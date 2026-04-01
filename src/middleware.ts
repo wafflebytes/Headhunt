@@ -2,6 +2,8 @@ import { NextResponse, type NextRequest } from 'next/server';
 
 import { auth0 } from '@/lib/auth0';
 
+const LOGIN_PATH = '/auth/login?prompt=login&max_age=0';
+
 /**
  * Middleware to handle authentication using Auth0
  */
@@ -18,7 +20,7 @@ export async function middleware(request: NextRequest) {
 
   // user does not have a session — redirect to login
   if (!session) {
-    return NextResponse.redirect(`${origin}/auth/login`);
+    return NextResponse.redirect(`${origin}${LOGIN_PATH}`);
   }
 
   return authRes;

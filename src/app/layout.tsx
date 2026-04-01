@@ -12,6 +12,8 @@ import UserButton from '@/components/auth0/user-button';
 
 const robotoMono = Roboto_Mono({ weight: '400', subsets: ['latin'] });
 const publicSans = Inter({ weight: '400', subsets: ['latin'] });
+const FORCED_LOGIN_PATH = '/auth/login?prompt=login&max_age=0';
+const LOGOUT_URL = `/auth/logout?federated=true&returnTo=${encodeURIComponent(FORCED_LOGIN_PATH)}`;
 
 const TITLE = 'Auth0 Assistant0: An Auth0 + LangChain + Next.js Template';
 const DESCRIPTION = 'Starter template showing how to use Auth0 in LangChain + Next.js projects.';
@@ -55,7 +57,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
               <div className="flex justify-center">
                 {session && (
                   <div className="flex items-center gap-2 px-4 text-white">
-                    <UserButton user={session?.user!} logoutUrl="/auth/logout" />
+                    <UserButton user={session?.user!} logoutUrl={LOGOUT_URL} />
                   </div>
                 )}
                 <Button asChild variant="header" size="default">

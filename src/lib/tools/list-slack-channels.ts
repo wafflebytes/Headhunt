@@ -1,6 +1,6 @@
 import { ErrorCode, WebClient } from '@slack/web-api';
 import { TokenVaultError } from '@auth0/ai/interrupts';
-import { withSlack, getAccessToken } from '@/lib/auth0-ai';
+import { withSlack, getAccessToken, SLACK_SCOPES } from '@/lib/auth0-ai';
 import { tool } from 'ai';
 import { z } from 'zod';
 
@@ -9,6 +9,8 @@ export const listSlackChannels = withSlack(
     description: 'List channels for the current user on Slack',
     inputSchema: z.object({}),
     execute: async () => {
+      const hasPrivateChannelScope = SLACK_SCOPES.includes('groups:read');
+
       // Get the access token from Auth0 AI
       const accessToken = await getAccessToken();
 
@@ -18,7 +20,7 @@ export const listSlackChannels = withSlack(
 
         const result = await web.conversations.list({
           exclude_archived: true,
-          types: 'public_channel,private_channel',
+          types: hasPrivateChannelScope ? 'public_channel,private_channel' : 'public_channel',
           limit: 10,
         });
 

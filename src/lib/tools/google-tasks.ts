@@ -4,7 +4,7 @@ import { google } from 'googleapis';
 import { z } from 'zod';
 import { TokenVaultError } from '@auth0/ai/interrupts';
 
-import { getAccessToken, withTasks } from '../auth0-ai';
+import { getGoogleAccessToken, withTasks } from '../auth0-ai';
 
 export const getTasksTool = withTasks(
   tool({
@@ -16,7 +16,7 @@ export const getTasksTool = withTasks(
     }),
     execute: async ({ maxResults = 20, showCompleted = true, showHidden = false }) => {
       // Get the access token from Auth0 AI
-      const accessToken = await getAccessToken();
+      const accessToken = await getGoogleAccessToken();
 
       // Google SDK
       try {
@@ -79,7 +79,7 @@ export const createTasksTool = withTasks(
     }),
     execute: async ({ title, notes, due }) => {
       // Get the access token from Auth0 AI
-      const accessToken = await getAccessToken();
+      const accessToken = await getGoogleAccessToken();
 
       // Google SDK
       try {
