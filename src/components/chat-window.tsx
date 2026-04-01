@@ -5,12 +5,13 @@ import { type UIMessage, DefaultChatTransport, generateId, lastAssistantMessageI
 import { useChat } from '@ai-sdk/react';
 import { toast } from 'sonner';
 import { StickToBottom, useStickToBottomContext } from 'use-stick-to-bottom';
-import { Activity, ArrowDown, ArrowUpIcon, KeyRound, LoaderCircle, RotateCcw, Square, Trash2 } from 'lucide-react';
+import { Activity, ArrowDown, ArrowUpIcon, Copy, KeyRound, LoaderCircle, RotateCcw, Square, Trash2 } from 'lucide-react';
 import { useInterruptions } from '@auth0/ai-vercel/react';
 
 import { TokenVaultInterruptHandler } from '@/components/TokenVaultInterruptHandler';
 import { ChatMessageBubble } from '@/components/chat-message-bubble';
 import { Button } from '@/components/ui/button';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { cn } from '@/utils/cn';
 
 const CHAT_STORAGE_KEY_PREFIX = 'headhunt:m1:chat:messages';
@@ -20,6 +21,9 @@ const RUN_CONNECTION_DIAGNOSTICS_PROMPT =
   'run_connection_diagnostics: call run_connection_diagnostics and summarize each check, including missing connections/scopes and exact next authorization step.';
 const AUTHORIZATION_STEP_TIMEOUT_MS = 10 * 60 * 1000;
 const AUTHORIZATION_STEP_POLL_MS = 400;
+const CHAT_LOG_JSON_MARKER = 'HHLOG_JSON';
+
+type ChatLogMode = 'latest_exchange' | 'full_session';
 
 const AUTHORIZATION_STEPS = [
   {
@@ -76,6 +80,148 @@ function normalizeIdentity(rawIdentity: string | null | undefined) {
   }
 
   return encodeURIComponent(rawIdentity.trim());
+}
+
+function safeJsonStringify(value: unknown): string {
+  const seen = new WeakSet<object>();
+
+  return JSON.stringify(
+    value,
+    (_key, item) => {
+      if (item instanceof Date) {
+        return item.toISOString();
+      }
+
+      if (typeof item === 'bigint') {
+        return item.toString();
+      }
+
+      if (typeof item === 'function') {
+        return '[function]';
+      }
+
+      if (typeof item === 'symbol') {
+        return item.toString();
+      }
+
+      if (item && typeof item === 'object') {
+        if (seen.has(item as object)) {
+          return '[circular]';
+        }
+        seen.add(item as object);
+      }
+
+      return item;
+    },
+    2,
+  );
+}
+
+async function writeClipboardText(value: string) {
+  if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+
+  const textArea = document.createElement('textarea');
+  textArea.value = value;
+  textArea.style.position = 'fixed';
+  textArea.style.opacity = '0';
+  document.body.appendChild(textArea);
+  textArea.focus();
+  textArea.select();
+
+  const copied = document.execCommand('copy');
+  document.body.removeChild(textArea);
+
+  if (!copied) {
+    throw new Error('Clipboard write is not available in this browser context.');
+  }
+}
+
+function extractToolParts(message: UIMessage) {
+  const parts = (message as { parts?: unknown }).parts;
+  if (!Array.isArray(parts)) {
+    return [];
+  }
+
+  return parts
+    .map((part) => {
+      if (!part || typeof part !== 'object') {
+        return null;
+      }
+
+      const value = part as Record<string, unknown>;
+      const partType = typeof value.type === 'string' ? value.type : null;
+      const looksLikeToolPart =
+        (partType && partType.includes('tool')) ||
+        'toolCallId' in value ||
+        'toolName' in value ||
+        'input' in value ||
+        'output' in value ||
+        'state' in value;
+
+      if (!looksLikeToolPart) {
+        return null;
+      }
+
+      return {
+        type: partType,
+        toolName: typeof value.toolName === 'string' ? value.toolName : null,
+        toolCallId: typeof value.toolCallId === 'string' ? value.toolCallId : null,
+        state: typeof value.state === 'string' ? value.state : null,
+        input: value.input ?? null,
+        output: value.output ?? null,
+        error: value.error ?? null,
+      };
+    })
+    .filter((part): part is NonNullable<typeof part> => Boolean(part));
+}
+
+function toLogEntry(message: UIMessage) {
+  const maybeCreatedAt = (message as { createdAt?: unknown }).createdAt;
+  const createdAt = maybeCreatedAt instanceof Date ? maybeCreatedAt.toISOString() : typeof maybeCreatedAt === 'string' ? maybeCreatedAt : null;
+
+  return {
+    id: message.id,
+    role: message.role,
+    createdAt,
+    text: uiMessageToText(message) || null,
+    toolParts: extractToolParts(message),
+    raw: message,
+  };
+}
+
+function selectLatestExchange(messages: UIMessage[]): UIMessage[] {
+  const lastUserIndex = [...messages].map((message) => message.role).lastIndexOf('user');
+
+  if (lastUserIndex === -1) {
+    return messages.slice(-2);
+  }
+
+  const assistantAfterUserIndex = messages.findIndex((message, index) => index > lastUserIndex && message.role === 'assistant');
+
+  if (assistantAfterUserIndex !== -1) {
+    let end = messages.length;
+    for (let i = assistantAfterUserIndex + 1; i < messages.length; i++) {
+      if (messages[i]?.role === 'user') {
+        end = i;
+        break;
+      }
+    }
+
+    return messages.slice(lastUserIndex, end);
+  }
+
+  const previousAssistantIndex = [...messages]
+    .map((message) => message.role)
+    .lastIndexOf('assistant', lastUserIndex);
+
+  if (previousAssistantIndex !== -1) {
+    return messages.slice(previousAssistantIndex, lastUserIndex + 1);
+  }
+
+  return [messages[lastUserIndex]].filter(Boolean);
 }
 
 function ChatMessages(props: {
@@ -200,6 +346,7 @@ export function ChatWindow(props: {
   const [hydrated, setHydrated] = useState(false);
   const [isAuthorizationFlowRunning, setIsAuthorizationFlowRunning] = useState(false);
   const [activeAuthorizationStep, setActiveAuthorizationStep] = useState<string | null>(null);
+  const [isCopyingLogs, setIsCopyingLogs] = useState(false);
   const hasLoadedPersistedMessages = useRef(false);
   const statusRef = useRef(status);
   const interruptRef = useRef(toolInterrupt);
@@ -317,6 +464,50 @@ export function ChatWindow(props: {
     window.localStorage.removeItem(chatStorageKey);
   }
 
+  async function onCopyLogs(mode: ChatLogMode) {
+    if (isCopyingLogs || messages.length === 0) {
+      return;
+    }
+
+    setIsCopyingLogs(true);
+
+    try {
+      const selectedMessages = mode === 'latest_exchange' ? selectLatestExchange(messages) : messages;
+
+      if (selectedMessages.length === 0) {
+        toast.error('No chat logs available to copy.');
+        return;
+      }
+
+      const payload = {
+        exportedAt: new Date().toISOString(),
+        mode,
+        threadId: chatThreadId,
+        scopedUserId,
+        messageCount: selectedMessages.length,
+        messages: selectedMessages.map((message) => toLogEntry(message)),
+      };
+
+      const serializedPayload = safeJsonStringify(payload);
+      const clipboardText = `${CHAT_LOG_JSON_MARKER}\n${serializedPayload}`;
+
+      await writeClipboardText(clipboardText);
+
+      toast.success('Chat logs copied.', {
+        description:
+          mode === 'latest_exchange'
+            ? 'Copied latest user + assistant exchange with tool details.'
+            : `Copied full session (${selectedMessages.length} messages) with tool details.`,
+      });
+    } catch (error) {
+      toast.error('Failed to copy chat logs.', {
+        description: error instanceof Error ? error.message : 'Unknown clipboard error.',
+      });
+    } finally {
+      setIsCopyingLogs(false);
+    }
+  }
+
   return (
     <StickToBottom>
       <StickyToBottomContent
@@ -367,6 +558,25 @@ export function ChatWindow(props: {
                   <RotateCcw className="w-4 h-4 mr-1" />
                   Regenerate
                 </Button>
+              ) : null}
+
+              {messages.length > 0 ? (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="outline" size="sm" disabled={isCopyingLogs}>
+                      <Copy className="w-4 h-4 mr-1" />
+                      {isCopyingLogs ? 'Copying...' : 'Copy Logs'}
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    <DropdownMenuItem onSelect={() => void onCopyLogs('latest_exchange')}>
+                      Latest You + AI Exchange
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onSelect={() => void onCopyLogs('full_session')}>
+                      Full Session (All Messages)
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
               ) : null}
 
               {messages.length > 0 ? (

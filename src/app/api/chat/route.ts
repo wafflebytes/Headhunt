@@ -1,4 +1,4 @@
-import { NextRequest } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import {
   streamText,
   type UIMessage,
@@ -9,6 +9,7 @@ import {
 import { setAIContext } from '@auth0/ai-vercel';
 import { errorSerializer, withInterruptions } from '@auth0/ai-vercel/interrupts';
 import { nim, nimChatModelId } from '@/lib/nim';
+import { auth0 } from '@/lib/auth0';
 
 import { serpApiTool } from '@/lib/tools/serpapi';
 import { getUserInfoTool } from '@/lib/tools/user-info';
@@ -28,6 +29,10 @@ import {
   verifyGmailSendConnectionTool,
   verifySlackConnectionTool,
 } from '@/lib/tools/connection-diagnostics';
+import { runIntakeE2ETool } from '@/lib/tools/intake-e2e';
+import { runInterceptTool } from '@/lib/tools/intercept';
+import { scheduleInterviewSlotsTool } from '@/lib/tools/scheduling';
+import { generateIntelCardTool, runTriageTool } from '@/lib/tools/triage-intel';
 
 const date = new Date().toISOString();
 
@@ -53,6 +58,15 @@ If the user sends an authorize_connections_step directive, call exactly one tool
 - authorize_connections_step:slack -> verify_slack_connection
 
 When diagnostics show any Google check as unhealthy, recommend authorize_connections_step:google as the next step.
+`;
+
+const TRIAGE_INTEL_INSTRUCTIONS = `
+When the user asks for a "true end-to-end intake run", call run_intake_e2e.
+When asked to pull candidate-like recruiting emails from Gmail intake, call run_intercept.
+When asked to classify hiring/recruiting emails, call run_triage.
+When asked to generate a candidate intel card, call generate_intel_card.
+When asked to propose interview slots or schedule an interview, call schedule_interview_slots.
+When generating intel, persist outputs and move candidate/application stage to reviewed.
 `;
 
 function extractErrorMessage(error: unknown): string {
@@ -127,6 +141,20 @@ function getForcedToolChoice(messages: Array<UIMessage>) {
     };
   }
 
+  if (/\brun_intake_e2e\b/i.test(text) || /true\s+end[-\s]?to[-\s]?end\s+intake\s+run/i.test(text)) {
+    return {
+      type: 'tool' as const,
+      toolName: 'run_intake_e2e',
+    };
+  }
+
+  if (/\bschedule_interview_slots\b/i.test(text) || /\bschedule\s+interview\s+slots\b/i.test(text)) {
+    return {
+      type: 'tool' as const,
+      toolName: 'schedule_interview_slots',
+    };
+  }
+
   const match = text.match(/authorize_connections_step:([a-z_]+)/i);
   const step = match?.[1]?.toLowerCase();
 
@@ -159,6 +187,11 @@ function getForcedToolChoice(messages: Array<UIMessage>) {
 export async function POST(req: NextRequest) {
   const { id, messages }: { id: string; messages: Array<UIMessage> } = await req.json();
 
+  const session = await auth0.getSession();
+  if (!session?.user?.sub) {
+    return NextResponse.json({ message: 'Unauthorized' }, { status: 401 });
+  }
+
   setAIContext({ threadID: id });
 
   const tools = {
@@ -180,6 +213,11 @@ export async function POST(req: NextRequest) {
     verify_gmail_send_connection: verifyGmailSendConnectionTool,
     verify_calendar_connection: verifyCalendarConnectionTool,
     verify_slack_connection: verifySlackConnectionTool,
+    run_intake_e2e: runIntakeE2ETool,
+    run_intercept: runInterceptTool,
+    run_triage: runTriageTool,
+    generate_intel_card: generateIntelCardTool,
+    schedule_interview_slots: scheduleInterviewSlotsTool,
   };
 
   const modelMessages = await convertToModelMessages(messages);
@@ -191,7 +229,7 @@ export async function POST(req: NextRequest) {
       async ({ writer }) => {
         const result = streamText({
           model: nim.chatModel(nimChatModelId),
-          system: `${AGENT_SYSTEM_TEMPLATE}\n${DIAGNOSTICS_INSTRUCTIONS}`,
+          system: `${AGENT_SYSTEM_TEMPLATE}\n${DIAGNOSTICS_INSTRUCTIONS}\n${TRIAGE_INTEL_INSTRUCTIONS}`,
           messages: modelMessages,
           temperature: 0.6,
           topP: 0.9,
