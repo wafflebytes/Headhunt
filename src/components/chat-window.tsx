@@ -58,6 +58,36 @@ function uiMessageToText(message: UIMessage): string {
   return typeof content === 'string' ? content : '';
 }
 
+function decodeEscapedLogText(value: string): string {
+  return value
+    .replace(/\\n/g, '\n')
+    .replace(/\\t/g, '\t')
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, '\\');
+}
+
+function sanitizeAssistantLogText(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return '';
+  }
+
+  const textMatches = Array.from(trimmed.matchAll(/['"]text['"]\s*:\s*(['"])([\s\S]*?)\1/g));
+  if (textMatches.length === 0) {
+    return raw;
+  }
+
+  const values = textMatches
+    .map((match) => decodeEscapedLogText(match[2] ?? '').trim())
+    .filter(Boolean);
+
+  if (values.length === 0) {
+    return '';
+  }
+
+  return values.join('\n');
+}
+
 function shouldAutoSubmitAfterToolCalls(messages: UIMessage[]): boolean {
   const lastUserMessage = [...messages].reverse().find((message) => message.role === 'user');
   const lastUserText = lastUserMessage ? uiMessageToText(lastUserMessage) : '';
@@ -172,22 +202,109 @@ function extractToolParts(message: UIMessage) {
         state: typeof value.state === 'string' ? value.state : null,
         input: value.input ?? null,
         output: value.output ?? null,
-        error: value.error ?? null,
+          error: value.error ?? value.errorText ?? null,
       };
     })
     .filter((part): part is NonNullable<typeof part> => Boolean(part));
 }
 
+function extractScheduleLogText(toolParts: ReturnType<typeof extractToolParts>): string | null {
+  const schedulePart = [...toolParts].reverse().find((part) => {
+    const partType = typeof part.type === 'string' ? part.type : '';
+    return part.toolName === 'schedule_interview_slots' || partType.includes('schedule_interview_slots');
+  });
+
+  if (!schedulePart || !schedulePart.output || typeof schedulePart.output !== 'object') {
+    return null;
+  }
+
+  const output = schedulePart.output as Record<string, unknown>;
+  const check = typeof output.check === 'string' ? output.check : null;
+  const status = typeof output.status === 'string' ? output.status : null;
+  const mode = typeof output.mode === 'string' ? output.mode : null;
+
+  if (check !== 'schedule_interview_slots') {
+    return null;
+  }
+
+  if (status === 'error') {
+    const message = typeof output.message === 'string' ? output.message : 'Unknown scheduling error.';
+    return `Scheduling failed: ${message}`;
+  }
+
+  if (status !== 'success') {
+    return null;
+  }
+
+  if (mode === 'propose') {
+    const slots = Array.isArray(output.slots) ? output.slots : [];
+    const recommendedIndex =
+      typeof output.recommendedSlotIndex === 'number' && Number.isInteger(output.recommendedSlotIndex)
+        ? output.recommendedSlotIndex
+        : -1;
+
+    const lines = slots
+      .map((slot, index) => {
+        if (!slot || typeof slot !== 'object') {
+          return null;
+        }
+
+        const slotRecord = slot as Record<string, unknown>;
+        const displayLabel = typeof slotRecord.displayLabel === 'string' ? slotRecord.displayLabel : null;
+        const startISO = typeof slotRecord.startISO === 'string' ? slotRecord.startISO : null;
+        if (!displayLabel || !startISO) {
+          return null;
+        }
+
+        const suffix = index === recommendedIndex ? ' (recommended)' : '';
+        return `${index + 1}. ${displayLabel}${suffix} | selectedStartISO: \"${startISO}\"`;
+      })
+      .filter((line): line is string => Boolean(line));
+
+    if (lines.length === 0) {
+      return 'Interview slots proposed (not scheduled yet).';
+    }
+
+    return `Interview slots proposed (not scheduled yet).\n${lines.join('\n')}`;
+  }
+
+  if (mode === 'schedule') {
+    const event = output.event && typeof output.event === 'object' ? (output.event as Record<string, unknown>) : null;
+    const displayLabel = event && typeof event.displayLabel === 'string' ? event.displayLabel : null;
+    const htmlLink = event && typeof event.htmlLink === 'string' ? event.htmlLink : null;
+    const meetLink = event && typeof event.meetLink === 'string' ? event.meetLink : null;
+
+    const lines = ['Interview scheduled successfully.'];
+    if (displayLabel) {
+      lines.push(`Slot: ${displayLabel}`);
+    }
+    if (meetLink) {
+      lines.push(`Meet link: ${meetLink}`);
+    }
+    if (htmlLink) {
+      lines.push(`Calendar event: ${htmlLink}`);
+    }
+
+    return lines.join('\n');
+  }
+
+  return null;
+}
+
 function toLogEntry(message: UIMessage) {
   const maybeCreatedAt = (message as { createdAt?: unknown }).createdAt;
   const createdAt = maybeCreatedAt instanceof Date ? maybeCreatedAt.toISOString() : typeof maybeCreatedAt === 'string' ? maybeCreatedAt : null;
+  const toolParts = extractToolParts(message);
+  const rawText = uiMessageToText(message);
+  const scheduleLogText = message.role === 'assistant' ? extractScheduleLogText(toolParts) : null;
+  const text = scheduleLogText ?? (message.role === 'assistant' ? sanitizeAssistantLogText(rawText) : rawText);
 
   return {
     id: message.id,
     role: message.role,
     createdAt,
-    text: uiMessageToText(message) || null,
-    toolParts: extractToolParts(message),
+    text: text || null,
+    toolParts,
     raw: message,
   };
 }

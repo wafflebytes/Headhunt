@@ -17,6 +17,7 @@
     "db:check": "drizzle-kit check",
     "fga:init": "tsx src/lib/fga/fga-init.ts",
     "smoke:m1-db": "tsx scripts/smoke-m1-db.ts",
+    "smoke:chat-log": "tsx scripts/smoke-chat-log.ts",
     "seed:demo": "tsx scripts/seed-demo-headhunt.ts"
   },
   "engines": {

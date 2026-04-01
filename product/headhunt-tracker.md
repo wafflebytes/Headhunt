@@ -427,6 +427,7 @@ Exit gate for M3:
 - [ ] Integration tests for critical route chains.
 - [/] Smoke scripts for demo paths.
 	- [x] Deterministic DB seed script exists (`npm run seed:demo`).
+	- [x] Chat-log smoke checker exists for `HHLOG_JSON` exports (`npm run smoke:chat-log`).
 	- [ ] Add authenticated endpoint replay script for fixture emails.
 
 ### Demo Seed Strategy
@@ -465,6 +466,7 @@ For any feature PR, complete this checklist first:
 
 - [x] Run deterministic seed: `npm run seed:demo -- --reset`.
 - [x] Confirm stage matrix includes applied/reviewed/interview_scheduled/interviewed/offer_sent/hired/rejected.
+- [ ] Run chat-log smoke checker: `npm run smoke:chat-log -- --file /tmp/hhlog.txt --require-scheduling --verbose`.
 - [ ] Run one-command intake replay in chat: `run_intake_e2e` and confirm processed message summary.
 - [ ] Create candidate ingest payload via route/tool.
 - [ ] Verify candidate row + audit row written.

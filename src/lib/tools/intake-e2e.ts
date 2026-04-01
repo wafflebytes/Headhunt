@@ -8,6 +8,7 @@ import { auth0 } from '@/lib/auth0';
 import { db } from '@/lib/db';
 import { auditLogs } from '@/lib/db/schema/audit-logs';
 import { jobs } from '@/lib/db/schema/jobs';
+import { organizations } from '@/lib/db/schema/organizations';
 import { fetchInterceptMessages } from '@/lib/tools/intercept';
 import { generateIntelCard, runTriage } from '@/lib/tools/triage-intel';
 
@@ -100,8 +101,39 @@ export const runIntakeE2ETool = withGmailRead(
       }
 
       const actorDisplayName = session?.user?.name ?? session?.user?.email ?? actorId;
-      const activeJobs = await loadActiveJobs(input.organizationId);
-      const fallbackJobId = input.jobId ?? activeJobs[0]?.id ?? null;
+      const requestedOrganizationId = input.organizationId ?? null;
+      const requestedJobId = input.jobId ?? null;
+
+      const requestedOrganization = requestedOrganizationId
+        ? (
+            await db
+              .select({ id: organizations.id })
+              .from(organizations)
+              .where(eq(organizations.id, requestedOrganizationId))
+              .limit(1)
+          )[0] ?? null
+        : null;
+
+      const requestedJob = requestedJobId
+        ? (
+            await db
+              .select({
+                id: jobs.id,
+                title: jobs.title,
+                organizationId: jobs.organizationId,
+                status: jobs.status,
+              })
+              .from(jobs)
+              .where(eq(jobs.id, requestedJobId))
+              .limit(1)
+          )[0] ?? null
+        : null;
+
+      const resolvedOrganizationId = requestedOrganization?.id ?? requestedJob?.organizationId ?? null;
+      const activeJobs = await loadActiveJobs(resolvedOrganizationId ?? undefined);
+      const fallbackJobId = requestedJob?.id ?? activeJobs[0]?.id ?? null;
+      const usedFallbackOrganizationId = Boolean(requestedOrganizationId && !requestedOrganization?.id);
+      const usedFallbackJobId = Boolean(requestedJobId && !requestedJob?.id);
 
       const intercepted = await fetchInterceptMessages({
         query: input.query,
@@ -133,7 +165,7 @@ export const runIntakeE2ETool = withGmailRead(
 
         try {
           const triage = await runTriage({
-            organizationId: input.organizationId,
+            organizationId: resolvedOrganizationId ?? undefined,
             from: message.from ?? undefined,
             subject: message.subject ?? '',
             body: rawEmailText,
@@ -156,7 +188,7 @@ export const runIntakeE2ETool = withGmailRead(
           }
 
           const triageJobId = triage.jobId ?? null;
-          const resolvedJobId = input.jobId ?? triageJobId ?? fallbackJobId;
+          const resolvedJobId = requestedJob?.id ?? triageJobId ?? fallbackJobId;
 
           if (!resolvedJobId) {
             messageResults.push({
@@ -172,7 +204,7 @@ export const runIntakeE2ETool = withGmailRead(
 
           const ingest = await ingestCandidateFromEmail({
             jobId: resolvedJobId,
-            organizationId: input.organizationId,
+            organizationId: resolvedOrganizationId ?? undefined,
             candidateName: sender.name,
             candidateEmail: sender.email,
             rawEmailText,
@@ -198,7 +230,7 @@ export const runIntakeE2ETool = withGmailRead(
               candidateId: ingest.candidate.id,
               jobId: resolvedJobId,
               actorUserId: actorId,
-              organizationId: input.organizationId,
+              organizationId: resolvedOrganizationId ?? undefined,
               emailText: rawEmailText,
               requirements: input.requirements,
             });
@@ -240,7 +272,7 @@ export const runIntakeE2ETool = withGmailRead(
       }
 
       await db.insert(auditLogs).values({
-        organizationId: input.organizationId ?? null,
+        organizationId: resolvedOrganizationId,
         actorType: 'agent',
         actorId: 'run_intake_e2e',
         actorDisplayName: 'Intake E2E Runner',
@@ -253,6 +285,12 @@ export const runIntakeE2ETool = withGmailRead(
           processLimit: input.processLimit,
           candidateLikeOnly: input.candidateLikeOnly,
           generateIntel: input.generateIntel,
+          requestedOrganizationId,
+          resolvedOrganizationId,
+          usedFallbackOrganizationId,
+          requestedJobId,
+          resolvedRequestedJobId: requestedJob?.id ?? null,
+          usedFallbackJobId,
           interceptedCount: intercepted.length,
           processedCount: messages.length,
           ingestedCreated,
@@ -267,6 +305,12 @@ export const runIntakeE2ETool = withGmailRead(
         status: 'success',
         query: input.query,
         actorUserId: actorId,
+        requestedOrganizationId,
+        resolvedOrganizationId,
+        usedFallbackOrganizationId,
+        requestedJobId,
+        resolvedRequestedJobId: requestedJob?.id ?? null,
+        usedFallbackJobId,
         activeJobsCount: activeJobs.length,
         interceptedCount: intercepted.length,
         processedCount: messages.length,

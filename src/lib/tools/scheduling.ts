@@ -314,6 +314,16 @@ export const scheduleInterviewSlotsTool = withCalendar(
           };
         }
 
+        const availableStartISOs = new Set(slots.map((slot) => slot.startISO));
+        if (!availableStartISOs.has(new Date(input.selectedStartISO).toISOString())) {
+          return {
+            check: 'schedule_interview_slots',
+            status: 'error',
+            message:
+              'Selected slot is stale or unavailable in the current window. Request fresh slot proposals and choose one of the returned selectedStartISO values.',
+          };
+        }
+
         const selectedStart = new Date(input.selectedStartISO);
         const selectedEnd = addMinutes(selectedStart, input.durationMinutes);
         const selectedRange = { start: selectedStart, end: selectedEnd };

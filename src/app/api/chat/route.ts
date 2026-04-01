@@ -62,10 +62,15 @@ When diagnostics show any Google check as unhealthy, recommend authorize_connect
 
 const TRIAGE_INTEL_INSTRUCTIONS = `
 When the user asks for a "true end-to-end intake run", call run_intake_e2e.
+When calling run_intake_e2e from a direct command, do not invent organizationId or jobId. Only use ids explicitly provided by the user.
 When asked to pull candidate-like recruiting emails from Gmail intake, call run_intercept.
 When asked to classify hiring/recruiting emails, call run_triage.
 When asked to generate a candidate intel card, call generate_intel_card.
 When asked to propose interview slots or schedule an interview, call schedule_interview_slots.
+When summarizing schedule_interview_slots output, be exact:
+- If output.mode is "propose", say slots were proposed only and ask for selectedStartISO confirmation.
+- If output.mode is "schedule", say the interview was scheduled and include event details.
+- If output.status is "error", report only the error and do not claim success.
 When generating intel, persist outputs and move candidate/application stage to reviewed.
 `;
 
@@ -126,32 +131,147 @@ function uiMessageToText(message: UIMessage): string {
   return typeof content === 'string' ? content : '';
 }
 
-function getForcedToolChoice(messages: Array<UIMessage>) {
+type ForcedToolDecision = {
+  toolChoice?: {
+    type: 'tool';
+    toolName: string;
+  };
+  forcedArgsInstruction?: string;
+};
+
+function parseCommandArgs(rawText: string): Record<string, string> {
+  const withIndex = rawText.toLowerCase().indexOf(' with ');
+  if (withIndex === -1) {
+    return {};
+  }
+
+  const argsPortion = rawText.slice(withIndex + 6);
+  const args: Record<string, string> = {};
+  const pairPattern = /(\w+)\s+(?:"([^"]*)"|'([^']*)'|([^\s]+))/g;
+  let match: RegExpExecArray | null = null;
+
+  while ((match = pairPattern.exec(argsPortion)) !== null) {
+    const key = match[1];
+    const value = match[2] ?? match[3] ?? match[4] ?? '';
+    if (key && value) {
+      args[key] = value;
+    }
+  }
+
+  return args;
+}
+
+function toNumberOrUndefined(value: string | undefined): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function toBooleanOrUndefined(value: string | undefined): boolean | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'true') {
+    return true;
+  }
+
+  if (normalized === 'false') {
+    return false;
+  }
+
+  return undefined;
+}
+
+function buildIntakeForcedArgsInstruction(rawText: string): string {
+  const parsed = parseCommandArgs(rawText);
+  const intakeArgs = {
+    organizationId: parsed.organizationId,
+    jobId: parsed.jobId,
+    query: parsed.query,
+    maxResults: toNumberOrUndefined(parsed.maxResults),
+    processLimit: toNumberOrUndefined(parsed.processLimit),
+    candidateLikeOnly: toBooleanOrUndefined(parsed.candidateLikeOnly),
+    includeBody: toBooleanOrUndefined(parsed.includeBody),
+    generateIntel: toBooleanOrUndefined(parsed.generateIntel),
+  };
+
+  const normalizedArgs = Object.fromEntries(
+    Object.entries(intakeArgs).filter(([, value]) => value !== undefined),
+  );
+
+  return `\nFORCED_TOOL_ARGS: The user sent a run_intake_e2e command. You MUST call run_intake_e2e exactly once with this JSON object and no extra fields:\n${JSON.stringify(
+    normalizedArgs,
+  )}\nDo not infer or fabricate organizationId/jobId. If they are absent, call with {} and let the backend resolve defaults.`;
+}
+
+function buildScheduleForcedArgsInstruction(rawText: string): string | undefined {
+  const parsed = parseCommandArgs(rawText);
+  const scheduleArgs = {
+    candidateId: parsed.candidateId,
+    jobId: parsed.jobId,
+    organizationId: parsed.organizationId,
+    actorUserId: parsed.actorUserId,
+    windowStartISO: parsed.windowStartISO,
+    windowEndISO: parsed.windowEndISO,
+    durationMinutes: toNumberOrUndefined(parsed.durationMinutes),
+    slotIntervalMinutes: toNumberOrUndefined(parsed.slotIntervalMinutes),
+    maxSuggestions: toNumberOrUndefined(parsed.maxSuggestions),
+    selectedStartISO: parsed.selectedStartISO,
+    timezone: parsed.timezone,
+  };
+
+  const normalizedArgs = Object.fromEntries(
+    Object.entries(scheduleArgs).filter(([, value]) => value !== undefined),
+  );
+
+  if (Object.keys(normalizedArgs).length === 0) {
+    return undefined;
+  }
+
+  return `\nFORCED_TOOL_ARGS: The user sent an explicit schedule_interview_slots command. You MUST call schedule_interview_slots exactly once with this JSON object and do not omit any provided field:\n${JSON.stringify(
+    normalizedArgs,
+  )}\nDo not replace or drop selectedStartISO when it is present.`;
+}
+
+function getForcedToolDecision(messages: Array<UIMessage>): ForcedToolDecision {
   const latestMessage = messages[messages.length - 1];
   if (!latestMessage || latestMessage.role !== 'user') {
-    return undefined;
+    return {};
   }
 
   const text = uiMessageToText(latestMessage);
 
   if (/\brun_connection_diagnostics\b/i.test(text) || /\brun\s+connection\s+diagnostics\b/i.test(text)) {
     return {
-      type: 'tool' as const,
-      toolName: 'run_connection_diagnostics',
+      toolChoice: {
+        type: 'tool',
+        toolName: 'run_connection_diagnostics',
+      },
     };
   }
 
   if (/\brun_intake_e2e\b/i.test(text) || /true\s+end[-\s]?to[-\s]?end\s+intake\s+run/i.test(text)) {
     return {
-      type: 'tool' as const,
-      toolName: 'run_intake_e2e',
+      toolChoice: {
+        type: 'tool',
+        toolName: 'run_intake_e2e',
+      },
+      forcedArgsInstruction: buildIntakeForcedArgsInstruction(text),
     };
   }
 
   if (/\bschedule_interview_slots\b/i.test(text) || /\bschedule\s+interview\s+slots\b/i.test(text)) {
     return {
-      type: 'tool' as const,
-      toolName: 'schedule_interview_slots',
+      toolChoice: {
+        type: 'tool',
+        toolName: 'schedule_interview_slots',
+      },
+      forcedArgsInstruction: buildScheduleForcedArgsInstruction(text),
     };
   }
 
@@ -159,7 +279,7 @@ function getForcedToolChoice(messages: Array<UIMessage>) {
   const step = match?.[1]?.toLowerCase();
 
   if (!step) {
-    return undefined;
+    return {};
   }
 
   const toolNameByStep: Record<string, string> = {
@@ -172,12 +292,14 @@ function getForcedToolChoice(messages: Array<UIMessage>) {
 
   const toolName = toolNameByStep[step];
   if (!toolName) {
-    return undefined;
+    return {};
   }
 
   return {
-    type: 'tool' as const,
-    toolName,
+    toolChoice: {
+      type: 'tool',
+      toolName,
+    },
   };
 }
 
@@ -221,7 +343,7 @@ export async function POST(req: NextRequest) {
   };
 
   const modelMessages = await convertToModelMessages(messages);
-  const forcedToolChoice = getForcedToolChoice(messages);
+  const forcedToolDecision = getForcedToolDecision(messages);
 
   const stream = createUIMessageStream({
     originalMessages: messages,
@@ -229,13 +351,13 @@ export async function POST(req: NextRequest) {
       async ({ writer }) => {
         const result = streamText({
           model: nim.chatModel(nimChatModelId),
-          system: `${AGENT_SYSTEM_TEMPLATE}\n${DIAGNOSTICS_INSTRUCTIONS}\n${TRIAGE_INTEL_INSTRUCTIONS}`,
+          system: `${AGENT_SYSTEM_TEMPLATE}\n${DIAGNOSTICS_INSTRUCTIONS}\n${TRIAGE_INTEL_INSTRUCTIONS}${forcedToolDecision.forcedArgsInstruction ?? ''}`,
           messages: modelMessages,
           temperature: 0.6,
           topP: 0.9,
           maxOutputTokens: 4096,
           tools: tools as any,
-          toolChoice: forcedToolChoice,
+          toolChoice: forcedToolDecision.toolChoice,
           onFinish: (output) => {
             if (output.finishReason === 'tool-calls') {
               const lastMessage = output.content[output.content.length - 1];
