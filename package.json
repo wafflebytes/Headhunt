@@ -15,7 +15,8 @@
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
     "db:check": "drizzle-kit check",
-    "fga:init": "tsx src/lib/fga/fga-init.ts"
+    "fga:init": "tsx src/lib/fga/fga-init.ts",
+    "smoke:m1-db": "tsx scripts/smoke-m1-db.ts"
   },
   "engines": {
     "node": ">=18"

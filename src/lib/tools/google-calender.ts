@@ -5,7 +5,7 @@ import { google } from 'googleapis';
 import { z } from 'zod';
 import { TokenVaultError } from '@auth0/ai/interrupts';
 
-import { getAccessToken, withCalendar } from '../auth0-ai';
+import { getGoogleAccessToken, withCalendar } from '../auth0-ai';
 
 export const getCalendarEventsTool = withCalendar(
   tool({
@@ -15,7 +15,7 @@ export const getCalendarEventsTool = withCalendar(
     }),
     execute: async ({ date }) => {
       // Get the access token from Auth0 AI
-      const accessToken = await getAccessToken();
+      const accessToken = await getGoogleAccessToken();
 
       // Google SDK
       try {

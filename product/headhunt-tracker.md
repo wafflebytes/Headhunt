@@ -1,0 +1,513 @@
+# Headhunt Tracker - Full Flow Execution
+
+Last updated: 2026-04-01
+Owner: Lead Founding Engineer
+Execution mode: ship plumbing first, polish later
+Current implementation focus: M1.1 account-isolation and login-flow hardening implemented; next step is live re-verification across multiple identities and then M2 triage/intel tools.
+
+## Legend
+
+- [x] done
+- [/] active
+- [ ] queued
+- [!] blocked
+
+## Non-Negotiable Principle
+
+If agents cannot securely access Gmail/Auth0 and persist pipeline state, the product does not exist.
+UI work is downstream of plumbing reliability.
+
+## Locked Stack Decisions (2026-04-01)
+
+- [x] UI component system (later dashboard + theming): shadcn/ui preset b1VlJlhY (Luma).
+- [/] M1 chat surface: replace Assistant0 UI with Vercel AI SDK UI (`useChat`) for streaming, tool-calling UX, stop controls, and persistence hooks.
+- [x] MCP server implementation framework: FastMCP.
+
+## Full Flow Definition (MVP)
+
+The MVP is "real" only when all of this works in sequence:
+
+1. New inbound email can be fetched using Auth0 Token Vault (Google connection).
+2. Email text can be manually triaged from existing chat tool-calling surface.
+3. Candidate profile can be generated as structured data.
+4. Candidate row can be written to DB and read back.
+5. Founder/hiring_manager permissions are enforced through FGA checks for sensitive transitions.
+6. Offer send path is gated by CIBA when initiated by hiring_manager.
+7. MCP tools can query pipeline with Auth0 JWT + FGA filtering.
+
+Anything not supporting this chain is secondary.
+
+## Current Reality Snapshot
+
+### Already Present In Repo
+
+- [x] Auth0 session + middleware protection.
+- [x] Token Vault wrappers for Google, Slack, GitHub in src/lib/auth0-ai.ts.
+- [x] Existing chat tool-calling surface in src/app/api/chat/route.ts.
+- [x] Existing Assistant0 chat UI is functional and can be swapped without changing core tool logic.
+- [x] Gmail tools already wired (search + draft) in src/lib/tools/gmail.ts.
+- [x] Calendar read tool exists in src/lib/tools/google-calender.ts.
+- [x] Slack channels tool exists in src/lib/tools/list-slack-channels.ts.
+- [x] Drizzle database wiring + migrations in src/lib/db.
+- [x] Existing write path to DB + embeddings in src/lib/actions/documents.ts.
+- [x] FGA bootstrap + basic doc model in src/lib/fga.
+
+### Missing For Headhunt Spec
+
+- [x] Jobs/Candidates/Applications/Interviews/Templates/Offers/Audit schema.
+- [ ] Agent-specific API routes (intercept/triage/analyst/liaison/dispatch).
+- [ ] CIBA initiate/poll implementation for clearance queue.
+- [ ] FGA model evolution from doc-level to org/job/candidate relations.
+- [ ] FastMCP server scaffold + MCP transport + tool handlers.
+- [ ] No-chat Ops Board experience.
+
+## MCP Grounding Log (Required Before Architectural Decisions)
+
+Rule: every architecture decision references one of Auth0 Docs MCP, Supabase MCP, or Shadcn MCP before implementation.
+
+### Auth0 Docs MCP Notes
+
+- [x] Token Vault baseline docs confirmed.
+	- Source: https://auth0.com/docs/secure/call-apis-on-users-behalf/token-vault
+	- Decision: keep all third-party tokens in Token Vault and request minimal scopes per tool execution.
+
+- [x] Calling external IdP API references confirmed.
+	- Source: https://auth0.com/docs/authenticate/identity-providers/calling-an-external-idp-api
+	- Source: https://auth0.com/docs/authenticate/identity-providers/adding-scopes-for-an-external-idp
+	- Decision: ensure M2M token used for token retrieval has read:user_idp_tokens equivalent capability where applicable.
+
+- [x] CIBA flow references confirmed.
+	- Source: https://auth0.com/docs/get-started/authentication-and-authorization-flow/client-initiated-backchannel-authentication-flow/user-authorization-with-ciba
+	- Decision: implement bc-authorize initiation and oauth/token poll loop with explicit handling for pending/denied/approved outcomes.
+
+- [x] RAR references confirmed.
+	- Source: https://auth0.com/docs/get-started/apis/configure-rich-authorization-requests
+	- Decision: carry authorization_details on high-risk actions for audit traceability.
+
+### Supabase MCP Notes
+
+- [x] RLS hard requirement confirmed.
+	- Source: https://supabase.com/docs/guides/api/securing-your-api
+	- Decision: all public schema tables must have RLS enabled before exposing any pipeline read/write API.
+
+- [x] service_role handling constraints confirmed.
+	- Source: https://supabase.com/docs/guides/api/api-keys
+	- Decision: service_role usage is server-only; never client-exposed; use publishable key for browser clients.
+
+- [x] Cron + pg_net scheduling patterns confirmed.
+	- Source: https://supabase.com/docs/guides/cron/quickstart
+	- Source: https://supabase.com/docs/guides/functions/schedule-functions
+	- Decision: keep polling path as MVP baseline and move to push/webhook for v2.
+
+### Shadcn MCP Notes
+
+- [x] Registry availability confirmed for dashboard primitives.
+	- Registry: @shadcn
+	- Candidate components: card, badge, tabs, table, chart, calendar, dialog, sheet, sidebar.
+	- Add command prepared:
+		- npx shadcn@latest add @shadcn/card @shadcn/badge @shadcn/tabs @shadcn/table @shadcn/chart @shadcn/calendar @shadcn/dialog @shadcn/sheet @shadcn/sidebar
+
+- [x] Preset decision locked: b1VlJlhY (Luma).
+	- Planned init/migration command:
+		- npx shadcn@latest init --preset b1VlJlhY
+
+## Phase Plan
+
+---
+
+## M1 - Connections (Auth0 Token Vault + Supabase Write Path)
+
+Goal: prove we can pull Gmail on behalf of user and persist a candidate-like record reliably.
+Exit criteria: deterministic E2E smoke from authenticated request -> tokenized provider call -> DB write -> DB read.
+
+### M1.0 Baseline and Environment
+
+- [x] Confirm local DB + migrations run without failure.
+	- Evidence: drizzle push executed successfully.
+- [x] Confirm FGA init script runs.
+	- Evidence: npm run fga:init successful.
+- [/] Add explicit .env checklist section for Headhunt-specific vars (Auth0/FGA/Supabase/CIBA/MCP).
+
+### M1.0A Chat UI Swap (Assistant0 -> Vercel AI SDK UI)
+
+- [x] Replace current Assistant0 chat frontend with AI SDK UI (`useChat`) as the M1 operator console.
+- [x] Keep server endpoint compatibility with current tool-calling backend (`/api/chat`) during transition.
+- [x] Implement core M1 UX controls via AI SDK UI:
+	- [x] streaming message rendering
+	- [x] tool call / tool result rendering
+	- [x] stop generation
+	- [x] retry/regenerate
+	- [x] optimistic input/submit states
+- [x] Add message persistence adapter for thread continuity (phase-appropriate persistence).
+- [x] Ensure TokenVaultInterruptHandler still works in the new chat surface.
+
+Acceptance checks:
+
+- [ ] Conversation streams incrementally end-to-end.
+- [ ] Tool call outputs are visible and understandable in-chat.
+- [ ] Stop generation works reliably.
+- [ ] Refresh/resume restores thread messages for active session.
+
+### M1.1 Token Vault Verification First
+
+- [x] Existing Gmail read/write tool wrappers are present.
+- [x] Existing calendar/slack wrappers are present.
+- [/] Add dedicated connection-check endpoints (or chat tools) for:
+	- [x] verify_gmail_read_connection
+	- [x] verify_gmail_send_connection
+	- [x] verify_calendar_connection
+	- [x] verify_slack_connection
+- [x] Add consistent TokenVaultError -> actionable UI interrupt payload mapping.
+- [x] Add one-click smoke prompt in chat UI for "run_connection_diagnostics".
+- [x] Scope chat thread and persisted message state by authenticated user identity.
+- [x] Force login/signup account chooser and federated logout to reduce sticky-idp session reuse.
+
+Acceptance checks:
+
+- [ ] Authenticated user can trigger Gmail profile/read check without manual token handling.
+- [ ] Missing consent path triggers interrupt UX and succeeds after user consent.
+- [ ] Failures produce normalized error JSON (no raw stack leaks).
+
+### M1.2 Supabase/DB Foundation For Hiring Domain
+
+
+- [x] Create first migration for core entities:
+	- [x] organizations
+	- [x] jobs
+	- [x] candidates
+	- [x] applications
+	- [x] interviews
+	- [x] templates
+	- [x] offers
+	- [x] audit_logs
+
+- [x] Create Drizzle schema files for each entity.
+- [ ] Add enums for stage/status where useful.
+- [x] Add indexes for frequent access paths:
+	- [x] candidates(job_id, stage)
+	- [x] offers(status)
+	- [x] audit_logs(resource_type, resource_id, timestamp)
+
+- [ ] Add Zod schemas for insert/update DTOs.
+
+Acceptance checks:
+
+- [x] db:generate + db:push works cleanly.
+- [x] Minimal seed inserts organization/job/candidate rows.
+- [x] Query returns expected counts by stage.
+
+### M1.3 First Valuable Write (Candidate Ingest Lite)
+
+- [x] Implement temporary server action or API route: create_candidate_from_email.
+- [x] Inputs:
+	- [x] jobId
+	- [x] candidate name/email
+	- [x] raw email text
+	- [x] source metadata (message/thread ids)
+- [x] Persist candidate + application row + audit event.
+- [x] Return canonical payload used later by Intel Card.
+
+Acceptance checks:
+
+- [ ] Single request creates row set atomically.
+- [ ] Duplicate source message id is idempotent.
+- [ ] Audit record includes actor, action, result.
+
+### M1.4 RLS/Server-Key Boundaries
+
+- [ ] Enable RLS on new public tables.
+- [ ] Add restrictive base policies (authenticated only + org scoped).
+- [ ] Keep all service-role operations server-side only.
+- [ ] Add "security smoke" SQL checks in tracker runbook.
+
+Exit gate for M1:
+
+- [ ] "fetch Gmail + create candidate" works from authenticated session with no manual credentials.
+
+---
+
+## M2 - Logic (Tool-First Agent Actions via AI SDK UI Admin Console)
+
+Goal: use AI SDK UI chat as operator console to run agent actions manually before no-chat frontend exists.
+Exit criteria: Headhunt core actions callable as tools with structured outputs and persisted side effects.
+
+### M2.0 Orchestrator Scope
+
+- [ ] Define tool contracts in code for first wave actions:
+	- [ ] run_intercept
+	- [ ] run_triage
+	- [ ] generate_intel_card
+	- [ ] schedule_interview_slots
+	- [ ] draft_offer_letter
+	- [ ] submit_offer_for_clearance
+
+- [ ] Each tool must enforce:
+	- [ ] input validation (zod)
+	- [ ] FGA check before writes
+	- [ ] audit logging
+	- [ ] normalized result schema
+
+### M2.1 Intercept + Triage
+
+- [ ] Build intercept route/tool to pull candidate-like emails from Gmail.
+- [ ] Build triage classifier output schema:
+	- [ ] classification (application/scheduling_reply/inquiry/irrelevant)
+	- [ ] jobId (nullable)
+	- [ ] confidence
+- [ ] Persist triage decision + route decision.
+
+Acceptance checks:
+
+- [ ] Manual run on test inbox returns deterministic structured output.
+- [ ] scheduling_reply is routed without candidate creation.
+- [ ] irrelevant messages are logged and ignored.
+
+### M2.2 Analyst (Intel Card Generation)
+
+- [ ] Implement generate_intel_card tool using structured output schema.
+- [ ] Parse resume text (PDF/plain/markdown) if available.
+- [ ] Save score, score breakdown, qualification checks, summary, work history.
+- [ ] Upsert candidate stage to reviewed.
+
+Acceptance checks:
+
+- [ ] Score output is always 0-100 with dimension breakdown.
+- [ ] Missing data paths still produce valid object with low confidence flags.
+- [ ] Output can be rendered without post-processing hacks.
+
+### M2.3 Liaison (Scheduling Actions)
+
+- [ ] Tool: parse_candidate_availability
+- [ ] Tool: propose_interview_slots
+- [ ] Tool: confirm_interview_event
+- [ ] Tool: send_interview_confirmation
+- [ ] Persist interview record + candidate stage transitions.
+
+Acceptance checks:
+
+- [ ] At least one end-to-end schedule flow creates event id + meet link.
+- [ ] Candidate stage becomes interview_scheduled after confirmation send.
+- [ ] Slack summary hook can post test message.
+
+### M2.4 Dispatch (Offer + CIBA Hold)
+
+- [ ] Add offer term capture schema.
+- [ ] Add draft generation tool.
+- [ ] Add CIBA initiation service.
+- [ ] Add CIBA polling handler.
+- [ ] Enforce rule:
+	- [ ] founder can send directly
+	- [ ] hiring_manager requires CIBA approval
+
+Acceptance checks:
+
+- [ ] Pending clearance state persists with expiry timestamp.
+- [ ] Deny path does not send offer.
+- [ ] Approve path sends offer and updates stage to offer_sent.
+
+### M2.5 Chat Console UX For Operators
+
+- [ ] Add standard command prompts for operators:
+	- [ ] /run intake for job <id>
+	- [ ] /score candidate <id>
+	- [ ] /schedule candidate <id>
+	- [ ] /draft-offer candidate <id>
+- [ ] Add tool-result cards in chat output for readability.
+- [ ] Add per-action elapsed time and result status.
+
+### M2.6 MCP Server Build (FastMCP)
+
+- [ ] Scaffold `mcp-server/` using FastMCP.
+- [ ] Implement MVP tools in FastMCP handlers:
+	- [ ] list_jobs
+	- [ ] list_pipeline
+	- [ ] get_candidate_detail
+	- [ ] summarize_pipeline_health
+- [ ] Add Auth0 JWT verification at MCP boundary.
+- [ ] Add FGA checks inside each MCP tool before data return.
+- [ ] Expose transport endpoint for local and hosted usage.
+
+Acceptance checks:
+
+- [ ] Authenticated founder can call all four tools successfully.
+- [ ] Unauthorized access attempts are rejected with clear errors.
+- [ ] Returned payloads are stable and compatible with MCP clients.
+
+Exit gate for M2:
+
+- [ ] Operator can run full manual pipeline in chat from intake to offer clearance.
+
+---
+
+## M3 - Dashboard (Shadcn No-Chat Ops Board)
+
+Goal: move from operator chat commands to explicit no-chat control panels once backend is reliable.
+Exit criteria: founders can execute critical actions without chat interface.
+
+### M3.0 Foundation Layout
+
+- [ ] Build dashboard shell (sidebar + header + auth-aware nav).
+- [ ] Apply Luma preset design tokens (shadcn preset b1VlJlhY) across dashboard and later chat theming pass.
+- [ ] Add pages:
+	- [ ] / (dashboard)
+	- [ ] /jobs
+	- [ ] /jobs/[jobId]
+	- [ ] /jobs/[jobId]/candidates/[candidateId]
+	- [ ] /approvals
+	- [ ] /audit
+
+### M3.1 Pipeline Board
+
+- [ ] Implement kanban columns for stages.
+- [ ] Implement candidate card summary blocks.
+- [ ] Implement stage move actions with FGA-aware controls.
+- [ ] Add optimistic updates + rollback.
+
+### M3.2 Candidate Intel Card
+
+- [ ] Score gauge + breakdown sections.
+- [ ] Qualification checklist.
+- [ ] Work history timeline.
+- [ ] Email thread snapshot.
+- [ ] Audit timeline.
+
+### M3.3 Clearance Queue
+
+- [ ] Pending CIBA cards with countdown.
+- [ ] View draft offer content.
+- [ ] Approve/deny controls + live state.
+
+### M3.4 Dashboard Component Plan (Shadcn MCP Aligned)
+
+- [ ] card
+- [ ] badge
+- [ ] tabs
+- [ ] table
+- [ ] chart
+- [ ] calendar
+- [ ] dialog
+- [ ] sheet
+- [ ] sidebar
+
+Exit gate for M3:
+
+- [ ] Demo can be run fully from no-chat UI with same backend actions.
+
+## Cross-Cutting Workstreams
+
+### Security + Authorization
+
+- [/] Evolve FGA model from doc-level to org/job/candidate roles.
+- [ ] Add centralized check helper for role-relation-object tuples.
+- [ ] Add negative tests for forbidden actions.
+- [ ] Add redaction policy for candidate PII in low-privilege contexts.
+
+### Auditability
+
+- [ ] Write audit event on every agent and user action.
+- [ ] Include cibaAuthReqId and approval actor where applicable.
+- [ ] Build query helpers for candidate-centric timelines.
+
+### Reliability + Observability
+
+- [ ] Add per-tool structured logs with request id.
+- [ ] Add retry policy for transient Gmail/Google API errors.
+- [ ] Add dead-letter handling for failed intake runs.
+
+### Test Strategy
+
+- [ ] Unit tests for schema validation and policy checks.
+- [ ] Integration tests for critical route chains.
+- [ ] Smoke scripts for demo paths.
+
+## Verify-First Checklist (Use Before Building Any Feature)
+
+For any feature PR, complete this checklist first:
+
+- [ ] Auth state verified (valid session).
+- [ ] Required provider connection consent exists (or explicit interrupt path tested).
+- [ ] Required DB migration applied locally.
+- [ ] FGA relation needed by feature is defined.
+- [ ] Tool input/output schema written before route logic.
+
+## Command Runbook
+
+### Daily Bootstrap
+
+- [ ] npm install
+- [ ] docker compose up -d
+- [ ] npm run db:push
+- [ ] npm run fga:init
+- [ ] npm run dev
+
+### Connection Smoke
+
+- [ ] Trigger Gmail read tool from chat and confirm non-empty output.
+- [ ] Trigger calendar read tool and confirm structured events.
+- [ ] Trigger slack channel list tool and confirm channel names.
+
+### Data Smoke
+
+- [ ] Create candidate ingest payload via route/tool.
+- [ ] Verify candidate row + audit row written.
+- [ ] Verify stage query for job returns expected counts.
+
+### Clearance Smoke
+
+- [ ] Create offer draft as hiring_manager.
+- [ ] Confirm CIBA request enters awaiting_clearance.
+- [ ] Simulate approval path and verify offer sent transition.
+
+## Risks and Mitigations
+
+- [ ] Risk: Token scope mismatch at runtime.
+	- Mitigation: always request minimal operation-specific scopes and expose meaningful consent prompts.
+
+- [ ] Risk: Incomplete RLS before API exposure.
+	- Mitigation: no public data routes merged without RLS enabled and reviewed.
+
+- [ ] Risk: CIBA race/poll timeouts.
+	- Mitigation: explicit pending/expired/denied states with retries and user-visible timers.
+
+- [ ] Risk: Scope creep into dashboard polish.
+	- Mitigation: enforce M1/M2 exit gates before any large UI epics.
+
+## Immediate Next 72 Hours
+
+### Day 1
+
+- [x] Finalize Headhunt domain schema migration set.
+- [x] Replace Assistant0 UI shell with AI SDK UI `useChat` baseline.
+- [x] Add candidate ingest lite route with audit logging.
+- [x] Add connection diagnostics tools in chat.
+
+### Day 2
+
+- [ ] Implement run_triage + generate_intel_card tools.
+- [ ] Persist score outputs and stage transitions.
+- [ ] Add first FGA checks for candidate visibility.
+- [/] Add AI SDK UI message persistence and stop/regenerate hardening.
+
+### Day 3
+
+- [ ] Implement offer draft + CIBA hold skeleton.
+- [ ] Scaffold FastMCP server with first two tools (`list_jobs`, `list_pipeline`).
+- [ ] Add approvals API surface and pending state model.
+- [ ] Demo script dry run from chat operator flow.
+
+## Definition of Done For Hackathon Demo
+
+- [ ] M1 operator chat runs on AI SDK UI (`useChat`) with tool output visibility + stop control.
+- [ ] Intake can process at least 3 realistic applications from Gmail.
+- [ ] At least 1 candidate goes end-to-end: reviewed -> interview_scheduled -> interviewed -> offer_sent.
+- [ ] Hiring manager initiated offer requires founder CIBA approval.
+- [ ] FastMCP endpoint can answer list_jobs + list_pipeline + candidate detail for authorized user.
+- [ ] Audit timeline clearly shows agent and human actions.
+
+## Out of Scope Until Core Flow Is Green
+
+- [ ] Fancy visual polish not tied to state clarity.
+- [ ] Full Gmail Pub/Sub production hardening.
+- [ ] Bulk operations and advanced analytics.
+- [ ] Additional outbound channels beyond required demo paths.
+

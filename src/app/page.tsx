@@ -13,18 +13,35 @@ export default async function Home() {
         <h2 className="text-xl">You are not logged in</h2>
         <div className="flex gap-4">
           <Button asChild variant="default" size="default">
-            <a href="/auth/login" className="flex items-center gap-2">
+            <a href="/auth/login?prompt=login&max_age=0" className="flex items-center gap-2">
               <LogIn />
               <span>Login</span>
             </a>
           </Button>
           <Button asChild variant="default" size="default">
-            <a href="/auth/login?screen_hint=signup">
+            <a href="/auth/login?screen_hint=signup&prompt=login&max_age=0">
               <UserPlus />
               <span>Sign up</span>
             </a>
           </Button>
         </div>
+      </div>
+    );
+  }
+
+  const chatUserId = session.user?.sub ?? session.user?.email ?? null;
+
+  if (!chatUserId) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-[50vh] my-auto gap-4">
+        <h2 className="text-xl">Unable to determine account identity</h2>
+        <p className="text-sm text-muted-foreground">Please sign in again to start an isolated chat session.</p>
+        <Button asChild variant="default" size="default">
+          <a href="/auth/login?prompt=login&max_age=0" className="flex items-center gap-2">
+            <LogIn />
+            <span>Sign in again</span>
+          </a>
+        </Button>
       </div>
     );
   }
@@ -70,10 +87,12 @@ export default async function Home() {
 
   return (
     <ChatWindow
+      key={chatUserId}
       endpoint="api/chat"
       emoji="🤖"
       placeholder={`Hello ${session?.user?.name}, I'm your personal assistant. How can I help you today?`}
       emptyStateComponent={InfoCard}
+      userId={chatUserId}
     />
   );
 }
