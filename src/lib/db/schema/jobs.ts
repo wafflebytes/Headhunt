@@ -1,10 +1,13 @@
 import { sql } from 'drizzle-orm';
 import { pgTable, text, timestamp, varchar } from 'drizzle-orm/pg-core';
-import { createSelectSchema } from 'drizzle-zod';
+import { createInsertSchema, createSelectSchema } from 'drizzle-zod';
 import { z } from 'zod';
 
 import { nanoid } from '@/utils/nano-id';
 import { organizations } from './organizations';
+
+export const JOB_STATUSES = ['draft', 'active', 'paused', 'closed'] as const;
+export const jobStatusSchema = z.enum(JOB_STATUSES);
 
 export const jobs = pgTable('jobs', {
   id: varchar('id', { length: 191 })
@@ -23,6 +26,28 @@ export const jobs = pgTable('jobs', {
     .default(sql`now()`),
 });
 
-export const jobSchema = createSelectSchema(jobs).extend({});
+export const jobSchema = createSelectSchema(jobs, {
+  status: jobStatusSchema,
+}).extend({});
+
+export const jobInsertSchema = createInsertSchema(jobs, {
+  status: jobStatusSchema,
+})
+  .omit({
+    id: true,
+    createdAt: true,
+    updatedAt: true,
+  })
+  .extend({
+    title: z.string().min(1),
+  });
+
+export const jobUpdateSchema = jobInsertSchema
+  .partial()
+  .extend({
+    id: z.string().min(1),
+  });
 
 export type Job = z.infer<typeof jobSchema>;
+export type JobInsert = z.infer<typeof jobInsertSchema>;
+export type JobUpdate = z.infer<typeof jobUpdateSchema>;

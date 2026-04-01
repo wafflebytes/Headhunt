@@ -37,6 +37,27 @@ async function main() {
           viewer: { this: {} },
         },
       },
+      {
+        type: 'candidate',
+        metadata: {
+          relations: {
+            can_view: {},
+            owner: { directly_related_user_types: [{ type: 'user' }] },
+            viewer: {
+              directly_related_user_types: [{ type: 'user' }, { type: 'user', wildcard: {} }],
+            },
+          },
+        },
+        relations: {
+          can_view: {
+            union: {
+              child: [{ computedUserset: { relation: 'owner' } }, { computedUserset: { relation: 'viewer' } }],
+            },
+          },
+          owner: { this: {} },
+          viewer: { this: {} },
+        },
+      },
     ],
   });
 

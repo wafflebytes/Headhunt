@@ -1,9 +1,9 @@
 # Headhunt Tracker - Full Flow Execution
 
-Last updated: 2026-04-01
+Last updated: 2026-04-02
 Owner: Lead Founding Engineer
 Execution mode: ship plumbing first, polish later
-Current implementation focus: M1.1 account-isolation and login-flow hardening implemented; next step is live re-verification across multiple identities and then M2 triage/intel tools.
+Current implementation focus: M2.0 contract hardening and acceptance/exit verification for completed M1/M2 slices.
 
 ## Legend
 
@@ -11,6 +11,8 @@ Current implementation focus: M1.1 account-isolation and login-flow hardening im
 - [/] active
 - [ ] queued
 - [!] blocked
+
+Execution rule: implementation checkboxes can move to done only when that section's acceptance checks are satisfied; otherwise keep the section in active.
 
 ## Non-Negotiable Principle
 
@@ -126,7 +128,8 @@ Exit criteria: deterministic E2E smoke from authenticated request -> tokenized p
 	- Evidence: drizzle push executed successfully.
 - [x] Confirm FGA init script runs.
 	- Evidence: npm run fga:init successful.
-- [/] Add explicit .env checklist section for Headhunt-specific vars (Auth0/FGA/Supabase/CIBA/MCP).
+- [x] Add explicit .env checklist section for Headhunt-specific vars (Auth0/FGA/Supabase/CIBA/MCP).
+	- Evidence: .env.example now includes Token Vault connection/scope overrides used by diagnostics.
 
 ### M1.0A Chat UI Swap (Assistant0 -> Vercel AI SDK UI)
 
@@ -182,19 +185,21 @@ Acceptance checks:
 	- [x] audit_logs
 
 - [x] Create Drizzle schema files for each entity.
-- [ ] Add enums for stage/status where useful.
+- [x] Add enums for stage/status where useful.
 - [x] Add indexes for frequent access paths:
 	- [x] candidates(job_id, stage)
 	- [x] offers(status)
 	- [x] audit_logs(resource_type, resource_id, timestamp)
 
-- [ ] Add Zod schemas for insert/update DTOs.
+- [x] Add Zod schemas for insert/update DTOs.
+- [x] Add deterministic demo seed script for stage-matrix data (jobs/candidates/applications/interviews/templates/offers/audit logs).
 
 Acceptance checks:
 
 - [x] db:generate + db:push works cleanly.
 - [x] Minimal seed inserts organization/job/candidate rows.
 - [x] Query returns expected counts by stage.
+- [x] Demo seed command can recreate applied->hired pipeline states with stable IDs.
 
 ### M1.3 First Valuable Write (Candidate Ingest Lite)
 
@@ -215,10 +220,10 @@ Acceptance checks:
 
 ### M1.4 RLS/Server-Key Boundaries
 
-- [ ] Enable RLS on new public tables.
-- [ ] Add restrictive base policies (authenticated only + org scoped).
-- [ ] Keep all service-role operations server-side only.
-- [ ] Add "security smoke" SQL checks in tracker runbook.
+- [x] Enable RLS on new public tables.
+- [x] Add restrictive base policies (authenticated only + org scoped).
+- [x] Keep all service-role operations server-side only.
+- [x] Add "security smoke" SQL checks in tracker runbook.
 
 Exit gate for M1:
 
@@ -233,28 +238,30 @@ Exit criteria: Headhunt core actions callable as tools with structured outputs a
 
 ### M2.0 Orchestrator Scope
 
-- [ ] Define tool contracts in code for first wave actions:
-	- [ ] run_intercept
-	- [ ] run_triage
-	- [ ] generate_intel_card
-	- [ ] schedule_interview_slots
+
+- [/] Define tool contracts in code for first wave actions:
+	- [x] run_intercept
+	- [x] run_intake_e2e
+	- [x] run_triage
+	- [x] generate_intel_card
+	- [x] schedule_interview_slots
 	- [ ] draft_offer_letter
 	- [ ] submit_offer_for_clearance
 
-- [ ] Each tool must enforce:
-	- [ ] input validation (zod)
-	- [ ] FGA check before writes
-	- [ ] audit logging
-	- [ ] normalized result schema
+- [/] Each tool must enforce:
+	- [/] input validation (zod)
+	- [/] FGA check before writes
+	- [/] audit logging
+	- [/] normalized result schema
 
 ### M2.1 Intercept + Triage
 
-- [ ] Build intercept route/tool to pull candidate-like emails from Gmail.
-- [ ] Build triage classifier output schema:
-	- [ ] classification (application/scheduling_reply/inquiry/irrelevant)
-	- [ ] jobId (nullable)
-	- [ ] confidence
-- [ ] Persist triage decision + route decision.
+- [x] Build intercept route/tool to pull candidate-like emails from Gmail.
+- [x] Build triage classifier output schema:
+	- [x] classification (application/scheduling_reply/inquiry/irrelevant)
+	- [x] jobId (nullable)
+	- [x] confidence
+- [x] Persist triage decision + route decision.
 
 Acceptance checks:
 
@@ -264,10 +271,10 @@ Acceptance checks:
 
 ### M2.2 Analyst (Intel Card Generation)
 
-- [ ] Implement generate_intel_card tool using structured output schema.
-- [ ] Parse resume text (PDF/plain/markdown) if available.
-- [ ] Save score, score breakdown, qualification checks, summary, work history.
-- [ ] Upsert candidate stage to reviewed.
+- [x] Implement generate_intel_card tool using structured output schema.
+- [x] Parse resume text (PDF/plain/markdown) if available.
+- [x] Save score, score breakdown, qualification checks, summary, work history.
+- [x] Upsert candidate stage to reviewed.
 
 Acceptance checks:
 
@@ -278,10 +285,10 @@ Acceptance checks:
 ### M2.3 Liaison (Scheduling Actions)
 
 - [ ] Tool: parse_candidate_availability
-- [ ] Tool: propose_interview_slots
-- [ ] Tool: confirm_interview_event
+- [x] Tool: propose_interview_slots
+- [x] Tool: confirm_interview_event
 - [ ] Tool: send_interview_confirmation
-- [ ] Persist interview record + candidate stage transitions.
+- [x] Persist interview record + candidate stage transitions.
 
 Acceptance checks:
 
@@ -398,7 +405,7 @@ Exit gate for M3:
 ### Security + Authorization
 
 - [/] Evolve FGA model from doc-level to org/job/candidate roles.
-- [ ] Add centralized check helper for role-relation-object tuples.
+- [x] Add centralized check helper for role-relation-object tuples.
 - [ ] Add negative tests for forbidden actions.
 - [ ] Add redaction policy for candidate PII in low-privilege contexts.
 
@@ -418,7 +425,15 @@ Exit gate for M3:
 
 - [ ] Unit tests for schema validation and policy checks.
 - [ ] Integration tests for critical route chains.
-- [ ] Smoke scripts for demo paths.
+- [/] Smoke scripts for demo paths.
+	- [x] Deterministic DB seed script exists (`npm run seed:demo`).
+	- [ ] Add authenticated endpoint replay script for fixture emails.
+
+### Demo Seed Strategy
+
+- [x] Create deterministic demo seed script (`scripts/seed-demo-headhunt.ts`).
+- [x] Create playbook for scopes, fixtures, and inject runbook (`product/headhunt-demo-seed-playbook.md`).
+- [x] Add one-command fixture replay path for authenticated Gmail intake (`run_intake_e2e`).
 
 ## Verify-First Checklist (Use Before Building Any Feature)
 
@@ -448,9 +463,29 @@ For any feature PR, complete this checklist first:
 
 ### Data Smoke
 
+- [x] Run deterministic seed: `npm run seed:demo -- --reset`.
+- [x] Confirm stage matrix includes applied/reviewed/interview_scheduled/interviewed/offer_sent/hired/rejected.
+- [ ] Run one-command intake replay in chat: `run_intake_e2e` and confirm processed message summary.
 - [ ] Create candidate ingest payload via route/tool.
 - [ ] Verify candidate row + audit row written.
 - [ ] Verify stage query for job returns expected counts.
+
+### RLS Security Smoke
+
+- [ ] Run migrations on a migration-tracked DB: `npm run db:migrate`.
+- [ ] If local DB was bootstrapped with `db:push` and migration history is missing, apply only the RLS migration file directly:
+	- `node -e "const fs=require('fs'); require('dotenv').config({path:'.env.local'}); const postgres=require('postgres'); const sql=postgres(process.env.DATABASE_URL,{max:1}); (async()=>{await sql.unsafe(fs.readFileSync('src/lib/db/migrations/0003_wise_selene.sql','utf8')); await sql.end(); console.log('ok');})().catch(async e=>{console.error(e); try{await sql.end();}catch{} process.exit(1);});"`
+- [ ] Set authenticated org claims in SQL session:
+	- `select set_config('request.jwt.claims', '{"role":"authenticated","org_id":"org_smoke"}', true);`
+- [ ] Confirm org-scoped reads allow same-org rows:
+	- `select count(*) from jobs where organization_id = 'org_smoke';`
+- [ ] Confirm cross-org rows are blocked by RLS:
+	- `select count(*) from jobs where organization_id = 'org_other';` (expected `0`)
+- [ ] Confirm unauthenticated requests are blocked:
+	- `select set_config('request.jwt.claims', '{"role":"anon"}', true);`
+	- `select count(*) from jobs;` (expected `0`)
+- [ ] Confirm application access is scoped through job organization:
+	- `select count(*) from applications;` with org claims should only return applications linked to that org's jobs.
 
 ### Clearance Smoke
 
@@ -483,17 +518,18 @@ For any feature PR, complete this checklist first:
 
 ### Day 2
 
-- [ ] Implement run_triage + generate_intel_card tools.
-- [ ] Persist score outputs and stage transitions.
-- [ ] Add first FGA checks for candidate visibility.
+- [x] Implement run_triage + generate_intel_card tools.
+- [x] Persist score outputs and stage transitions.
+- [x] Add first FGA checks for candidate visibility.
 - [/] Add AI SDK UI message persistence and stop/regenerate hardening.
+- [x] Add deterministic demo seed + scope playbook for operator runbook.
 
 ### Day 3
 
 - [ ] Implement offer draft + CIBA hold skeleton.
 - [ ] Scaffold FastMCP server with first two tools (`list_jobs`, `list_pipeline`).
 - [ ] Add approvals API surface and pending state model.
-- [ ] Demo script dry run from chat operator flow.
+- [/] Demo script dry run from chat operator flow (data seed + one-command intake replay runner ready).
 
 ## Definition of Done For Hackathon Demo
 

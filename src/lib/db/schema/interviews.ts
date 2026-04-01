@@ -1,12 +1,15 @@
 import { sql } from 'drizzle-orm';
 import { index, integer, pgTable, text, timestamp, varchar } from 'drizzle-orm/pg-core';
-import { createSelectSchema } from 'drizzle-zod';
+import { createInsertSchema, createSelectSchema } from 'drizzle-zod';
 import { z } from 'zod';
 
 import { nanoid } from '@/utils/nano-id';
 import { candidates } from './candidates';
 import { jobs } from './jobs';
 import { organizations } from './organizations';
+
+export const INTERVIEW_STATUSES = ['scheduled', 'completed', 'cancelled', 'no_show'] as const;
+export const interviewStatusSchema = z.enum(INTERVIEW_STATUSES);
 
 export const interviews = pgTable(
   'interviews',
@@ -43,6 +46,28 @@ export const interviews = pgTable(
   ],
 );
 
-export const interviewSchema = createSelectSchema(interviews).extend({});
+export const interviewSchema = createSelectSchema(interviews, {
+  status: interviewStatusSchema,
+}).extend({});
+
+export const interviewInsertSchema = createInsertSchema(interviews, {
+  status: interviewStatusSchema,
+})
+  .omit({
+    id: true,
+    createdAt: true,
+    updatedAt: true,
+  })
+  .extend({
+    durationMinutes: z.number().int().min(1).max(480),
+  });
+
+export const interviewUpdateSchema = interviewInsertSchema
+  .partial()
+  .extend({
+    id: z.string().min(1),
+  });
 
 export type Interview = z.infer<typeof interviewSchema>;
+export type InterviewInsert = z.infer<typeof interviewInsertSchema>;
+export type InterviewUpdate = z.infer<typeof interviewUpdateSchema>;
