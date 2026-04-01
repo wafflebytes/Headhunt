@@ -206,6 +206,7 @@ function getToolCallsFromMessage(message: UIMessage): ToolCallView[] {
 
     const partType = asNonEmptyString(partRecord?.type) ?? '';
     const partState = asNonEmptyString(partRecord?.state) ?? '';
+    const toolError = partRecord?.error ?? partRecord?.errorText ?? toolInvocation?.error ?? toolInvocation?.errorText;
 
     if (partState === 'output-available' || partType === 'tool-output-available') {
       existing.status = 'complete';
@@ -220,6 +221,9 @@ function getToolCallsFromMessage(message: UIMessage): ToolCallView[] {
       partRecord?.isError === true
     ) {
       existing.status = 'error';
+      if (toolError !== undefined && existing.result === undefined) {
+        existing.result = typeof toolError === 'string' ? { message: toolError } : toolError;
+      }
     }
 
     if (partType === 'tool-result') {
@@ -263,6 +267,111 @@ function summarizeToolResult(result: unknown): string | null {
   }
 
   return null;
+}
+
+function formatScheduleToolResult(result: unknown): string | null {
+  const resultRecord = asRecord(result);
+  if (!resultRecord) {
+    return null;
+  }
+
+  const check = asNonEmptyString(resultRecord.check);
+  if (check !== 'schedule_interview_slots') {
+    return null;
+  }
+
+  const status = asNonEmptyString(resultRecord.status);
+  const mode = asNonEmptyString(resultRecord.mode);
+
+  if (status === 'error') {
+    const message = asNonEmptyString(resultRecord.message) ?? 'Unknown scheduling error.';
+    return `Scheduling failed: ${message}`;
+  }
+
+  if (status !== 'success') {
+    return null;
+  }
+
+  if (mode === 'propose') {
+    const slotsValue = resultRecord.slots;
+    const slots = Array.isArray(slotsValue) ? slotsValue : [];
+    const recommendedRaw = resultRecord.recommendedSlotIndex;
+    const recommendedIndex =
+      typeof recommendedRaw === 'number' && Number.isInteger(recommendedRaw) ? recommendedRaw : -1;
+
+    const slotLines = slots
+      .map((slot, index) => {
+        const slotRecord = asRecord(slot);
+        if (!slotRecord) {
+          return null;
+        }
+
+        const displayLabel = asNonEmptyString(slotRecord.displayLabel);
+        const startISO = asNonEmptyString(slotRecord.startISO);
+        if (!displayLabel || !startISO) {
+          return null;
+        }
+
+        const suffix = index === recommendedIndex ? ' (recommended)' : '';
+        return `${index + 1}. ${displayLabel}${suffix}\n   selectedStartISO: \"${startISO}\"`;
+      })
+      .filter((line): line is string => Boolean(line));
+
+    if (slotLines.length === 0) {
+      return 'Interview slots proposed, but no available slots were returned in the current window.';
+    }
+
+    const recommendedSlot =
+      recommendedIndex >= 0 && recommendedIndex < slots.length ? asRecord(slots[recommendedIndex]) : null;
+    const recommendedStartISO = recommendedSlot ? asNonEmptyString(recommendedSlot.startISO) : null;
+
+    const confirmHint = recommendedStartISO
+      ? `Reply with selectedStartISO \"${recommendedStartISO}\" to confirm scheduling.`
+      : 'Reply with the chosen selectedStartISO value to confirm scheduling.';
+
+    return `Interview slots proposed successfully.\n\n${slotLines.join('\n')}\n\n${confirmHint}`;
+  }
+
+  if (mode === 'schedule') {
+    const eventRecord = asRecord(resultRecord.event);
+    const displayLabel = asNonEmptyString(eventRecord?.displayLabel);
+    const startISO = asNonEmptyString(eventRecord?.startISO);
+    const endISO = asNonEmptyString(eventRecord?.endISO);
+    const meetLink = asNonEmptyString(eventRecord?.meetLink);
+    const htmlLink = asNonEmptyString(eventRecord?.htmlLink);
+
+    const lines = ['Interview scheduled successfully.'];
+    if (displayLabel) {
+      lines.push(`Slot: ${displayLabel}`);
+    } else if (startISO && endISO) {
+      lines.push(`Slot: ${startISO} -> ${endISO}`);
+    }
+
+    if (meetLink) {
+      lines.push(`Meet link: ${meetLink}`);
+    }
+
+    if (htmlLink) {
+      lines.push(`Calendar event: ${htmlLink}`);
+    }
+
+    return lines.join('\n');
+  }
+
+  return null;
+}
+
+function formatToolErrorSummary(toolCall: ToolCallView): string | null {
+  if (toolCall.status !== 'error') {
+    return null;
+  }
+
+  const detail = summarizeToolResult(toolCall.result);
+  if (detail) {
+    return `${toolCall.toolName} failed: ${detail}`;
+  }
+
+  return `${toolCall.toolName} failed. See tool output above.`;
 }
 
 function getAssistantFallbackText(toolCalls: ToolCallView[]): string {
@@ -358,9 +467,24 @@ function ToolCallDisplay({ toolCall }: { toolCall: ToolCallView }) {
 export function ChatMessageBubble(props: { message: UIMessage; aiEmoji?: string }) {
   const { message, aiEmoji } = props;
   const toolCalls = getToolCallsFromMessage(message);
+  const authoritativeScheduleText =
+    message.role === 'assistant'
+      ? [...toolCalls]
+          .reverse()
+          .filter((toolCall) => toolCall.toolName === 'schedule_interview_slots' && toolCall.status === 'complete')
+          .map((toolCall) => formatScheduleToolResult(toolCall.result))
+          .find((value): value is string => Boolean(value)) ?? ''
+      : '';
+  const authoritativeToolErrorText =
+    message.role === 'assistant'
+      ? [...toolCalls]
+          .reverse()
+          .map((toolCall) => formatToolErrorSummary(toolCall))
+          .find((value): value is string => Boolean(value)) ?? ''
+      : '';
   const text = message.role === 'assistant' ? sanitizeAssistantText(uiMessageToText(message)) : uiMessageToText(message);
   const hideStubText = message.role === 'assistant' && isLikelyAssistantStub(text);
-  const renderedText = hideStubText ? '' : text;
+  const renderedText = authoritativeScheduleText || authoritativeToolErrorText || (hideStubText ? '' : text);
   const fallbackText = message.role === 'assistant' && !renderedText ? getAssistantFallbackText(toolCalls) : '';
 
   if (message.role === 'assistant' && !renderedText && !fallbackText && toolCalls.length === 0) {

@@ -193,6 +193,23 @@ Scheduling troubleshooting:
 - If `schedule_interview_slots` loops on generic authorization prompts, use the latest code and rerun once.
 - If candidate is seeded but not yours, you may see `Forbidden: no candidate visibility access`; use the candidate id created by your own `run_intake_e2e` run.
 - If Calendar scopes are missing, the tool now returns an explicit message to run `run_connection_diagnostics` and then `authorize_connections_step:google`.
+- If selectedStartISO is stale, the tool now returns fresh slots in the same response (`mode: propose`) with `recovery.reason: stale_selected_start_iso`; you only need to confirm one of the returned selectedStartISO values.
+
+Chat log smoke check (automated):
+- Copy logs from chat using `Copy Logs` (Latest You + AI Exchange or Full Session).
+- Save to a file, then run:
+
+```bash
+npm run smoke:chat-log -- --file /tmp/hhlog.txt --require-scheduling --verbose
+```
+
+- Or run directly from clipboard:
+
+```bash
+pbpaste | npm run smoke:chat-log -- --require-scheduling --verbose
+```
+
+- The command fails with exit code 1 when it detects stale/conflict schedule errors, raw tool marker leakage, or stub assistant text.
 
 ### Path 3 - API-level ingest (single message replay)
 
