@@ -245,8 +245,24 @@ function shouldEscalateToManualReview(handlerType: string, result: JsonObject): 
   return false;
 }
 
+function resolveAutomationExecuteUrl() {
+  const configured = requiredEnv('AUTOMATION_EXECUTE_URL').trim();
+
+  try {
+    const parsed = new URL(configured);
+    // Guard against stale local-only secrets in cloud runtime.
+    if (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') {
+      return 'https://headhunt-one.vercel.app/api/automation/execute';
+    }
+  } catch {
+    // Keep original error behavior if URL parsing fails later.
+  }
+
+  return configured;
+}
+
 async function invokeAutomationExecutor(run: AutomationRunRow): Promise<JsonObject> {
-  const executeUrl = requiredEnv('AUTOMATION_EXECUTE_URL');
+  const executeUrl = resolveAutomationExecuteUrl();
   const executeSecret =
     Deno.env.get('AUTOMATION_EXECUTE_SECRET')?.trim() ||
     Deno.env.get('SUPABASE_AUTOMATION_FUNCTION_SECRET')?.trim() ||
