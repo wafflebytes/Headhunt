@@ -2,7 +2,7 @@ type CibaBaseConfig = {
   domain: string;
   clientId: string;
   clientSecret: string;
-  audience: string;
+  audience?: string;
   scope: string;
   issuer: string;
 };
@@ -63,7 +63,7 @@ function normalizeDomain(rawDomain: string): string {
 }
 
 function normalizeIssuer(rawIssuer: string): string {
-  return rawIssuer.replace(/\/+$/g, '/') + '/';
+  return rawIssuer.replace(/\/+$/g, '') + '/';
 }
 
 function resolveCibaConfig(params: { audience?: string; scope?: string }): CibaBaseConfig {
@@ -74,10 +74,6 @@ function resolveCibaConfig(params: { audience?: string; scope?: string }): CibaB
     params.audience ??
     process.env.AUTH0_CIBA_AUDIENCE?.trim() ??
     process.env.SHOP_API_AUDIENCE?.trim();
-
-  if (!audience) {
-    throw new Error('Missing CIBA audience. Set AUTH0_CIBA_AUDIENCE or SHOP_API_AUDIENCE.');
-  }
 
   const scope = params.scope ?? process.env.AUTH0_CIBA_SCOPE?.trim() ?? 'openid';
   const issuer = normalizeIssuer(process.env.AUTH0_CIBA_LOGIN_HINT_ISSUER?.trim() ?? `https://${domain}`);
@@ -144,28 +140,48 @@ function encodeLoginHint(founderUserId: string, issuer: string): string {
 export async function initiateCibaAuthorization(input: CibaInitiationInput): Promise<CibaInitiationResult> {
   const config = resolveCibaConfig({ audience: input.audience, scope: input.scope });
 
-  const params = new URLSearchParams({
-    client_id: config.clientId,
-    client_secret: config.clientSecret,
-    audience: config.audience,
-    scope: config.scope,
-    login_hint: encodeLoginHint(input.founderUserId, config.issuer),
-    binding_message: input.bindingMessage,
-  });
+  const requestCiba = async (includeAudience: boolean) => {
+    const params = new URLSearchParams({
+      client_id: config.clientId,
+      client_secret: config.clientSecret,
+      scope: config.scope,
+      login_hint: encodeLoginHint(input.founderUserId, config.issuer),
+      binding_message: input.bindingMessage,
+    });
 
-  if (typeof input.requestedExpirySeconds === 'number' && Number.isFinite(input.requestedExpirySeconds)) {
-    params.set('requested_expiry', String(Math.max(60, Math.floor(input.requestedExpirySeconds))));
+    if (includeAudience && config.audience) {
+      params.set('audience', config.audience);
+    }
+
+    if (typeof input.requestedExpirySeconds === 'number' && Number.isFinite(input.requestedExpirySeconds)) {
+      params.set('requested_expiry', String(Math.max(60, Math.floor(input.requestedExpirySeconds))));
+    }
+
+    const response = await fetch(`https://${config.domain}/bc-authorize`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body: params.toString(),
+    });
+
+    const payload = await parseJson(response);
+    return { response, payload };
+  };
+
+  const useAudience = Boolean(config.audience);
+  let { response, payload } = await requestCiba(useAudience);
+
+  if (!response.ok) {
+    const errorMessage = parseAuth0Error(payload, 'Failed to initiate CIBA authorization request.');
+    const shouldRetryWithoutAudience = useAudience && /service not found/i.test(errorMessage);
+
+    if (shouldRetryWithoutAudience) {
+      const retry = await requestCiba(false);
+      response = retry.response;
+      payload = retry.payload;
+    }
   }
-
-  const response = await fetch(`https://${config.domain}/bc-authorize`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/x-www-form-urlencoded',
-    },
-    body: params.toString(),
-  });
-
-  const payload = await parseJson(response);
 
   if (!response.ok) {
     throw new Error(parseAuth0Error(payload, 'Failed to initiate CIBA authorization request.'));
@@ -259,6 +275,17 @@ export async function pollCibaAuthorization(params: {
   }
 
   if (errorCode === 'expired_token') {
+    return {
+      status: 'expired',
+      message: errorMessage,
+    };
+  }
+
+  // Auth0 may return stale/invalid CIBA request IDs as invalid_grant instead of expired_token.
+  if (
+    errorCode === 'invalid_grant' &&
+    /invalid\s+or\s+expired\s+auth_req_id|expired\s+auth_req_id/i.test(errorMessage)
+  ) {
     return {
       status: 'expired',
       message: errorMessage,

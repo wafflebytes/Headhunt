@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
+import { setAIContext } from '@auth0/ai-vercel';
 
 import { executeAutomationHandler } from '@/lib/automation/queue';
 
@@ -37,15 +38,31 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const result = await executeAutomationHandler({
-    handlerType: payload.data.handlerType,
-    payload: payload.data.payload,
+  setAIContext({
+    threadID: `automation:${payload.data.handlerType}:${Date.now()}`,
   });
 
-  return NextResponse.json({
-    check: 'automation_execute',
-    status: 'success',
-    handlerType: payload.data.handlerType,
-    result,
-  });
+  try {
+    const result = await executeAutomationHandler({
+      handlerType: payload.data.handlerType,
+      payload: payload.data.payload,
+    });
+
+    return NextResponse.json({
+      check: 'automation_execute',
+      status: 'success',
+      handlerType: payload.data.handlerType,
+      result,
+    });
+  } catch (error) {
+    return NextResponse.json(
+      {
+        check: 'automation_execute',
+        status: 'error',
+        handlerType: payload.data.handlerType,
+        message: error instanceof Error ? error.message : 'Automation execute failed.',
+      },
+      { status: 500 },
+    );
+  }
 }

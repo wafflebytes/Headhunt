@@ -1,12 +1,28 @@
 // @ts-nocheck
 import {
+  asNumber,
   asString,
   createAdminClient,
   isAuthorized,
   jsonResponse,
+  processQueue,
   readJsonObject,
   replayRun,
 } from '../_shared/automation-runtime.ts';
+
+function asBoolean(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true') return true;
+    if (normalized === 'false') return false;
+  }
+
+  return undefined;
+}
 
 Deno.serve(async (request) => {
   if (request.method !== 'POST') {
@@ -46,10 +62,26 @@ Deno.serve(async (request) => {
       );
     }
 
+    const processNow = asBoolean(payload.processNow) ?? true;
+    const processLimit = Math.max(1, Math.min(10, asNumber(payload.processLimit) ?? 1));
+    const executeCookie =
+      request.headers.get('x-automation-execute-cookie')?.trim() ||
+      request.headers.get('cookie')?.trim() ||
+      asString(payload.executeCookie);
+
+    let processed: Record<string, unknown> | undefined;
+    if (processNow) {
+      processed = await processQueue(client, processLimit, {
+        executeCookie,
+      });
+    }
+
     return jsonResponse({
       check: 'automation_replay',
       status: 'success',
       run: replayed,
+      processNow,
+      processed,
     });
   } catch (error) {
     return jsonResponse(

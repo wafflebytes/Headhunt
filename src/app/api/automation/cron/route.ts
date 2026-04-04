@@ -24,7 +24,7 @@ export async function POST(request: NextRequest) {
     functionName: 'automation-cron',
     fallbackBody: {
       job: 'all',
-      limit: 20,
+      limit: 6,
     },
   });
 }

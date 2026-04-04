@@ -45,7 +45,11 @@ import {
   summarizeCalBookingTranscriptTool,
   summarizeDriveTranscriptPdfTool,
 } from '@/lib/tools/interview-transcripts';
-import { draftOfferLetterTool } from '@/lib/tools/offers';
+import {
+  draftOfferLetterTool,
+  pollOfferClearanceTool,
+  submitOfferForClearanceTool,
+} from '@/lib/tools/offers';
 import { runMultiAgentCandidateScoreTool } from '@/lib/tools/multi-agent-candidate-score';
 import { generateIntelCardTool, runTriageTool } from '@/lib/tools/triage-intel';
 
@@ -424,6 +428,44 @@ function buildDraftOfferLetterForcedArgsInstruction(rawText: string): string | u
   });
 }
 
+function buildSubmitOfferForClearanceForcedArgsInstruction(rawText: string): string | undefined {
+  const parsed = parseCommandArgs(rawText);
+  const submitArgs = {
+    offerId: parsed.offerId,
+    candidateId: resolveCandidateId(parsed),
+    jobId: resolveJobId(parsed),
+    organizationId: resolveOrganizationId(parsed),
+    actorUserId: parsed.actorUserId,
+    founderUserId: parsed.founderUserId,
+    requestedExpirySeconds: toNumberOrUndefined(parsed.requestedExpirySeconds),
+    forceReissue: toBooleanOrUndefined(parsed.forceReissue),
+  };
+
+  return buildForcedArgsInstruction({
+    toolName: 'submit_offer_for_clearance',
+    commandDescription: 'an explicit submit_offer_for_clearance command',
+    args: submitArgs,
+  });
+}
+
+function buildPollOfferClearanceForcedArgsInstruction(rawText: string): string | undefined {
+  const parsed = parseCommandArgs(rawText);
+  const pollArgs = {
+    offerId: parsed.offerId,
+    authReqId: parsed.authReqId,
+    organizationId: resolveOrganizationId(parsed),
+    actorUserId: parsed.actorUserId,
+    founderUserId: parsed.founderUserId,
+    allowSystemBypass: toBooleanOrUndefined(parsed.allowSystemBypass),
+  };
+
+  return buildForcedArgsInstruction({
+    toolName: 'poll_offer_clearance',
+    commandDescription: 'an explicit poll_offer_clearance command',
+    args: pollArgs,
+  });
+}
+
 function buildMultiAgentCandidateScoreForcedArgsInstruction(rawText: string): string | undefined {
   const parsed = parseCommandArgs(rawText);
   const scoreArgs = {
@@ -642,6 +684,32 @@ function getForcedToolDecision(messages: Array<UIMessage>): ForcedToolDecision {
     };
   }
 
+  if (/^\/submit-offer\b/i.test(trimmedText)) {
+    const forcedArgsInstruction = buildSubmitOfferForClearanceForcedArgsInstruction(trimmedText);
+    return {
+      toolChoice: {
+        type: 'tool',
+        toolName: 'submit_offer_for_clearance',
+      },
+      forcedArgsInstruction,
+      forcedToolName: 'submit_offer_for_clearance',
+      forcedToolArgs: parseForcedArgs(forcedArgsInstruction),
+    };
+  }
+
+  if (/^\/poll-offer\b/i.test(trimmedText)) {
+    const forcedArgsInstruction = buildPollOfferClearanceForcedArgsInstruction(trimmedText);
+    return {
+      toolChoice: {
+        type: 'tool',
+        toolName: 'poll_offer_clearance',
+      },
+      forcedArgsInstruction,
+      forcedToolName: 'poll_offer_clearance',
+      forcedToolArgs: parseForcedArgs(forcedArgsInstruction),
+    };
+  }
+
   if (/^\/schedule\b/i.test(trimmedText)) {
     const forcedArgsInstruction = buildFinalScheduleFlowForcedArgsInstruction(trimmedText);
     return {
@@ -784,6 +852,35 @@ function getForcedToolDecision(messages: Array<UIMessage>): ForcedToolDecision {
     };
   }
 
+  if (
+    /\bsubmit_offer_for_clearance\b/i.test(text) ||
+    /\bsubmit\s+offer\s+for\s+clearance\b/i.test(text)
+  ) {
+    const forcedArgsInstruction = buildSubmitOfferForClearanceForcedArgsInstruction(text);
+    return {
+      toolChoice: {
+        type: 'tool',
+        toolName: 'submit_offer_for_clearance',
+      },
+      forcedArgsInstruction,
+      forcedToolName: 'submit_offer_for_clearance',
+      forcedToolArgs: parseForcedArgs(forcedArgsInstruction),
+    };
+  }
+
+  if (/\bpoll_offer_clearance\b/i.test(text) || /\bpoll\s+offer\s+clearance\b/i.test(text)) {
+    const forcedArgsInstruction = buildPollOfferClearanceForcedArgsInstruction(text);
+    return {
+      toolChoice: {
+        type: 'tool',
+        toolName: 'poll_offer_clearance',
+      },
+      forcedArgsInstruction,
+      forcedToolName: 'poll_offer_clearance',
+      forcedToolArgs: parseForcedArgs(forcedArgsInstruction),
+    };
+  }
+
   if (/\brun_multi_agent_candidate_score\b/i.test(text)) {
     const forcedArgsInstruction = buildMultiAgentCandidateScoreForcedArgsInstruction(text);
     return {
@@ -914,6 +1011,8 @@ export async function POST(req: NextRequest) {
     summarize_drive_transcript_pdf: summarizeDriveTranscriptPdfTool,
     send_interview_confirmation: sendInterviewConfirmationTool,
     draft_offer_letter: draftOfferLetterTool,
+    submit_offer_for_clearance: submitOfferForClearanceTool,
+    poll_offer_clearance: pollOfferClearanceTool,
   };
 
   const modelMessages = await convertToModelMessages(messages);

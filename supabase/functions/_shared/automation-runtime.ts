@@ -13,6 +13,9 @@ type AutomationRunRow = {
   max_attempts: number;
 };
 
+const AGENT_NAMES = ['intercept', 'triage', 'analyst', 'liaison', 'dispatch'] as const;
+type AgentName = typeof AGENT_NAMES[number];
+
 function requiredEnv(name: string): string {
   const value = Deno.env.get(name)?.trim();
   if (!value) {
@@ -41,6 +44,74 @@ export function asString(value: unknown): string | undefined {
 
 export function asNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+export function asBoolean(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true') {
+      return true;
+    }
+
+    if (normalized === 'false') {
+      return false;
+    }
+  }
+
+  return undefined;
+}
+
+function normalizeAgentName(value: unknown): AgentName | undefined {
+  const raw = asString(value)?.toLowerCase();
+  if (!raw) {
+    return undefined;
+  }
+
+  if (AGENT_NAMES.includes(raw as AgentName)) {
+    return raw as AgentName;
+  }
+
+  return undefined;
+}
+
+function inferAgentFromHandler(handlerType: string): AgentName {
+  if (handlerType === 'intake.scan') {
+    return 'intercept';
+  }
+
+  if (handlerType === 'candidate.score') {
+    return 'analyst';
+  }
+
+  if (handlerType === 'scheduling.request.send' || handlerType === 'scheduling.reply.parse_book') {
+    return 'liaison';
+  }
+
+  if (handlerType.startsWith('offer.')) {
+    return 'dispatch';
+  }
+
+  if (handlerType.startsWith('interview.')) {
+    return 'liaison';
+  }
+
+  return 'triage';
+}
+
+function resolveRunAgentName(run: AutomationRunRow): AgentName {
+  const payload = asRecord(run.payload) ?? {};
+  return normalizeAgentName(payload.agentName) ?? inferAgentFromHandler(run.handler_type);
+}
+
+function withAgentName(payload: JsonObject, fallbackAgent: AgentName): JsonObject {
+  return {
+    ...payload,
+    agentName: normalizeAgentName(payload.agentName) ?? fallbackAgent,
+  };
 }
 
 export function jsonResponse(body: unknown, status = 200) {
@@ -245,6 +316,276 @@ function shouldEscalateToManualReview(handlerType: string, result: JsonObject): 
   return false;
 }
 
+function shouldDeadLetterWithoutRetry(run: AutomationRunRow, result: JsonObject): boolean {
+  const status = asString(result.status);
+  if (status !== 'error') {
+    return false;
+  }
+
+  const message = (asString(result.message) ?? '').toLowerCase();
+
+  if (run.handler_type === 'offer.submit.clearance' && message.includes('offer not found')) {
+    return true;
+  }
+
+  if (run.handler_type === 'offer.submit.clearance') {
+    if (message.includes('no eligible notification channels were found')) {
+      return true;
+    }
+
+    if (message.includes('iss within login_hint')) {
+      return true;
+    }
+
+    if (message.includes('binding_message')) {
+      return true;
+    }
+
+    if (message.includes('service not found')) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function resolveDefaultActorUserId() {
+  return (
+    Deno.env.get('HEADHUNT_FOUNDER_USER_ID')?.trim() ||
+    Deno.env.get('AUTH0_FOUNDER_USER_ID')?.trim() ||
+    undefined
+  );
+}
+
+function compactObject(value: JsonObject): JsonObject {
+  const entries = Object.entries(value).filter(([, item]) => item !== undefined);
+  return Object.fromEntries(entries);
+}
+
+function shouldAutoScheduleFromScore(result: JsonObject): boolean {
+  const consensus = asRecord(result.consensus);
+  const recommendation = asString(consensus?.recommendation);
+
+  if (recommendation) {
+    return recommendation === 'Strong Hire' || recommendation === 'Hire' || recommendation === 'Leaning Hire';
+  }
+
+  const finalScore = asNumber(consensus?.finalScore);
+  if (typeof finalScore === 'number') {
+    return finalScore >= 65;
+  }
+
+  // Preserve forward progress for legacy score payloads that omit consensus.
+  return true;
+}
+
+async function enqueuePostSuccessFollowUps(
+  client: SupabaseClient,
+  run: AutomationRunRow,
+  result: JsonObject,
+): Promise<JsonObject[]> {
+  const payload = asRecord(run.payload) ?? {};
+  const followUps: JsonObject[] = [];
+
+  if (run.handler_type === 'candidate.score' && shouldAutoScheduleFromScore(result)) {
+    const candidateId = asString(result.candidateId) ?? asString(payload.candidateId);
+    const jobId = asString(result.jobId) ?? asString(payload.jobId);
+
+    if (candidateId && jobId) {
+      const organizationId = asString(result.organizationId) ?? asString(payload.organizationId);
+      const actorUserId = asString(payload.actorUserId) ?? resolveDefaultActorUserId();
+      const idempotencyKey = buildIdempotencyKey(['chain', 'candidate-score', 'schedule-request', candidateId, jobId]);
+
+      const schedulingPayload = compactObject({
+        candidateId,
+        jobId,
+        organizationId,
+        actorUserId,
+        agentName: 'liaison',
+        sendMode: asString(payload.schedulingSendMode) ?? 'send',
+        timezone: asString(payload.timezone) ?? 'America/Los_Angeles',
+        durationMinutes: asNumber(payload.durationMinutes) ?? 30,
+        targetDayCount: asNumber(payload.targetDayCount) ?? 3,
+        slotsPerDay: asNumber(payload.slotsPerDay) ?? 1,
+        maxSlotsToEmail: asNumber(payload.maxSlotsToEmail) ?? 3,
+        eventTypeSlug: asString(payload.eventTypeSlug) ?? Deno.env.get('CAL_INTERVIEW_EVENT_TYPE_SLUG')?.trim(),
+        username: asString(payload.username) ?? Deno.env.get('CAL_PUBLIC_USERNAME')?.trim(),
+        teamSlug: asString(payload.teamSlug) ?? Deno.env.get('CAL_PUBLIC_TEAM_SLUG')?.trim(),
+        organizationSlug: asString(payload.organizationSlug) ?? Deno.env.get('CAL_PUBLIC_ORGANIZATION_SLUG')?.trim(),
+      });
+
+      const enqueueResult = await enqueueRun(client, {
+        handlerType: 'scheduling.request.send',
+        resourceType: 'candidate',
+        resourceId: candidateId,
+        idempotencyKey,
+        payload: schedulingPayload,
+        maxAttempts: 6,
+      });
+
+      followUps.push({
+        sourceHandler: run.handler_type,
+        handlerType: 'scheduling.request.send',
+        resourceType: 'candidate',
+        resourceId: candidateId,
+        idempotencyKey,
+        inserted: enqueueResult.inserted,
+        runId: enqueueResult.runId,
+      });
+    }
+  }
+
+  if (run.handler_type === 'scheduling.reply.parse_book' && asString(result.mode) === 'scheduled') {
+    const candidateId = asString(result.candidateId) ?? asString(payload.candidateId);
+    const jobId = asString(result.jobId) ?? asString(payload.jobId);
+
+    if (candidateId && jobId) {
+      const organizationId = asString(result.organizationId) ?? asString(payload.organizationId);
+      const actorUserId = asString(payload.actorUserId) ?? resolveDefaultActorUserId();
+      const templateId = asString(payload.offerTemplateId) ?? asString(payload.templateId);
+      const terms = asRecord(payload.offerTerms) ?? asRecord(payload.terms) ?? {};
+      const resultEvent = asRecord(result.event);
+      const scheduleFingerprint =
+        asString(result.interviewId) ??
+        asString(resultEvent.bookingUid) ??
+        asString(resultEvent.startISO) ??
+        asString(resultEvent.endISO);
+      const idempotencyKey = buildIdempotencyKey([
+        'chain',
+        'interview-scheduled',
+        'offer-draft',
+        candidateId,
+        jobId,
+        scheduleFingerprint,
+      ]);
+
+      const offerPayload = compactObject({
+        candidateId,
+        jobId,
+        organizationId,
+        actorUserId,
+        agentName: 'dispatch',
+        autoSubmitOffer: true,
+        templateId,
+        terms,
+      });
+
+      const enqueueResult = await enqueueRun(client, {
+        handlerType: 'offer.draft.create',
+        resourceType: 'candidate',
+        resourceId: candidateId,
+        idempotencyKey,
+        payload: offerPayload,
+        maxAttempts: 6,
+      });
+
+      followUps.push({
+        sourceHandler: run.handler_type,
+        handlerType: 'offer.draft.create',
+        resourceType: 'candidate',
+        resourceId: candidateId,
+        idempotencyKey,
+        inserted: enqueueResult.inserted,
+        runId: enqueueResult.runId,
+      });
+    }
+  }
+
+  if (
+    run.handler_type === 'offer.draft.create' &&
+    asString(result.status) === 'success' &&
+    asBoolean(payload.autoSubmitOffer) === true
+  ) {
+    const offerId = asString(result.offerId) ?? asString(payload.offerId);
+    const candidateId = asString(result.candidateId) ?? asString(payload.candidateId);
+    const jobId = asString(result.jobId) ?? asString(payload.jobId);
+
+    if (offerId && candidateId && jobId) {
+      const organizationId = asString(payload.organizationId);
+      const actorUserId = asString(payload.actorUserId) ?? resolveDefaultActorUserId();
+      const founderUserId = asString(payload.founderUserId) ?? resolveDefaultActorUserId();
+      const idempotencyKey = buildIdempotencyKey(['chain', 'offer-draft', 'submit', offerId]);
+
+      const submitPayload = compactObject({
+        offerId,
+        candidateId,
+        jobId,
+        organizationId,
+        actorUserId,
+        founderUserId,
+        allowSystemBypass: true,
+        agentName: 'dispatch',
+      });
+
+      const enqueueResult = await enqueueRun(client, {
+        handlerType: 'offer.submit.clearance',
+        resourceType: 'offer',
+        resourceId: offerId,
+        idempotencyKey,
+        payload: submitPayload,
+        maxAttempts: 6,
+      });
+
+      followUps.push({
+        sourceHandler: run.handler_type,
+        handlerType: 'offer.submit.clearance',
+        resourceType: 'offer',
+        resourceId: offerId,
+        idempotencyKey,
+        inserted: enqueueResult.inserted,
+        runId: enqueueResult.runId,
+      });
+    }
+  }
+
+  if (run.handler_type === 'offer.submit.clearance' && asString(result.mode) === 'awaiting_clearance') {
+    const offerId = asString(result.offerId) ?? asString(payload.offerId);
+    const candidateId = asString(result.candidateId) ?? asString(payload.candidateId);
+    const jobId = asString(result.jobId) ?? asString(payload.jobId);
+
+    if (offerId) {
+      const organizationId = asString(payload.organizationId);
+      const actorUserId = asString(payload.actorUserId) ?? resolveDefaultActorUserId();
+      const founderUserId = asString(payload.founderUserId) ?? resolveDefaultActorUserId();
+      const authReqId = asString(result.cibaAuthReqId) ?? asString(payload.authReqId);
+      const idempotencyKey = buildIdempotencyKey(['chain', 'offer-clearance', 'poll', offerId, authReqId]);
+
+      const pollPayload = compactObject({
+        offerId,
+        candidateId,
+        jobId,
+        organizationId,
+        authReqId,
+        actorUserId,
+        founderUserId,
+        allowSystemBypass: true,
+        agentName: 'dispatch',
+      });
+
+      const enqueueResult = await enqueueRun(client, {
+        handlerType: 'offer.clearance.poll',
+        resourceType: 'offer',
+        resourceId: offerId,
+        idempotencyKey,
+        payload: pollPayload,
+        maxAttempts: 8,
+      });
+
+      followUps.push({
+        sourceHandler: run.handler_type,
+        handlerType: 'offer.clearance.poll',
+        resourceType: 'offer',
+        resourceId: offerId,
+        idempotencyKey,
+        inserted: enqueueResult.inserted,
+        runId: enqueueResult.runId,
+      });
+    }
+  }
+
+  return followUps;
+}
+
 function resolveAutomationExecuteUrl() {
   const configured = requiredEnv('AUTOMATION_EXECUTE_URL').trim();
 
@@ -261,29 +602,74 @@ function resolveAutomationExecuteUrl() {
   return configured;
 }
 
-async function invokeAutomationExecutor(run: AutomationRunRow): Promise<JsonObject> {
+function resolveExecuteTimeoutMs() {
+  const raw = Deno.env.get('AUTOMATION_EXECUTE_TIMEOUT_MS')?.trim();
+  if (!raw) {
+    return 12_000;
+  }
+
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 5_000) {
+    return 12_000;
+  }
+
+  return Math.min(parsed, 60_000);
+}
+
+async function invokeAutomationExecutor(
+  run: AutomationRunRow,
+  executeCookieOverride?: string,
+): Promise<JsonObject> {
   const executeUrl = resolveAutomationExecuteUrl();
   const executeSecret =
     Deno.env.get('AUTOMATION_EXECUTE_SECRET')?.trim() ||
     Deno.env.get('SUPABASE_AUTOMATION_FUNCTION_SECRET')?.trim() ||
     Deno.env.get('AUTOMATION_CRON_SECRET')?.trim();
+  const executeCookie =
+    executeCookieOverride?.trim() ||
+    Deno.env.get('AUTOMATION_EXECUTE_COOKIE')?.trim() ||
+    '';
+  const timeoutMs = resolveExecuteTimeoutMs();
 
   if (!executeSecret) {
     throw new Error('Missing automation execute secret. Set AUTOMATION_EXECUTE_SECRET.');
   }
 
-  const response = await fetch(executeUrl, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      authorization: `Bearer ${executeSecret}`,
-      'x-automation-secret': executeSecret,
-    },
-    body: JSON.stringify({
-      handlerType: run.handler_type,
-      payload: run.payload ?? {},
-    }),
-  });
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    authorization: `Bearer ${executeSecret}`,
+    'x-automation-secret': executeSecret,
+  };
+
+  if (executeCookie) {
+    headers.cookie = executeCookie;
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(executeUrl, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        handlerType: run.handler_type,
+        payload: run.payload ?? {},
+      }),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new Error(`Automation execute timed out after ${timeoutMs}ms for handler ${run.handler_type}.`);
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
 
   const raw = await response.text();
   const parsed = raw.trim() ? JSON.parse(raw) : {};
@@ -345,110 +731,158 @@ async function insertManualReviewAudit(
   }
 }
 
-export async function processQueue(client: SupabaseClient, limit: number) {
-  const claimed = await claimDueRuns(client, limit);
-
+export async function processQueue(
+  client: SupabaseClient,
+  limit: number,
+  options?: {
+    executeCookie?: string;
+  },
+) {
+  let totalClaimed = 0;
+  let remainingClaims = Math.max(1, limit);
   let completed = 0;
   let retried = 0;
   let deadLettered = 0;
+  const agents: Record<string, { claimed: number; completed: number; retried: number; deadLettered: number }> = {};
 
-  for (const run of claimed) {
-    const nowIso = new Date().toISOString();
+  const bumpAgentMetric = (
+    agentName: AgentName,
+    key: 'claimed' | 'completed' | 'retried' | 'deadLettered',
+  ) => {
+    const current = agents[agentName] ?? {
+      claimed: 0,
+      completed: 0,
+      retried: 0,
+      deadLettered: 0,
+    };
+    current[key] += 1;
+    agents[agentName] = current;
+  };
 
-    try {
-      const result = await invokeAutomationExecutor(run);
-      const status = asString(result.status);
+  while (remainingClaims > 0) {
+    const claimed = await claimDueRuns(client, remainingClaims);
+    if (claimed.length === 0) {
+      break;
+    }
 
-      if (status === 'success' && !isRetryableSuccess(result)) {
-        const manualReviewNeeded = shouldEscalateToManualReview(run.handler_type, result);
-        const finalResult = manualReviewNeeded
-          ? {
-              ...result,
-              manualReviewRequired: true,
-              manualReviewReason: 'Automation could not safely complete booking from candidate reply.',
-            }
-          : result;
+    totalClaimed += claimed.length;
+    remainingClaims -= claimed.length;
 
-        await updateRun(client, run.id, {
-          status: 'completed',
-          result: finalResult,
-          finished_at: nowIso,
-          updated_at: nowIso,
-          last_error: null,
-          last_error_at: null,
-        });
+    for (const run of claimed) {
+      const agentName = resolveRunAgentName(run);
+      bumpAgentMetric(agentName, 'claimed');
+      const nowIso = new Date().toISOString();
 
-        if (manualReviewNeeded) {
-          await insertManualReviewAudit(client, run, finalResult);
+      try {
+        const result = await invokeAutomationExecutor(run, options?.executeCookie);
+        const status = asString(result.status);
+
+        if (status === 'success' && !isRetryableSuccess(result)) {
+          const manualReviewNeeded = shouldEscalateToManualReview(run.handler_type, result);
+          const baseResult = manualReviewNeeded
+            ? {
+                ...result,
+                agentName,
+                manualReviewRequired: true,
+                manualReviewReason: 'Automation could not safely complete booking from candidate reply.',
+              }
+            : withAgentName(result, agentName);
+
+          const followUps = await enqueuePostSuccessFollowUps(client, run, baseResult);
+          const finalResult = followUps.length > 0
+            ? {
+                ...baseResult,
+                followUps,
+              }
+            : baseResult;
+
+          await updateRun(client, run.id, {
+            status: 'completed',
+            result: finalResult,
+            finished_at: nowIso,
+            updated_at: nowIso,
+            last_error: null,
+            last_error_at: null,
+          });
+
+          if (manualReviewNeeded) {
+            await insertManualReviewAudit(client, run, finalResult);
+          }
+
+          completed += 1;
+          bumpAgentMetric(agentName, 'completed');
+          continue;
         }
 
-        completed += 1;
-        continue;
-      }
+        const nextAttemptCount = run.attempt_count + 1;
+        const reachedMax = shouldDeadLetterWithoutRetry(run, result) || nextAttemptCount >= run.max_attempts;
 
-      const nextAttemptCount = run.attempt_count + 1;
-      const reachedMax = nextAttemptCount >= run.max_attempts;
+        if (reachedMax) {
+          await updateRun(client, run.id, {
+            status: 'dead_letter',
+            result,
+            attempt_count: nextAttemptCount,
+            finished_at: nowIso,
+            updated_at: nowIso,
+            last_error: asString(result.message) ?? 'Automation run exhausted retry attempts.',
+            last_error_at: nowIso,
+          });
 
-      if (reachedMax) {
-        await updateRun(client, run.id, {
-          status: 'dead_letter',
-          result,
-          attempt_count: nextAttemptCount,
-          finished_at: nowIso,
-          updated_at: nowIso,
-          last_error: asString(result.message) ?? 'Automation run exhausted retry attempts.',
-          last_error_at: nowIso,
-        });
+          deadLettered += 1;
+          bumpAgentMetric(agentName, 'deadLettered');
+        } else {
+          await updateRun(client, run.id, {
+            status: 'retrying',
+            result,
+            attempt_count: nextAttemptCount,
+            next_attempt_at: new Date(Date.now() + computeRetryDelayMs(nextAttemptCount)).toISOString(),
+            updated_at: nowIso,
+            last_error: asString(result.message) ?? 'Retrying due to non-terminal automation response.',
+            last_error_at: nowIso,
+          });
 
-        deadLettered += 1;
-      } else {
-        await updateRun(client, run.id, {
-          status: 'retrying',
-          result,
-          attempt_count: nextAttemptCount,
-          next_attempt_at: new Date(Date.now() + computeRetryDelayMs(nextAttemptCount)).toISOString(),
-          updated_at: nowIso,
-          last_error: asString(result.message) ?? 'Retrying due to non-terminal automation response.',
-          last_error_at: nowIso,
-        });
+          retried += 1;
+          bumpAgentMetric(agentName, 'retried');
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown automation error.';
+        const nextAttemptCount = run.attempt_count + 1;
+        const reachedMax = nextAttemptCount >= run.max_attempts;
 
-        retried += 1;
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown automation error.';
-      const nextAttemptCount = run.attempt_count + 1;
-      const reachedMax = nextAttemptCount >= run.max_attempts;
+        if (reachedMax) {
+          await updateRun(client, run.id, {
+            status: 'dead_letter',
+            attempt_count: nextAttemptCount,
+            finished_at: nowIso,
+            updated_at: nowIso,
+            last_error: message,
+            last_error_at: nowIso,
+          });
 
-      if (reachedMax) {
-        await updateRun(client, run.id, {
-          status: 'dead_letter',
-          attempt_count: nextAttemptCount,
-          finished_at: nowIso,
-          updated_at: nowIso,
-          last_error: message,
-          last_error_at: nowIso,
-        });
+          deadLettered += 1;
+          bumpAgentMetric(agentName, 'deadLettered');
+        } else {
+          await updateRun(client, run.id, {
+            status: 'retrying',
+            attempt_count: nextAttemptCount,
+            next_attempt_at: new Date(Date.now() + computeRetryDelayMs(nextAttemptCount)).toISOString(),
+            updated_at: nowIso,
+            last_error: message,
+            last_error_at: nowIso,
+          });
 
-        deadLettered += 1;
-      } else {
-        await updateRun(client, run.id, {
-          status: 'retrying',
-          attempt_count: nextAttemptCount,
-          next_attempt_at: new Date(Date.now() + computeRetryDelayMs(nextAttemptCount)).toISOString(),
-          updated_at: nowIso,
-          last_error: message,
-          last_error_at: nowIso,
-        });
-
-        retried += 1;
+          retried += 1;
+          bumpAgentMetric(agentName, 'retried');
+        }
       }
     }
   }
 
   return {
-    claimed: claimed.length,
+    claimed: totalClaimed,
     completed,
     retried,
     deadLettered,
+    agents,
   };
 }

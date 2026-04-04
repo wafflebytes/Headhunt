@@ -1,8 +1,10 @@
 import { and, desc, eq, inArray } from 'drizzle-orm';
 import { tool } from 'ai';
+import { google } from 'googleapis';
 import { z } from 'zod';
 
 import { auth0 } from '@/lib/auth0';
+import { getGoogleAccessToken, withGmailWrite } from '@/lib/auth0-ai';
 import { decodeJwtSubUnsafe, initiateCibaAuthorization, pollCibaAuthorization } from '@/lib/auth0-ciba';
 import { db } from '@/lib/db';
 import { applications } from '@/lib/db/schema/applications';
@@ -33,6 +35,7 @@ const submitOfferForClearanceInputSchema = z
     founderUserId: z.string().min(1).optional(),
     requestedExpirySeconds: z.number().int().min(60).max(3600).optional(),
     forceReissue: z.boolean().default(false),
+    allowSystemBypass: z.boolean().optional().default(false),
   })
   .refine((value) => Boolean(value.offerId || (value.candidateId && value.jobId)), {
     message: 'Provide offerId OR candidateId and jobId.',
@@ -240,6 +243,138 @@ function formatOfferSalarySnippet(terms: Record<string, unknown>): string {
   return formatCurrency(baseSalary, currency);
 }
 
+function buildCibaBindingMessage(params: { candidateName: string; jobTitle: string; salarySnippet: string }): string {
+  const compact = `Offer approval: ${params.candidateName} ${params.jobTitle} ${params.salarySnippet}`
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const sanitized = compact
+    .replace(/[^a-zA-Z0-9\s+\-_,.:#]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const normalized = sanitized || 'Offer approval';
+
+  if (normalized.length <= 64) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, 61)}...`;
+}
+
+function toBase64Url(value: string): string {
+  return Buffer.from(value, 'utf8')
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+}
+
+function parseDraftOfferContent(params: {
+  draftContent: string | null;
+  fallbackJobTitle: string;
+}): { subject: string; body: string } {
+  const fallbackSubject = `Offer Letter: ${params.fallbackJobTitle}`;
+  const normalized = (params.draftContent ?? '').replace(/\r\n/g, '\n').trim();
+
+  if (!normalized) {
+    return {
+      subject: fallbackSubject,
+      body: 'Please review your offer details and reply with any questions.',
+    };
+  }
+
+  const lines = normalized.split('\n');
+  const firstLine = lines[0]?.trim() ?? '';
+
+  if (/^subject\s*:/i.test(firstLine)) {
+    const subject = firstLine.replace(/^subject\s*:/i, '').trim() || fallbackSubject;
+    const body = lines.slice(1).join('\n').trim() || 'Please review your offer details and reply with any questions.';
+    return { subject, body };
+  }
+
+  return {
+    subject: fallbackSubject,
+    body: normalized,
+  };
+}
+
+function buildOfferEmailMessage(params: {
+  to: string;
+  subject: string;
+  body: string;
+}): string {
+  return [
+    `To: ${params.to}`,
+    'Content-Type: text/plain; charset="UTF-8"',
+    'MIME-Version: 1.0',
+    `Subject: ${params.subject}`,
+    '',
+    params.body,
+  ].join('\r\n');
+}
+
+async function sendOfferEmail(params: {
+  offerId: string;
+}): Promise<{
+  providerId: string | null;
+  providerThreadId: string | null;
+  to: string;
+  subject: string;
+}> {
+  const [offerContext] = await db
+    .select({
+      draftContent: offers.draftContent,
+      candidateEmail: candidates.contactEmail,
+      jobTitle: jobs.title,
+    })
+    .from(offers)
+    .innerJoin(candidates, eq(candidates.id, offers.candidateId))
+    .innerJoin(jobs, eq(jobs.id, offers.jobId))
+    .where(eq(offers.id, params.offerId))
+    .limit(1);
+
+  if (!offerContext) {
+    throw new Error(`Offer ${params.offerId} not found while preparing send.`);
+  }
+
+  const to = offerContext.candidateEmail?.trim();
+  if (!to) {
+    throw new Error(`Offer ${params.offerId} cannot be sent because candidate email is missing.`);
+  }
+
+  const { subject, body } = parseDraftOfferContent({
+    draftContent: offerContext.draftContent,
+    fallbackJobTitle: offerContext.jobTitle,
+  });
+
+  const accessToken = await getGoogleAccessToken();
+  const auth = new google.auth.OAuth2();
+  auth.setCredentials({ access_token: accessToken });
+
+  const gmail = google.gmail('v1');
+  const raw = toBase64Url(
+    buildOfferEmailMessage({
+      to,
+      subject,
+      body,
+    }),
+  );
+
+  const sent = await gmail.users.messages.send({
+    auth,
+    userId: 'me',
+    requestBody: { raw },
+  });
+
+  return {
+    providerId: sent.data.id ?? null,
+    providerThreadId: sent.data.threadId ?? null,
+    to,
+    subject,
+  };
+}
+
 async function markOfferSent(params: {
   offerId: string;
   candidateId: string;
@@ -249,9 +384,13 @@ async function markOfferSent(params: {
   actorRole: ActorRole;
   actorTool: 'submit_offer_for_clearance' | 'poll_offer_clearance';
   approvedBy: string | null;
-  method: 'founder_direct' | 'ciba_approved';
+  method: 'ciba_approved';
   cibaAuthReqId?: string | null;
 }) {
+  const delivery = await sendOfferEmail({
+    offerId: params.offerId,
+  });
+
   const sentAt = new Date();
   const updatedAt = new Date();
 
@@ -300,6 +439,10 @@ async function markOfferSent(params: {
         method: params.method,
         sentAt: sentAt.toISOString(),
         cibaAuthReqId: params.cibaAuthReqId ?? null,
+        providerId: delivery.providerId,
+        providerThreadId: delivery.providerThreadId,
+        to: delivery.to,
+        subject: delivery.subject,
       },
       result: 'success',
     });
@@ -364,6 +507,10 @@ export const draftOfferLetterTool = tool({
       };
     }
 
+    let failureStep = 'load_candidate';
+
+    try {
+
     const [candidate] = await db
       .select({
         id: candidates.id,
@@ -383,6 +530,7 @@ export const draftOfferLetterTool = tool({
       };
     }
 
+    failureStep = 'check_candidate_visibility';
     const canView = await canViewCandidate(actorUserId, candidate.id);
     if (!canView) {
       return {
@@ -392,6 +540,7 @@ export const draftOfferLetterTool = tool({
       };
     }
 
+    failureStep = 'load_job';
     const [job] = await db.select({ id: jobs.id, title: jobs.title }).from(jobs).where(eq(jobs.id, input.jobId)).limit(1);
     if (!job) {
       return {
@@ -402,6 +551,7 @@ export const draftOfferLetterTool = tool({
     }
 
     const resolvedOrganizationId = input.organizationId ?? candidate.organizationId ?? null;
+    failureStep = 'load_organization';
     const [organization] = resolvedOrganizationId
       ? await db
           .select({ id: organizations.id, name: organizations.name })
@@ -410,6 +560,7 @@ export const draftOfferLetterTool = tool({
           .limit(1)
       : [];
 
+    failureStep = 'load_template';
     const [template] = await (input.templateId
       ? db
           .select({ id: templates.id, subject: templates.subject, body: templates.body })
@@ -467,6 +618,7 @@ export const draftOfferLetterTool = tool({
 
     const draftContent = [`Subject: ${subject}`, '', body].join('\n');
 
+    failureStep = 'load_existing_draft';
     const [existingDraft] = await db
       .select({ id: offers.id })
       .from(offers)
@@ -482,6 +634,14 @@ export const draftOfferLetterTool = tool({
 
     const updatedAt = new Date();
 
+    const normalizedTerms = Object.fromEntries(
+      Object.entries({
+        ...input.terms,
+        currency: normalizedCurrency,
+      }).filter(([, value]) => value !== undefined),
+    );
+
+    failureStep = existingDraft ? 'update_offer_draft' : 'create_offer_draft';
     const [offerRow] = existingDraft
       ? await db
           .update(offers)
@@ -489,10 +649,7 @@ export const draftOfferLetterTool = tool({
             organizationId: resolvedOrganizationId,
             status: 'draft',
             draftContent,
-            terms: {
-              ...input.terms,
-              currency: normalizedCurrency,
-            },
+            terms: normalizedTerms,
             initiatedBy: actorUserId,
             updatedAt,
           })
@@ -506,14 +663,12 @@ export const draftOfferLetterTool = tool({
             jobId: input.jobId,
             status: 'draft',
             draftContent,
-            terms: {
-              ...input.terms,
-              currency: normalizedCurrency,
-            },
+            terms: normalizedTerms,
             initiatedBy: actorUserId,
           })
           .returning({ id: offers.id, status: offers.status, draftContent: offers.draftContent, terms: offers.terms });
 
+    failureStep = 'write_offer_audit_log';
     await db.insert(auditLogs).values({
       organizationId: resolvedOrganizationId,
       actorType: 'agent',
@@ -549,16 +704,27 @@ export const draftOfferLetterTool = tool({
         terms: offerRow.terms,
       },
     };
+
+    } catch (error) {
+      return {
+        check: 'draft_offer_letter',
+        status: 'error',
+        message: `draft_offer_letter failed at ${failureStep}: ${
+          error instanceof Error ? error.message : 'Unknown error'
+        }`,
+      };
+    }
   },
 });
 
-export const submitOfferForClearanceTool = tool({
+export const submitOfferForClearanceTool = withGmailWrite(tool({
   description:
-    'Submit an offer for clearance. Founders can send immediately; hiring managers trigger CIBA founder approval and set awaiting clearance.',
+    'Submit an offer for founder CIBA clearance. Offer email is sent only after CIBA approval is confirmed by poll_offer_clearance.',
   inputSchema: submitOfferForClearanceInputSchema,
   execute: async (input) => {
     const session = await auth0.getSession();
-    const actorUserId = input.actorUserId ?? session?.user?.sub ?? null;
+    const allowSystemBypass = input.allowSystemBypass === true;
+    const actorUserId = input.actorUserId ?? session?.user?.sub ?? (allowSystemBypass ? 'automation.worker' : null);
 
     if (!actorUserId) {
       return {
@@ -633,13 +799,15 @@ export const submitOfferForClearanceTool = tool({
       };
     }
 
-    const canView = await canViewCandidate(actorUserId, candidate.id);
-    if (!canView) {
-      return {
-        check: 'submit_offer_for_clearance',
-        status: 'error',
-        message: `Forbidden: no candidate visibility access for ${candidate.id}.`,
-      };
+    if (!allowSystemBypass) {
+      const canView = await canViewCandidate(actorUserId, candidate.id);
+      if (!canView) {
+        return {
+          check: 'submit_offer_for_clearance',
+          status: 'error',
+          message: `Forbidden: no candidate visibility access for ${candidate.id}.`,
+        };
+      }
     }
 
     const [job] = await db.select({ id: jobs.id, title: jobs.title }).from(jobs).where(eq(jobs.id, offerRow.jobId)).limit(1);
@@ -658,40 +826,15 @@ export const submitOfferForClearanceTool = tool({
       explicitFounderUserId: input.founderUserId,
     });
 
-    if (actorRole === 'founder') {
-      if (offerRow.status === 'sent') {
-        return {
-          check: 'submit_offer_for_clearance',
-          status: 'success',
-          mode: 'already_sent',
-          offerId: offerRow.id,
-          candidateId: offerRow.candidateId,
-          jobId: offerRow.jobId,
-          stage: 'offer_sent',
-        };
-      }
-
-      const sentAt = await markOfferSent({
-        offerId: offerRow.id,
-        candidateId: offerRow.candidateId,
-        jobId: offerRow.jobId,
-        organizationId: resolvedOrganizationId,
-        actorUserId,
-        actorRole,
-        actorTool: 'submit_offer_for_clearance',
-        approvedBy: actorUserId,
-        method: 'founder_direct',
-      });
-
+    if (offerRow.status === 'sent' && !input.forceReissue) {
       return {
         check: 'submit_offer_for_clearance',
         status: 'success',
-        mode: 'sent_direct',
+        mode: 'already_sent',
         offerId: offerRow.id,
         candidateId: offerRow.candidateId,
         jobId: offerRow.jobId,
         stage: 'offer_sent',
-        sentAt: sentAt.toISOString(),
       };
     }
 
@@ -708,10 +851,12 @@ export const submitOfferForClearanceTool = tool({
       };
     }
 
-    const founderUserId = resolveFounderUserId({
-      sessionUserRecord,
-      explicitFounderUserId: input.founderUserId,
-    });
+    const founderUserId =
+      resolveFounderUserId({
+        sessionUserRecord,
+        explicitFounderUserId: input.founderUserId,
+      }) ??
+      (actorRole === 'founder' && actorUserId !== 'automation.worker' ? actorUserId : undefined);
 
     if (!founderUserId) {
       return {
@@ -727,7 +872,11 @@ export const submitOfferForClearanceTool = tool({
       const salarySnippet = formatOfferSalarySnippet(terms);
       const cibaRequest = await initiateCibaAuthorization({
         founderUserId,
-        bindingMessage: `Offer clearance: ${candidate.name} for ${job.title}. Compensation ${salarySnippet}. Approve to release.`,
+        bindingMessage: buildCibaBindingMessage({
+          candidateName: candidate.name,
+          jobTitle: job.title,
+          salarySnippet,
+        }),
         requestedExpirySeconds: input.requestedExpirySeconds,
       });
 
@@ -788,9 +937,9 @@ export const submitOfferForClearanceTool = tool({
       };
     }
   },
-});
+}));
 
-export const pollOfferClearanceTool = tool({
+export const pollOfferClearanceTool = withGmailWrite(tool({
   description:
     'Poll CIBA clearance status for an offer. On approval, marks offer sent and advances candidate/application stage to offer_sent.',
   inputSchema: pollOfferClearanceInputSchema,
@@ -994,4 +1143,4 @@ export const pollOfferClearanceTool = tool({
       };
     }
   },
-});
+}));

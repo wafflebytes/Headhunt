@@ -44,7 +44,7 @@ type CalSlot = {
   endISO: string;
 };
 
-const DEFAULT_CAL_MEETING_INTEGRATION = process.env.CAL_BOOKING_MEETING_INTEGRATION?.trim() || 'google-meet';
+const DEFAULT_CAL_MEETING_INTEGRATION = 'cal-video';
 
 function toIso(value: unknown): string | null {
   if (typeof value !== 'string' || !value.trim()) {

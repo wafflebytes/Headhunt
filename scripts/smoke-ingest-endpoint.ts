@@ -101,7 +101,7 @@ Options:
 
 Auth cookie source:
 - Use --cookie OR set HEADHUNT_SMOKE_COOKIE in your shell.
-- Or point to a cookie file via --cookie-file / HEADHUNT_SMOKE_COOKIE_FILE (supports "session 0 : ..." + "session 1 : ...").
+- Or point to a cookie file via --cookie-file / HEADHUNT_SMOKE_COOKIE_FILE (supports "session 0 : ..." + "session 1 : ..." OR "__session=...").
 - The value must be the full Cookie header string copied from an authenticated request to your app.`);
 }
 
@@ -217,20 +217,29 @@ function normalizeCookieHeader(rawCookie: string): string {
     return rawCookie;
   }
 
-  if (/\b__session__0=|\b__session__1=/i.test(collapsed)) {
+  if (/\b__session__0=|\b__session__1=|\b__session=/i.test(collapsed)) {
     return collapsed;
   }
 
   const session0 = collapsed.match(/\bsession\s*0\s*:\s*([^\s;]+)/i)?.[1];
   const session1 = collapsed.match(/\bsession\s*1\s*:\s*([^\s;]+)/i)?.[1];
+  const singleSession = collapsed.match(/\b(?:__session|session)\b\s*[:=]\s*([^\s;]+)/i)?.[1];
 
-  if (!session0 && !session1) {
+  if (!session0 && !session1 && !singleSession) {
+    if (collapsed.startsWith('eyJ')) {
+      return `__session=${collapsed}`;
+    }
+
     return rawCookie.trim();
   }
 
   const normalizedParts: string[] = [];
   if (session0) normalizedParts.push(`__session__0=${session0}`);
   if (session1) normalizedParts.push(`__session__1=${session1}`);
+
+  if (normalizedParts.length === 0 && singleSession) {
+    normalizedParts.push(`__session=${singleSession}`);
+  }
 
   return normalizedParts.join('; ');
 }
@@ -243,12 +252,17 @@ function parseCookieFromText(rawText: string): string | null {
 
   const session0 = normalized.match(/\bsession\s*0\s*:\s*([^\s;]+)/i)?.[1];
   const session1 = normalized.match(/\bsession\s*1\s*:\s*([^\s;]+)/i)?.[1];
+  const singleSession = normalized.match(/\b(?:__session|session)\b\s*[:=]\s*([^\s;]+)/i)?.[1];
 
   if (session0 || session1) {
     const segments: string[] = [];
     if (session0) segments.push(`__session__0=${session0}`);
     if (session1) segments.push(`__session__1=${session1}`);
     return segments.join('; ');
+  }
+
+  if (singleSession) {
+    return `__session=${singleSession}`;
   }
 
   const firstNonCommentLine = normalized
@@ -414,6 +428,32 @@ function summarizeAttempt(attempt: { status: number; body: unknown }) {
   };
 }
 
+function detectAuthCookieIssue(body: unknown): string | null {
+  const asObj = asRecord(body);
+  const rawText = asString(asObj?.rawText) ?? '';
+  const message = asString(asObj?.message) ?? '';
+  const combined = `${rawText}\n${message}`;
+
+  if (!combined.trim()) {
+    return null;
+  }
+
+  if (/JWEInvalid|JWE Protected Header is invalid/i.test(combined)) {
+    return (
+      'Detected stale/invalid Auth0 session cookie (JWE decryption failed). ' +
+      'Log in again on localhost and refresh product/cookie.md with latest session values (__session or session 0/session 1 format).'
+    );
+  }
+
+  if (/Unauthorized/i.test(combined)) {
+    return (
+      'Detected unauthenticated request. Ensure you are logged in on localhost and product/cookie.md contains current session cookies.'
+    );
+  }
+
+  return null;
+}
+
 function assertSuccessfulCreate(result: IngestResult, attemptSummary: ReturnType<typeof summarizeAttempt>) {
   if (attemptSummary.status !== 200) {
     result.errors.push(`first attempt expected HTTP 200, got ${attemptSummary.status}`);
@@ -430,6 +470,17 @@ function assertSuccessfulCreate(result: IngestResult, attemptSummary: ReturnType
 
   if (!attemptSummary.applicationId) {
     result.errors.push('first attempt did not return application.id');
+  }
+}
+
+function appendAuthCookieHints(result: IngestResult, attempt: { status: number; body: unknown }) {
+  if (attempt.status === 200) {
+    return;
+  }
+
+  const issue = detectAuthCookieIssue(attempt.body);
+  if (issue) {
+    result.errors.push(issue);
   }
 }
 
@@ -483,6 +534,8 @@ async function main() {
       errors: [],
     };
 
+    appendAuthCookieHints(result, firstAttempt);
+
     assertSuccessfulCreate(result, result.firstAttempt);
 
     if (args.checkIdempotency) {
@@ -493,6 +546,7 @@ async function main() {
       });
 
       result.secondAttempt = summarizeAttempt(secondAttempt);
+      appendAuthCookieHints(result, secondAttempt);
       assertIdempotencyReplay(result, result.secondAttempt);
     }
 
