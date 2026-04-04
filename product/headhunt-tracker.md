@@ -1,9 +1,9 @@
 # Headhunt Tracker - Full Flow Execution
 
-Last updated: 2026-04-02
+Last updated: 2026-04-04
 Owner: Lead Founding Engineer
 Execution mode: ship plumbing first, polish later
-Current implementation focus: M2.0 contract hardening and acceptance/exit verification for completed M1/M2 slices.
+Current implementation focus: M2.3 scheduling hardening + transcript summarization flow (Cal-first, Drive fallback) under demo-phase operator control.
 
 ## Legend
 
@@ -34,8 +34,11 @@ The MVP is "real" only when all of this works in sequence:
 3. Candidate profile can be generated as structured data.
 4. Candidate row can be written to DB and read back.
 5. Founder/hiring_manager permissions are enforced through FGA checks for sensitive transitions.
-6. Offer send path is gated by CIBA when initiated by hiring_manager.
-7. MCP tools can query pipeline with Auth0 JWT + FGA filtering.
+6. Final scheduling flow sends live Cal slot options (3 options max, one per day), parses candidate reply, and books in Cal.
+7. Cal-managed bookings avoid duplicate founder confirmation email (Cal invite is source of truth).
+8. Transcript summary is generated from Cal booking transcripts, with Drive PDF fallback when needed.
+9. Offer send path is gated by CIBA when initiated by hiring_manager.
+10. MCP tools can query pipeline with Auth0 JWT + FGA filtering.
 
 Anything not supporting this chain is secondary.
 
@@ -50,6 +53,7 @@ Anything not supporting this chain is secondary.
 - [x] Gmail tools already wired (search + draft) in src/lib/tools/gmail.ts.
 - [x] Calendar read tool exists in src/lib/tools/google-calender.ts.
 - [x] Slack channels tool exists in src/lib/tools/list-slack-channels.ts.
+- [x] Transcript summarization tools exist in src/lib/tools/interview-transcripts.ts (Cal-first + Drive fallback).
 - [x] Drizzle database wiring + migrations in src/lib/db.
 - [x] Existing write path to DB + embeddings in src/lib/actions/documents.ts.
 - [x] FGA bootstrap + basic doc model in src/lib/fga.
@@ -245,7 +249,7 @@ Exit criteria: Headhunt core actions callable as tools with structured outputs a
 	- [x] run_triage
 	- [x] generate_intel_card
 	- [x] schedule_interview_slots
-	- [ ] draft_offer_letter
+	- [x] draft_offer_letter
 	- [ ] submit_offer_for_clearance
 
 - [/] Each tool must enforce:
@@ -284,22 +288,43 @@ Acceptance checks:
 
 ### M2.3 Liaison (Scheduling Actions)
 
-- [ ] Tool: parse_candidate_availability
+- [x] Tool: parse_candidate_availability
 - [x] Tool: propose_interview_slots
 - [x] Tool: confirm_interview_event
-- [ ] Tool: send_interview_confirmation
+- [x] Tool: send_interview_confirmation
+- [x] Tool: run_final_schedule_flow (Cal-slot-first request, candidate reply analysis, auto-book)
 - [x] Persist interview record + candidate stage transitions.
+- [x] Constrain candidate outreach to 3 slot options max, one per day.
+- [x] Skip duplicate founder confirmation email for Cal-managed bookings.
 
 Acceptance checks:
 
-- [ ] At least one end-to-end schedule flow creates event id + meet link.
-- [ ] Candidate stage becomes interview_scheduled after confirmation send.
+- [x] At least one end-to-end schedule flow creates event id + meet link.
+- [x] First scheduling outreach email always uses live Cal free slots (not generic availability ask).
+- [x] Founder can constrain outreach days (for example `days sat,sun`) while keeping auto day-pick defaults.
+- [x] Candidate stage becomes interview_scheduled after booking persistence.
+- [x] Candidate outreach uses natural-language email body (not raw slot dump formatting).
+- [x] Cal-managed bookings do not send duplicate founder confirmation email.
 - [ ] Slack summary hook can post test message.
+
+### M2.7 Transcript Summary (Cal + Drive Fallback)
+
+- [x] Tool: summarize_cal_booking_transcript (`/v2/bookings/{bookingUid}/transcripts`).
+- [x] Tool: summarize_drive_transcript_pdf (Google Drive PDF fallback by file id/query).
+- [x] Structured HR-style transcript rubric summary with recommendation + actionable follow-ups.
+- [x] Persist summary to interview record and audit logs.
+- [x] Wire tools into chat route and result summaries.
+
+Acceptance checks:
+
+- [ ] At least one live booking UID returns transcript URL(s) and extractable transcript text.
+- [ ] Drive fallback path works with `drive.readonly` consented connection.
+- [ ] Generated summary includes recommendation, rubric score, strengths, risks, and actionable follow-ups.
 
 ### M2.4 Dispatch (Offer + CIBA Hold)
 
-- [ ] Add offer term capture schema.
-- [ ] Add draft generation tool.
+- [x] Add offer term capture schema.
+- [x] Add draft generation tool.
 - [ ] Add CIBA initiation service.
 - [ ] Add CIBA polling handler.
 - [ ] Enforce rule:
@@ -428,7 +453,7 @@ Exit gate for M3:
 - [/] Smoke scripts for demo paths.
 	- [x] Deterministic DB seed script exists (`npm run seed:demo`).
 	- [x] Chat-log smoke checker exists for `HHLOG_JSON` exports (`npm run smoke:chat-log`).
-	- [ ] Add authenticated endpoint replay script for fixture emails.
+	- [x] Add authenticated endpoint replay script for fixture emails (`npm run smoke:ingest-endpoint`).
 
 ### Demo Seed Strategy
 
@@ -467,6 +492,7 @@ For any feature PR, complete this checklist first:
 - [x] Run deterministic seed: `npm run seed:demo -- --reset`.
 - [x] Confirm stage matrix includes applied/reviewed/interview_scheduled/interviewed/offer_sent/hired/rejected.
 - [ ] Run chat-log smoke checker: `npm run smoke:chat-log -- --file /tmp/hhlog.txt --require-scheduling --verbose`.
+- [ ] Run authenticated endpoint replay: `HEADHUNT_SMOKE_COOKIE='...' npm run smoke:ingest-endpoint -- --fixture all --verbose`.
 - [ ] Run one-command intake replay in chat: `run_intake_e2e` and confirm processed message summary.
 - [ ] Create candidate ingest payload via route/tool.
 - [ ] Verify candidate row + audit row written.
@@ -538,6 +564,7 @@ For any feature PR, complete this checklist first:
 - [ ] M1 operator chat runs on AI SDK UI (`useChat`) with tool output visibility + stop control.
 - [ ] Intake can process at least 3 realistic applications from Gmail.
 - [ ] At least 1 candidate goes end-to-end: reviewed -> interview_scheduled -> interviewed -> offer_sent.
+- [ ] At least 1 completed interview has transcript summary generated (Cal-first or Drive fallback).
 - [ ] Hiring manager initiated offer requires founder CIBA approval.
 - [ ] FastMCP endpoint can answer list_jobs + list_pipeline + candidate detail for authorized user.
 - [ ] Audit timeline clearly shows agent and human actions.

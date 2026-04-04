@@ -1,8 +1,37 @@
 import { LogIn, UserPlus } from 'lucide-react';
+import { desc, eq } from 'drizzle-orm';
 import { ChatWindow } from '@/components/chat-window';
 import { GuideInfoBox } from '@/components/guide/GuideInfoBox';
 import { Button } from '@/components/ui/button';
 import { auth0 } from '@/lib/auth0';
+import { db } from '@/lib/db';
+import { jobs } from '@/lib/db/schema/jobs';
+
+const PRESET_JOB_OPTIONS = [
+  {
+    id: 'job_demo_founding_engineer',
+    title: 'Founding Engineer',
+  },
+  {
+    id: 'job_demo_product_designer',
+    title: 'Product Designer',
+  },
+  {
+    id: 'job_demo_recruiting_coordinator',
+    title: 'Recruiting Coordinator',
+  },
+  {
+    id: 'job_demo_growth_marketer',
+    title: 'Growth Marketer',
+  },
+] as const;
+
+type JobOption = {
+  id: string;
+  title: string;
+  organizationId: string | null;
+  isActive: boolean;
+};
 
 export default async function Home() {
   const session = await auth0.getSession();
@@ -45,6 +74,58 @@ export default async function Home() {
       </div>
     );
   }
+
+  const activeJobs = await db
+    .select({
+      id: jobs.id,
+      title: jobs.title,
+      organizationId: jobs.organizationId,
+    })
+    .from(jobs)
+    .where(eq(jobs.status, 'active'))
+    .orderBy(desc(jobs.updatedAt))
+    .limit(50);
+
+  const normalizedActiveJobs: JobOption[] = activeJobs.map((job: { id: string; title: string; organizationId: string | null }) => ({
+    id: job.id,
+    title: job.title,
+    organizationId: job.organizationId,
+    isActive: true,
+  }));
+
+  const mergedPresetJobs: JobOption[] = PRESET_JOB_OPTIONS.map((preset) => {
+    const matched = normalizedActiveJobs.find(
+      (job: JobOption) =>
+        job.id === preset.id ||
+        job.title.trim().toLowerCase() === preset.title.trim().toLowerCase(),
+    );
+
+    if (matched) {
+      return matched;
+    }
+
+    return {
+      id: preset.id,
+      title: preset.title,
+      organizationId: null,
+      isActive: false,
+    };
+  });
+
+  const remainingActiveJobs = normalizedActiveJobs.filter(
+    (job: JobOption) =>
+      !mergedPresetJobs.some(
+        (option: JobOption) =>
+          option.id === job.id ||
+          option.title.trim().toLowerCase() === job.title.trim().toLowerCase(),
+      ),
+  );
+
+  const chatJobOptions = [...mergedPresetJobs, ...remainingActiveJobs];
+  const defaultJobId =
+    chatJobOptions.find(
+      (option) => option.isActive && /founding\s+engineer/i.test(option.title),
+    )?.id ?? chatJobOptions.find((option) => option.isActive)?.id;
 
   const InfoCard = (
     <GuideInfoBox>
@@ -93,6 +174,8 @@ export default async function Home() {
       placeholder={`Hello ${session?.user?.name}, I'm your personal assistant. How can I help you today?`}
       emptyStateComponent={InfoCard}
       userId={chatUserId}
+      jobOptions={chatJobOptions}
+      defaultJobId={defaultJobId}
     />
   );
 }

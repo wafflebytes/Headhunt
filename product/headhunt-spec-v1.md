@@ -1,9 +1,9 @@
 # Headhunt — Product Specification v1.0
 
-### Auth0 "Authorized to Act" Hackathon · Engineering Blueprint
+### Auth0 "Authorized to Act" Hackathon · Engineering Blueprint (Demo-Phase)
 
 > **Stack:** Next.js 15 · Vercel AI SDK · Supabase · Auth0 (Token Vault · FGA · CIBA · MCP)
-> **Status:** Hackathon MVP · Deadline Apr 6 2026
+> **Status:** Demo Phase (operator-assisted) · Deadline Apr 6 2026
 
 ---
 
@@ -13,7 +13,7 @@
 
 Agents handle the pipeline. You approve the hire.
 
-Headhunt is an autonomous recruiting crew for founders and early-stage startup teams. Every application that lands in Gmail gets read, scored, and ranked — overnight, without you touching it. Interviews get booked. Confirmations go out. Slack gets briefed after every call. And when it's time to extend an offer, **every word of it sits locked behind a CIBA push notification to your phone before a single email moves.**
+Headhunt is currently a demo-phase recruiting copilot for founders and early-stage startup teams. Applications that land in Gmail can be triaged, scored, and moved through interview scheduling with operator-triggered commands. Interview slots are sourced from live Cal availability, booking is performed in Cal, and high-stakes actions (like offer release) remain explicitly gated. The long-term autonomous behavior remains the target architecture, but this document reflects what is implemented for the demo now.
 
 Founders post the job. Six agents run the search. You rule on who gets in.
 
@@ -28,6 +28,23 @@ Most entries show an AI agent doing things. Headhunt shows one **stopping** — 
 | **Technical Execution** | Token Vault + FGA + CIBA deployed non-trivially; real Gmail Pub/Sub pipeline; six-agent crew on Vercel AI SDK                                                  |
 | **Design**              | Zero chat UI: Ops Board kanban, AI-rendered calendar slot picker, Field Log timeline — decisions surface as cards, not conversations                           |
 | **Insight Value**       | A novel Auth0 pattern: CIBA as a delegation escalation gate — a hiring manager can draft, only a founder can fire. No existing documented example of this flow |
+
+### Demo-Phase Scope Override (Apr 2026)
+
+This spec is intentionally written for current demo operation, not full autonomous production behavior.
+
+- Pipeline execution is operator-assisted from the AI SDK chat surface.
+- Final scheduling is Cal-first and thread-aware:
+  - request candidate windows with live Cal slots,
+  - parse candidate reply,
+  - re-check Cal,
+  - create booking.
+- Candidate outreach is constrained to **3 options total (1 slot per day)** and written in natural-language email format.
+- For Cal-managed bookings, the system skips duplicate founder-sent confirmation emails to avoid double notifications.
+- Transcript processing is currently tool-driven:
+  - Cal transcripts via `/v2/bookings/{bookingUid}/transcripts`,
+  - fallback to Google Drive PDF transcript parsing when Cal transcript text is unavailable.
+- Final hiring decision after transcript summary is human-in-the-loop (advance, hold, reject, or draft offer).
 
 ---
 
@@ -64,12 +81,14 @@ Most entries show an AI agent doing things. Headhunt shows one **stopping** — 
 
 1. Posts a job on Headhunt: title, JD, requirements, compensation range.
 2. Platform publishes to Tumblr automatically (CIBA confirmation first).
-3. Does nothing — **Intercept**, **Triage**, and **Analyst** run the intake in the background.
-4. Reviews ranked candidates once a day. Marks each as Interview or Pass.
-5. **Liaison** handles all scheduling, confirmation emails, and Meet link creation.
-6. Receives a Slack brief after every interview call.
-7. Gets a CIBA push when an offer is ready. Reviews terms. Approves or kills from the phone.
-8. **Dispatch** sends the offer letter the moment approval fires.
+3. Runs intake from the operator console — **Intercept**, **Triage**, and **Analyst** classify and score candidates.
+4. Reviews ranked candidates and marks each as Interview or Pass.
+5. **Liaison** sends a Cal-slot-first outreach email (3 options, one per day) on the original application thread.
+6. Candidate replies on-thread; **Liaison** analyzes reply and books via Cal.
+7. Cal sends the booking notification directly; the platform avoids duplicate founder-sent confirmation for Cal-managed bookings.
+8. Operator runs transcript summary (Cal first, Drive PDF fallback) and reviews recommendation + rubric.
+9. Gets a CIBA push when an offer is ready. Reviews terms. Approves or kills from the phone.
+10. **Dispatch** sends the offer letter the moment approval fires.
 
 ### Run B — Hiring Manager (Coordinator Role)
 
@@ -144,11 +163,15 @@ Headhunt runs a **one commander, five specialist agents** model. Each agent has 
 
 #### Field Agent 4 — `Liaison`
 
-- **Triggers:** (a) Founder/hiring manager marks candidate Interview on the Ops Board, (b) Email reply classified as scheduling-related by Triage.
-- **Phase A — Outreach:** Reads playbook from `templates` table. Fills placeholders. Drafts email via Gmail Token Vault token. Returns draft for human review (not auto-sent).
-- **Phase B — Slot Detection:** When candidate replies with availability, calls `calendar.freeBusy` to find conflicts. Generates a `SchedulingPayload` (structured JSON of available slots).
-- **Phase C — Confirmation:** Once founder picks a slot (via calendar picker UI), creates Google Calendar event with `conferenceData` (Meet link). Sends confirmation email via Gmail (auto-sent — it's a confirmation, not an initiation). Notifies founder in Slack.
-- **Phase D — Debrief:** Triggered by Calendar event end time + 30 minute buffer. Checks Google Drive for Meet recording transcript. Generates Slack brief. Updates candidate `stage` to `interviewed`.
+- **Triggers:** (a) Founder/hiring_manager marks candidate Interview in the operator flow, (b) Email reply classified as scheduling-related by Triage.
+- **Phase A — Cal Slot Outreach:** Calls Cal.com `/v2/slots` for the founder's configured event type and sends **3 candidate-facing options (1 slot per day)** on the original application thread.
+- **Phase B — Reply Analysis + Recheck:** Parses candidate reply (option number or explicit window). Rechecks live Cal availability to avoid stale selections.
+- **Phase C — Booking:** Creates Cal booking via `/v2/bookings` for the selected/overlapping slot and persists interview state (`interview_scheduled`).
+- **Phase C.1 — Notification Behavior:** For Cal-managed bookings, Cal email is treated as source-of-truth invite; duplicate founder-sent confirmation is skipped.
+- **Phase D — Transcript Summary (tool-driven in demo):**
+  - Try Cal transcript endpoint: `/v2/bookings/{bookingUid}/transcripts`.
+  - If transcript text is unavailable, fallback to Google Drive PDF transcript parsing.
+  - Generate HR-style summary + rubric + actionable follow-ups and persist interview summary/audit logs.
 
 #### Field Agent 5 — `Dispatch`
 
@@ -864,12 +887,13 @@ Templates are stored in Supabase and use `{{handlebars}}` syntax:
   "type": "interview_invitation",
   "name": "Interview Invitation",
   "subject": "Interview Opportunity: {{jobTitle}} at {{companyName}}",
-  "body": "Hi {{candidateName}},\n\nThank you for your interest in the {{jobTitle}} role at {{companyName}}.\n\nI'd love to schedule a call to discuss the opportunity further. Could you share your availability for a {{durationMinutes}}-minute conversation?\n\nBest,\n{{senderName}}\n{{companyName}}",
+  "body": "Hi {{candidateName}},\n\nThank you for your interest in the {{jobTitle}} role at {{companyName}}.\n\nI checked my live Cal availability for a {{durationMinutes}}-minute conversation and these slots are currently free:\n{{slotOptions}}\n\nPlease reply with the option number(s) that work for you, or suggest alternatives.\n\nBest,\n{{senderName}}\n{{companyName}}",
   "variables": [
     "candidateName",
     "jobTitle",
     "companyName",
     "durationMinutes",
+    "slotOptions",
     "senderName"
   ],
   "createdAt": "2026-03-01T00:00:00.000Z",
@@ -880,9 +904,31 @@ Templates are stored in Supabase and use `{{handlebars}}` syntax:
 ### Notification Routing
 
 - Slack: interview briefs, offer clearance confirmations, hire announcements, pipeline daily digests
-- Email (via Dispatch): offer letter, interview confirmation, application acknowledgement
+- Email:
+  - Cal: booking/invite notifications for Cal-managed interviews
+  - Dispatch: offer letter and related approval outcomes
+  - Founder-sent interview confirmation: used only for non-Cal scheduling paths
 - Push (CIBA): offer hold clearance, Tumblr publish confirm, GDPR delete confirm
 - In-app: stage transitions, Triage failures, token expiry warnings
+
+### Transcript Summary Flow (Demo)
+
+1. Interview is booked in Cal and stored with `googleCalendarEventId = cal:<bookingUid>`.
+2. Operator runs transcript summary using booking UID.
+3. System fetches transcript URLs from Cal and extracts transcript text.
+4. If Cal transcript text is missing/unreadable, operator runs Drive PDF fallback summary.
+5. System produces structured debrief:
+  - recommendation,
+  - rubric score,
+  - strengths,
+  - risks,
+  - actionable follow-ups,
+  - interviewer action items.
+6. Founder/hiring manager chooses next branch:
+  - proceed to next round,
+  - draft offer,
+  - hold for more signals,
+  - reject.
 
 ### CIBA Implementation
 

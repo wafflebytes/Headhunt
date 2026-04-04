@@ -8,8 +8,12 @@ import { db } from '@/lib/db';
 import { auditLogs } from '@/lib/db/schema/audit-logs';
 
 const runInterceptInputSchema = z.object({
-  query: z.string().default('in:inbox newer_than:14d'),
-  maxResults: z.number().int().min(1).max(25).default(10),
+  query: z
+    .string()
+    .default(
+      'in:inbox newer_than:14d -category:promotions -category:social -subject:newsletter -subject:digest -subject:unsubscribe',
+    ),
+  maxResults: z.number().int().min(1).max(25).default(20),
   candidateLikeOnly: z.boolean().default(true),
   includeBody: z.boolean().default(true),
   organizationId: z.string().optional(),
@@ -41,12 +45,49 @@ const POSITIVE_SIGNALS = [
   'application',
   'applying',
   'cover letter',
+  'founding engineer',
+  'product designer',
+  'founding role',
   'interested in',
   'job opening',
-  'position',
 ] as const;
 
-const NEGATIVE_SIGNALS = ['unsubscribe', 'newsletter', 'otp', 'invoice', 'receipt', 'promotion'] as const;
+const NEGATIVE_SIGNALS = [
+  'unsubscribe',
+  'newsletter',
+  'substack',
+  'view this post on the web',
+  'manage subscription',
+  'otp',
+  'invoice',
+  'receipt',
+  'promotion',
+  'digest',
+  'coupon',
+  'sale',
+  'deal',
+] as const;
+
+const SUBJECT_APPLICATION_PATTERNS = [
+  /\bapplication\b\s*[-:|]\s*[^\n]{2,120}\s*[-:|]\s*[^\n]{2,120}$/i,
+  /\bapplication\s+for\b/i,
+  /\b(applying|candidate)\s+for\b/i,
+  /\bresume\b\s+(for|attached)/i,
+] as const;
+
+const STRONG_NEGATIVE_SUBJECT_PATTERNS = [
+  /\b(newsletter|digest|daily\s+brief|weekly\s+roundup|promo|promotion|deal|coupon)\b/i,
+  /\b(invoice|receipt|payment|statement|otp|verification\s+code)\b/i,
+] as const;
+
+const AUTOMATED_SENDER_PATTERNS = [/\bno-?reply\b/i, /\bnewsletter\b/i, /\bdigest\b/i] as const;
+
+const HIRING_SUBJECT_PATTERNS = [
+  /\bfounding\s+engineer\b/i,
+  /\bproduct\s+designer\b/i,
+  /\bsoftware\s+engineer\b/i,
+  /\bfull\s*stack\b/i,
+] as const;
 
 function decodeBase64Url(value: string | null | undefined): string {
   if (!value) return '';
@@ -91,16 +132,47 @@ function compact(value: string, limit = 1400): string {
 }
 
 function classifyCandidateLike(params: { from: string | null; subject: string | null; body: string; snippet: string }) {
-  const source = `${params.from ?? ''}\n${params.subject ?? ''}\n${params.body}\n${params.snippet}`.toLowerCase();
+  const from = params.from ?? '';
+  const subject = params.subject ?? '';
+  const source = `${from}\n${subject}\n${params.body}\n${params.snippet}`.toLowerCase();
+  const subjectLower = subject.toLowerCase();
 
   const positive = POSITIVE_SIGNALS.filter((keyword) => source.includes(keyword));
   const negative = NEGATIVE_SIGNALS.filter((keyword) => source.includes(keyword));
 
-  const candidateLike = positive.length > 0 && negative.length === 0;
+  const subjectTemplateMatch = SUBJECT_APPLICATION_PATTERNS.some((pattern) => pattern.test(subject));
+  const strongNegativeSubject = STRONG_NEGATIVE_SUBJECT_PATTERNS.some((pattern) => pattern.test(subject));
+  const automatedSender = AUTOMATED_SENDER_PATTERNS.some((pattern) => pattern.test(from));
+  const hiringSubject = HIRING_SUBJECT_PATTERNS.some((pattern) => pattern.test(subject));
+  const likelyNewsletter =
+    source.includes('substack') ||
+    source.includes('view this post on the web') ||
+    source.includes('manage subscription') ||
+    source.includes('daily dose of news');
+  const subjectPositiveHits = POSITIVE_SIGNALS.filter((keyword) => subjectLower.includes(keyword)).length;
+
+  const positiveScore = positive.length + subjectPositiveHits + (subjectTemplateMatch ? 3 : 0) + (hiringSubject ? 1 : 0);
+  const negativeScore = negative.length + (strongNegativeSubject ? 2 : 0) + (automatedSender ? 1 : 0);
+
+  const candidateLike =
+    !(
+      strongNegativeSubject &&
+      !subjectTemplateMatch &&
+      !hiringSubject
+    ) &&
+    !(likelyNewsletter && !subjectTemplateMatch) &&
+    (subjectTemplateMatch || (positiveScore >= 2 && negativeScore <= 1) || (hiringSubject && positiveScore >= 1 && negativeScore === 0));
 
   return {
     candidateLike,
-    signals: [...positive, ...negative.map((keyword) => `not:${keyword}`)],
+    signals: [
+      ...positive,
+      ...(subjectTemplateMatch ? ['subject:application-template'] : []),
+      ...(hiringSubject ? ['subject:hiring-context'] : []),
+      ...(automatedSender ? ['not:automated-sender'] : []),
+      ...negative.map((keyword) => `not:${keyword}`),
+      ...(strongNegativeSubject ? ['not:strong-negative-subject'] : []),
+    ],
   };
 }
 

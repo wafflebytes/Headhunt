@@ -7,6 +7,10 @@ import { google } from 'googleapis';
 import { z } from 'zod';
 
 import {
+  CAL_BOOKINGS_API_VERSION,
+  CAL_COM_API_BASE_URL,
+  CAL_COM_SCOPES,
+  CAL_COM_TOKEN_VAULT_CONNECTION,
   CALENDAR_SCOPES,
   GMAIL_READ_SCOPES,
   GMAIL_WRITE_SCOPES,
@@ -16,6 +20,7 @@ import {
   SLACK_TOKEN_VAULT_CONNECTION,
   getGoogleAccessToken,
   getAccessToken,
+  withCal,
   withGoogle,
   withCalendar,
   withGmailRead,
@@ -66,6 +71,13 @@ function normalizeRequiredScopes(scopes: string[]) {
   return scopes.filter((scope) => scope !== 'openid');
 }
 
+function hasRefreshCapableAccess(accounts: ConnectedAccountSnapshot[]): boolean {
+  return accounts.some((account) => {
+    const accessType = (account.access_type ?? '').toLowerCase();
+    return accessType.includes('offline') || accessType.includes('refresh');
+  });
+}
+
 function buildScopeCheck(params: {
   check: string;
   provider: string;
@@ -91,6 +103,28 @@ function buildScopeCheck(params: {
 
   const grantedScopeSet = new Set(connectionAccounts.flatMap((account) => account.scopes ?? []));
   const missingScopes = params.requiredScopes.filter((scope) => !grantedScopeSet.has(scope));
+  const requiresOfflineAccess = params.requiredScopes.includes('offline_access');
+  const hasOfflineAccessType = hasRefreshCapableAccess(connectionAccounts);
+
+  if (requiresOfflineAccess && !hasOfflineAccessType) {
+    return {
+      check: params.check,
+      provider: params.provider,
+      connection: params.connection,
+      status: 'unhealthy' as DiagnosticStatus,
+      message:
+        'Connected account is missing refresh-capable offline access. Reconnect this provider and approve consent for long-lived access.',
+      details: {
+        requiredScopes: params.requiredScopes,
+        grantedScopes: Array.from(grantedScopeSet),
+        connectedAccounts: connectionAccounts.map((account) => ({
+          id: account.id,
+          accessType: account.access_type ?? null,
+          expiresAt: account.expires_at ?? null,
+        })),
+      },
+    };
+  }
 
   if (missingScopes.length > 0) {
     return {
@@ -165,7 +199,9 @@ function isMissingFederatedRefreshTokenError(error: unknown): boolean {
   return (
     error instanceof TokenVaultError &&
     typeof error.message === 'string' &&
-    /missing refresh token|refresh token not found|offline access/i.test(error.message)
+    /missing refresh token|refresh token not found|refresh token flow.*federated connection.*failed|offline access|cannot read properties of undefined \(reading ['\"]access_token['\"]\)|invalid_request.*access_token|not supported jwt type in subject token/i.test(
+      error.message,
+    )
   );
 }
 
@@ -411,6 +447,86 @@ export const verifyCalendarConnectionTool = withCalendar(
   }),
 );
 
+export const verifyCalConnectionTool = withCal(
+  tool({
+    description: 'Verify Cal.com connection by fetching the authenticated founder profile from Cal API v2.',
+    inputSchema: z.object({}),
+    execute: async () => {
+      try {
+        const accessToken = await getAccessToken();
+        const response = await fetch(`${CAL_COM_API_BASE_URL}/me`, {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'cal-api-version': CAL_BOOKINGS_API_VERSION,
+          },
+        });
+
+        if (response.status === 401 || response.status === 403) {
+          throwAuthorizationInterrupt({
+            check: 'verify_cal_connection',
+            provider: 'cal',
+            connection: CAL_COM_TOKEN_VAULT_CONNECTION,
+            scopes: CAL_COM_SCOPES,
+          });
+        }
+
+        if (!response.ok) {
+          const details = await response.text();
+          return failedDiagnostic({
+            check: 'verify_cal_connection',
+            provider: 'cal',
+            connection: CAL_COM_TOKEN_VAULT_CONNECTION,
+            message: `Cal profile lookup failed (${response.status}): ${details}`,
+            code: 'CAL_CHECK_FAILED',
+          });
+        }
+
+        const payload = (await response.json()) as {
+          data?: {
+            id?: number;
+            email?: string;
+            username?: string;
+            name?: string | null;
+            timeZone?: string;
+          };
+        };
+
+        return {
+          check: 'verify_cal_connection',
+          provider: 'cal',
+          connection: CAL_COM_TOKEN_VAULT_CONNECTION,
+          status: 'healthy' as DiagnosticStatus,
+          message: 'Cal.com connection is healthy.',
+          details: {
+            id: payload.data?.id ?? null,
+            email: payload.data?.email ?? null,
+            username: payload.data?.username ?? null,
+            name: payload.data?.name ?? null,
+            timeZone: payload.data?.timeZone ?? null,
+          },
+        };
+      } catch (error) {
+        if (error instanceof TokenVaultError) {
+          throwAuthorizationInterrupt({
+            check: 'verify_cal_connection',
+            provider: 'cal',
+            connection: CAL_COM_TOKEN_VAULT_CONNECTION,
+            scopes: CAL_COM_SCOPES,
+          });
+        }
+
+        return failedDiagnostic({
+          check: 'verify_cal_connection',
+          provider: 'cal',
+          connection: CAL_COM_TOKEN_VAULT_CONNECTION,
+          message: error instanceof Error ? error.message : 'Unknown error while verifying Cal.com access.',
+          code: 'CAL_CHECK_FAILED',
+        });
+      }
+    },
+  }),
+);
+
 export const verifySlackConnectionTool = withSlack(
   tool({
     description: 'Verify Slack connection by performing auth.test and a minimal channels read operation.',
@@ -506,6 +622,14 @@ export const runConnectionDiagnosticsTool = tool({
         accounts,
       });
 
+      const cal = buildScopeCheck({
+        check: 'verify_cal_connection',
+        provider: 'cal',
+        connection: CAL_COM_TOKEN_VAULT_CONNECTION,
+        requiredScopes: CAL_COM_SCOPES,
+        accounts,
+      });
+
       const slack = buildScopeCheck({
         check: 'verify_slack_connection',
         provider: 'slack',
@@ -514,7 +638,7 @@ export const runConnectionDiagnosticsTool = tool({
         accounts,
       });
 
-      const checks = [gmailRead, gmailWrite, calendar, slack];
+      const checks = [gmailRead, gmailWrite, calendar, cal, slack];
       const overallStatus = checks.every((check) => check.status === 'healthy') ? 'healthy' : 'unhealthy';
 
       return {

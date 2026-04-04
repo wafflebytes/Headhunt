@@ -15,6 +15,7 @@ import { canViewCandidate } from '@/lib/fga/fga';
 import { jobs } from '@/lib/db/schema/jobs';
 import { nim, nimChatModelId } from '@/lib/nim';
 import { auth0 } from '@/lib/auth0';
+import { buildResumeSynthesisPrompt } from '@/lib/prompts/resume-synthesis';
 
 const TRIAGE_CLASSIFICATIONS = ['application', 'scheduling_reply', 'inquiry', 'irrelevant'] as const;
 const TRIAGE_ROUTES = ['analyst', 'liaison', 'none'] as const;
@@ -175,18 +176,41 @@ function heuristicClassification(source: string): TriageClassification {
     'promo',
     'interview prep club',
   ];
+  const newsletterSignals = [
+    'substack.com',
+    'view this post on the web',
+    'manage subscription',
+    'daily dose of news',
+    'weekly roundup',
+    'techcrunch',
+  ];
   const schedulingSignals = ['availability', 'available', 'schedule', 'reschedule', 'calendar invite', 'time works'];
   const applicationSignals = ['application', 'apply', 'applying', 'resume', 'cv', 'cover letter', 'job opening'];
   const inquirySignals = ['question', 'inquiry', 'can you clarify', 'would like to know'];
+  const explicitApplicationIntentPatterns = [
+    /\b(application|applying)\s+(for|to)\b/i,
+    /\b(i am|i'm)\s+applying\b/i,
+    /\battached\s+(is\s+)?(my\s+)?(resume|cv|cover letter)\b/i,
+    /\bplease\s+find\s+(my\s+)?(resume|cv|cover letter)\b/i,
+    /\bmy\s+(resume|cv)\s+is\s+attached\b/i,
+  ];
 
   const hasNegative = negativeSignals.some((signal) => lower.includes(signal));
+  const newsletterSignalCount = newsletterSignals.reduce(
+    (count, signal) => count + (lower.includes(signal) ? 1 : 0),
+    0,
+  );
   const hasScheduling = schedulingSignals.some((signal) => lower.includes(signal));
   const hasApplication = applicationSignals.some((signal) => lower.includes(signal));
   const hasInquiry = inquirySignals.some((signal) => lower.includes(signal));
+  const hasExplicitApplicationIntent = explicitApplicationIntentPatterns.some((pattern) => pattern.test(source));
 
-  if (hasNegative && !hasApplication && !hasScheduling) return 'irrelevant';
+  if ((hasNegative || newsletterSignalCount > 0) && !hasExplicitApplicationIntent && !hasScheduling) {
+    return 'irrelevant';
+  }
+
   if (hasScheduling) return 'scheduling_reply';
-  if (hasApplication) return 'application';
+  if (hasApplication && hasExplicitApplicationIntent) return 'application';
   if (hasInquiry) return 'inquiry';
   return 'irrelevant';
 }
@@ -323,18 +347,14 @@ export async function generateIntelCard(input: GenerateIntelCardInput) {
 
   const requirements = input.requirements ?? [];
 
-  const intelPrompt = [
-    'You are the Headhunt analyst agent.',
-    'Produce a structured candidate intel card.',
-    'Score must be 0-100 and confidence must be 0-100.',
-    'Use evidence from the email and resume text only.',
-    `Candidate name: ${candidate.name}`,
-    `Candidate email: ${candidate.contactEmail}`,
-    `Job title: ${job?.title ?? 'unknown'}`,
-    `Job requirements JSON: ${JSON.stringify(requirements)}`,
-    `Application email text:\n${input.emailText}`,
-    `Resume text (may be empty):\n${input.resumeText ?? ''}`,
-  ].join('\n\n');
+  const intelPrompt = buildResumeSynthesisPrompt({
+    candidateName: candidate.name,
+    candidateEmail: candidate.contactEmail,
+    jobTitle: job?.title ?? 'unknown',
+    requirements,
+    emailText: input.emailText,
+    resumeText: input.resumeText ?? '',
+  });
 
   let intel: z.infer<typeof intelCardOutputSchema>;
   let intelFallback = false;

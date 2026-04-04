@@ -70,6 +70,52 @@ This package has [@next/bundle-analyzer](https://www.npmjs.com/package/@next/bun
 $ ANALYZE=true npm run build
 ```
 
+## Supabase Automation Runtime
+
+Automation orchestration now runs in Supabase Edge Functions so cron/webhook execution logs are visible in Supabase:
+
+- `automation-cron`: enqueues watchdog runs and processes due queue runs.
+- `automation-webhook`: maps DB/internal webhook events into queue runs.
+- `automation-replay`: creates replay child runs.
+
+App routes under `/api/automation/*` are lightweight proxies to these Supabase functions.
+Queue handler execution is called by Supabase via `/api/automation/execute`.
+
+### 1. Apply migrations
+
+Run the project migration flow so helper SQL functions exist:
+
+```bash
+npm run db:migrate
+```
+
+### 2. Configure environment
+
+Set these values in your app and Supabase function environment:
+
+- `NEXT_PUBLIC_SUPABASE_URL`
+- `SUPABASE_FUNCTIONS_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+- `SUPABASE_AUTOMATION_FUNCTION_SECRET`
+- `AUTOMATION_EXECUTE_URL`
+- `AUTOMATION_EXECUTE_SECRET`
+
+### 3. Deploy Edge Functions
+
+```bash
+supabase functions deploy automation-cron
+supabase functions deploy automation-webhook
+supabase functions deploy automation-replay
+```
+
+### 4. Wire Supabase cron and webhooks
+
+- Cron target: `automation-cron` with body like `{"job":"all","limit":20}`.
+- Database webhook target: `automation-webhook` with Supabase event payloads.
+- Replay can be invoked manually via `automation-replay`.
+
+Use the `Authorization: Bearer <SUPABASE_AUTOMATION_FUNCTION_SECRET>` header (or `x-automation-secret`) for all automation function calls.
+
 ## License
 
 This project is open-sourced under the MIT License - see the [LICENSE](LICENSE) file for details.
