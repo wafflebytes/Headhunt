@@ -6,6 +6,7 @@ const nimBaseURL = process.env.NVIDIA_NIM_BASE_URL ?? process.env.NIM_BASE_URL ?
 export const nim = createOpenAICompatible({
   name: 'nvidia-nim',
   baseURL: nimBaseURL,
+  supportsStructuredOutputs: true,
   headers: {
     Authorization: `Bearer ${nimApiKey ?? ''}`,
   },

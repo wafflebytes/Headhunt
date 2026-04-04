@@ -25,7 +25,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
     <html lang="en" suppressHydrationWarning>
       <head>
         <title>{TITLE}</title>
-        <link rel="shortcut icon" type="image/svg+xml" href="/images/favicon.png" />
+        <link rel="icon" type="image/png" href="/assets/headie.png" />
         <meta name="description" content={DESCRIPTION} />
         <meta property="og:title" content={TITLE} />
         <meta property="og:description" content={DESCRIPTION} />

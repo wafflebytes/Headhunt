@@ -16,8 +16,13 @@
     "db:studio": "drizzle-kit studio",
     "db:check": "drizzle-kit check",
     "fga:init": "tsx src/lib/fga/fga-init.ts",
+    "mcp:http": "MCP_TRANSPORT=httpStream tsx mcp-server/index.ts",
+    "mcp:stdio": "MCP_TRANSPORT=stdio tsx mcp-server/index.ts",
     "smoke:m1-db": "tsx scripts/smoke-m1-db.ts",
     "smoke:chat-log": "tsx scripts/smoke-chat-log.ts",
+    "smoke:chat-prompts": "tsx scripts/smoke-chat-prompts.ts",
+    "smoke:ingest-endpoint": "tsx scripts/smoke-ingest-endpoint.ts",
+    "smoke:mcp-acceptance": "tsx scripts/smoke-mcp-acceptance.ts",
     "seed:demo": "tsx scripts/seed-demo-headhunt.ts"
   },
   "engines": {
@@ -46,7 +51,9 @@
     "dotenv": "^16.4.7",
     "drizzle-orm": "^0.43.1",
     "drizzle-zod": "^0.7.1",
+    "fastmcp": "^3.34.0",
     "googleapis": "^161.0.0",
+    "jose": "^5.10.0",
     "llm-chunk": "^0.0.1",
     "lucide-react": "^0.475.0",
     "marked": "^15.0.7",

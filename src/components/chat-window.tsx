@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { type UIMessage, DefaultChatTransport, generateId, lastAssistantMessageIsCompleteWithToolCalls } from 'ai';
 import { useChat } from '@ai-sdk/react';
 import { toast } from 'sonner';
@@ -9,13 +9,25 @@ import { Activity, ArrowDown, ArrowUpIcon, Copy, KeyRound, LoaderCircle, RotateC
 import { useInterruptions } from '@auth0/ai-vercel/react';
 
 import { TokenVaultInterruptHandler } from '@/components/TokenVaultInterruptHandler';
-import { ChatMessageBubble } from '@/components/chat-message-bubble';
+import { ChatMessageBubble, type ToolCallStatus, type ToolCallTimingInfo } from '@/components/chat-message-bubble';
+import { FounderSlotSelectionPanel } from '@/components/founder-slot-selection-panel';
 import { Button } from '@/components/ui/button';
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuShortcut,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { cn } from '@/utils/cn';
 
 const CHAT_STORAGE_KEY_PREFIX = 'headhunt:m1:chat:messages';
 const CHAT_THREAD_ID_PREFIX = 'headhunt-m1-chat';
+const CHAT_JOB_PICKER_STORAGE_KEY_PREFIX = 'headhunt:m1:chat:selected-job';
 const CHAT_STORAGE_VERSION = 'v2';
 const RUN_CONNECTION_DIAGNOSTICS_PROMPT =
   'run_connection_diagnostics: call run_connection_diagnostics and summarize each check, including missing connections/scopes and exact next authorization step.';
@@ -23,7 +35,71 @@ const AUTHORIZATION_STEP_TIMEOUT_MS = 10 * 60 * 1000;
 const AUTHORIZATION_STEP_POLL_MS = 400;
 const CHAT_LOG_JSON_MARKER = 'HHLOG_JSON';
 
+const OPERATOR_COMMAND_TEMPLATES: Array<{ label: string; value: string }> = [
+  {
+    label: '/run intake',
+    value: '/run intake job <job_id> organization <org_id>',
+  },
+  {
+    label: '/score candidate',
+    value: '/score candidate <candidate_id> job <job_id> emailText "<email text snippet>"',
+  },
+  {
+    label: '/analyze-consensus',
+    value:
+      '/analyze-consensus candidate <candidate_id> job <job_id> turns 3 requirements "TypeScript,Next.js,System design" externalContext "GitHub profile + portfolio notes"',
+  },
+  {
+    label: '/schedule candidate',
+    value:
+      '/schedule candidate <candidate_id> job <job_id> eventTypeSlug 30min username <cal_username> action auto sendMode send days sat,sun timezone America/Los_Angeles',
+  },
+  {
+    label: '/schedule-cal candidate',
+    value:
+      '/schedule-cal candidate <candidate_id> job <job_id> eventTypeId <event_type_id> timezone America/Los_Angeles',
+  },
+  {
+    label: '/propose candidate',
+    value:
+      '/propose candidate <candidate_id> job <job_id> sendMode send timezone America/Los_Angeles calendar true',
+  },
+  {
+    label: '/analyze-reply candidate',
+    value: '/analyze-reply candidate <candidate_id> job <job_id> timezone America/Los_Angeles',
+  },
+  {
+    label: 'confirm slot',
+    value:
+      'schedule_interview_slots with candidateId <candidate_id> jobId <job_id> selectedStartISO "<selected_start_iso>" timezone America/Los_Angeles',
+  },
+  {
+    label: 'parse availability (fallback)',
+    value:
+      'parse_candidate_availability with candidateId <candidate_id> availabilityText "Tuesday 2-5 PM PT" timezone America/Los_Angeles',
+  },
+  {
+    label: 'send confirmation',
+    value: 'send_interview_confirmation with candidateId <candidate_id> jobId <job_id> sendMode send',
+  },
+  {
+    label: '/draft-offer candidate',
+    value:
+      '/draft-offer candidate <candidate_id> job <job_id> salary 185000 currency USD start 2026-05-01',
+  },
+  {
+    label: 'submit clearance',
+    value: 'submit_offer_for_clearance with offerId <offer_id>',
+  },
+  {
+    label: 'poll clearance',
+    value: 'poll_offer_clearance with offerId <offer_id> authReqId <auth_req_id>',
+  },
+];
+
 type ChatLogMode = 'latest_exchange' | 'full_session';
+
+type ToolTimingByKey = Record<string, ToolCallTimingInfo>;
 
 const AUTHORIZATION_STEPS = [
   {
@@ -32,11 +108,166 @@ const AUTHORIZATION_STEPS = [
       'authorize_connections_step:google. Call only verify_google_connection. If authorization is needed, prompt to authorize and stop.',
   },
   {
+    label: 'Cal',
+    prompt:
+      'authorize_connections_step:cal. Call only verify_cal_connection. If authorization is needed, prompt to authorize and stop.',
+  },
+  {
     label: 'Slack',
     prompt:
       'authorize_connections_step:slack. Call only verify_slack_connection. If authorization is needed, prompt to authorize and stop.',
   },
 ];
+
+export type ChatJobPickerOption = {
+  id: string;
+  title: string;
+  organizationId?: string | null;
+  isActive: boolean;
+};
+
+type WorkflowIdKey =
+  | 'jobId'
+  | 'organizationId'
+  | 'candidateId'
+  | 'interviewId'
+  | 'offerId'
+  | 'authReqId'
+  | 'selectedStartISO'
+  | 'eventId';
+
+type WorkflowIdEntry = {
+  key: WorkflowIdKey;
+  value: string;
+};
+
+type WorkflowIdCatalog = {
+  entries: WorkflowIdEntry[];
+  latest: Partial<Record<WorkflowIdKey, string>>;
+};
+
+function normalizeIdString(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function formatWorkflowIdLabel(key: WorkflowIdKey): string {
+  switch (key) {
+    case 'jobId':
+      return 'Job ID';
+    case 'organizationId':
+      return 'Organization ID';
+    case 'candidateId':
+      return 'Candidate ID';
+    case 'interviewId':
+      return 'Interview ID';
+    case 'offerId':
+      return 'Offer ID';
+    case 'authReqId':
+      return 'Approval Request ID';
+    case 'selectedStartISO':
+      return 'Selected Start ISO';
+    case 'eventId':
+      return 'Calendar Event ID';
+    default:
+      return key;
+  }
+}
+
+function formatWorkflowIdShortcut(value: string): string {
+  if (value.length <= 28) {
+    return value;
+  }
+
+  return `${value.slice(0, 12)}...${value.slice(-8)}`;
+}
+
+function buildWorkflowIdCatalog(params: {
+  messages: UIMessage[];
+  selectedJob: ChatJobPickerOption | null;
+}): WorkflowIdCatalog {
+  const entries: WorkflowIdEntry[] = [];
+  const latest: Partial<Record<WorkflowIdKey, string>> = {};
+  const seen = new Set<string>();
+
+  const addId = (key: WorkflowIdKey, rawValue: unknown) => {
+    const value = normalizeIdString(rawValue);
+    if (!value) {
+      return;
+    }
+
+    if (!latest[key]) {
+      latest[key] = value;
+    }
+
+    const signature = `${key}:${value}`;
+    if (seen.has(signature)) {
+      return;
+    }
+
+    seen.add(signature);
+    entries.push({ key, value });
+  };
+
+  if (params.selectedJob?.id) {
+    addId('jobId', params.selectedJob.id);
+  }
+
+  if (params.selectedJob?.organizationId) {
+    addId('organizationId', params.selectedJob.organizationId);
+  }
+
+  const scanUnknown = (value: unknown, parentKey?: string) => {
+    if (!value) {
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        scanUnknown(item, parentKey);
+      }
+      return;
+    }
+
+    if (typeof value !== 'object') {
+      return;
+    }
+
+    for (const [key, childValue] of Object.entries(value as Record<string, unknown>)) {
+      if (key === 'candidateId') addId('candidateId', childValue);
+      if (key === 'jobId') addId('jobId', childValue);
+      if (key === 'organizationId') addId('organizationId', childValue);
+      if (key === 'interviewId') addId('interviewId', childValue);
+      if (key === 'offerId') addId('offerId', childValue);
+      if (key === 'authReqId' || key === 'cibaAuthReqId') addId('authReqId', childValue);
+      if (key === 'selectedStartISO') addId('selectedStartISO', childValue);
+      if (key === 'id' && parentKey === 'event') addId('eventId', childValue);
+      if (key === 'startISO' && parentKey === 'slots') addId('selectedStartISO', childValue);
+
+      scanUnknown(childValue, key);
+    }
+  };
+
+  for (let messageIndex = params.messages.length - 1; messageIndex >= 0; messageIndex--) {
+    const message = params.messages[messageIndex];
+    const toolParts = extractToolParts(message);
+
+    for (let partIndex = toolParts.length - 1; partIndex >= 0; partIndex--) {
+      const part = toolParts[partIndex];
+      scanUnknown(part.input);
+      scanUnknown(part.output);
+    }
+  }
+
+  return {
+    entries,
+    latest,
+  };
+}
 
 function uiMessageToText(message: UIMessage): string {
   const parts = (message as { parts?: unknown }).parts;
@@ -91,6 +322,13 @@ function sanitizeAssistantLogText(raw: string): string {
 function shouldAutoSubmitAfterToolCalls(messages: UIMessage[]): boolean {
   const lastUserMessage = [...messages].reverse().find((message) => message.role === 'user');
   const lastUserText = lastUserMessage ? uiMessageToText(lastUserMessage) : '';
+  const trimmedUserText = lastUserText.trim();
+
+  // Slash commands in this console are expected to be one-shot execution requests.
+  // Auto-submitting a follow-up turn can trigger unintended extra tool calls.
+  if (/^\/[a-z0-9_-]+\b/i.test(trimmedUserText)) {
+    return false;
+  }
 
   const isControlFlowPrompt =
     /\bauthorize_connections_step:[a-z_]+\b/i.test(lastUserText) ||
@@ -104,12 +342,46 @@ function shouldAutoSubmitAfterToolCalls(messages: UIMessage[]): boolean {
   return lastAssistantMessageIsCompleteWithToolCalls({ messages });
 }
 
+function runtimeBadgeClass(status: string): string {
+  if (status === 'streaming') {
+    return 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300';
+  }
+
+  if (status === 'submitted') {
+    return 'bg-blue-100 text-blue-800 dark:bg-blue-950/40 dark:text-blue-300';
+  }
+
+  return 'bg-slate-100 text-slate-700 dark:bg-slate-700/40 dark:text-slate-200';
+}
+
 function normalizeIdentity(rawIdentity: string | null | undefined) {
   if (!rawIdentity) {
     return 'anonymous';
   }
 
   return encodeURIComponent(rawIdentity.trim());
+}
+
+function pickDefaultJobId(
+  options: ChatJobPickerOption[],
+  explicitDefaultJobId?: string,
+): string | null {
+  if (explicitDefaultJobId) {
+    const explicit = options.find((option) => option.id === explicitDefaultJobId && option.isActive);
+    if (explicit) {
+      return explicit.id;
+    }
+  }
+
+  const foundingEngineer = options.find(
+    (option) => option.isActive && /founding\s+engineer/i.test(option.title),
+  );
+  if (foundingEngineer) {
+    return foundingEngineer.id;
+  }
+
+  const firstActive = options.find((option) => option.isActive);
+  return firstActive?.id ?? null;
 }
 
 function safeJsonStringify(value: unknown): string {
@@ -202,10 +474,42 @@ function extractToolParts(message: UIMessage) {
         state: typeof value.state === 'string' ? value.state : null,
         input: value.input ?? null,
         output: value.output ?? null,
-          error: value.error ?? value.errorText ?? null,
+        error: value.error ?? value.errorText ?? null,
       };
     })
     .filter((part): part is NonNullable<typeof part> => Boolean(part));
+}
+
+function getMessageCreatedAtMs(message: UIMessage): number | undefined {
+  const value = (message as { createdAt?: unknown }).createdAt;
+  if (value instanceof Date) {
+    return value.getTime();
+  }
+
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  return undefined;
+}
+
+function deriveToolPartRuntimeStatus(
+  part: ReturnType<typeof extractToolParts>[number],
+): ToolCallStatus {
+  const state = (part.state ?? '').toLowerCase();
+
+  if (state === 'output-error' || state === 'output-denied' || state === 'error' || part.error) {
+    return 'error';
+  }
+
+  if (state === 'output-available' || (part.output !== null && part.output !== undefined)) {
+    return 'complete';
+  }
+
+  return 'pending';
 }
 
 function extractScheduleLogText(toolParts: ReturnType<typeof extractToolParts>): string | null {
@@ -237,6 +541,10 @@ function extractScheduleLogText(toolParts: ReturnType<typeof extractToolParts>):
   }
 
   if (mode === 'propose') {
+    const recovery = output.recovery && typeof output.recovery === 'object' ? (output.recovery as Record<string, unknown>) : null;
+    const recoveryMessage = recovery && typeof recovery.message === 'string' ? recovery.message : null;
+    const recoveryReason = recovery && typeof recovery.reason === 'string' ? recovery.reason : null;
+
     const slots = Array.isArray(output.slots) ? output.slots : [];
     const recommendedIndex =
       typeof output.recommendedSlotIndex === 'number' && Number.isInteger(output.recommendedSlotIndex)
@@ -261,11 +569,27 @@ function extractScheduleLogText(toolParts: ReturnType<typeof extractToolParts>):
       })
       .filter((line): line is string => Boolean(line));
 
+    const intro =
+      recoveryMessage ??
+      (recoveryReason === 'stale_selected_start_iso'
+        ? 'Selected slot was stale. Returning refreshed interview slots.'
+        : 'Interview slots proposed (not scheduled yet).');
+
     if (lines.length === 0) {
-      return 'Interview slots proposed (not scheduled yet).';
+      return `${intro}`;
     }
 
-    return `Interview slots proposed (not scheduled yet).\n${lines.join('\n')}`;
+    const recommendedSlot =
+      recommendedIndex >= 0 && recommendedIndex < slots.length && slots[recommendedIndex] && typeof slots[recommendedIndex] === 'object'
+        ? (slots[recommendedIndex] as Record<string, unknown>)
+        : null;
+    const recommendedStartISO =
+      recommendedSlot && typeof recommendedSlot.startISO === 'string' ? recommendedSlot.startISO : null;
+    const confirmHint = recommendedStartISO
+      ? `Reply with selectedStartISO "${recommendedStartISO}" to confirm scheduling.`
+      : 'Reply with a selectedStartISO from the list to confirm scheduling.';
+
+    return `${intro}\n${lines.join('\n')}\n${confirmHint}`;
   }
 
   if (mode === 'schedule') {
@@ -345,12 +669,22 @@ function ChatMessages(props: {
   messages: UIMessage[];
   emptyStateComponent: ReactNode;
   aiEmoji?: string;
+  toolTimingByKey: ToolTimingByKey;
+  toolTimingNowMs: number;
   className?: string;
 }) {
   return (
     <div className="flex flex-col max-w-[768px] mx-auto pb-12 w-full">
       {props.messages.map((m) => {
-        return <ChatMessageBubble key={m.id} message={m} aiEmoji={props.aiEmoji} />;
+        return (
+          <ChatMessageBubble
+            key={m.id}
+            message={m}
+            aiEmoji={props.aiEmoji}
+            toolTimingByKey={props.toolTimingByKey}
+            nowMs={props.toolTimingNowMs}
+          />
+        );
       })}
     </div>
   );
@@ -440,36 +774,90 @@ export function ChatWindow(props: {
   placeholder?: string;
   emoji?: string;
   userId: string;
+  jobOptions?: ChatJobPickerOption[];
+  defaultJobId?: string;
 }) {
   const scopedUserId = normalizeIdentity(props.userId);
   const chatStorageKey = `${CHAT_STORAGE_KEY_PREFIX}:${CHAT_STORAGE_VERSION}:${scopedUserId}`;
   const chatThreadId = `${CHAT_THREAD_ID_PREFIX}:${CHAT_STORAGE_VERSION}:${scopedUserId}`;
+  const jobPickerStorageKey = `${CHAT_JOB_PICKER_STORAGE_KEY_PREFIX}:${CHAT_STORAGE_VERSION}:${scopedUserId}`;
+  const autoSubmitBlockedUntilMsRef = useRef(0);
+
+  const jobOptions = useMemo(() => props.jobOptions ?? [], [props.jobOptions]);
+  const defaultSelectableJobId = useMemo(
+    () => pickDefaultJobId(jobOptions, props.defaultJobId),
+    [jobOptions, props.defaultJobId],
+  );
+
+  const [selectedJobId, setSelectedJobId] = useState<string | null>(defaultSelectableJobId);
+  const selectedJob = useMemo(
+    () => jobOptions.find((option) => option.id === selectedJobId && option.isActive) ?? null,
+    [jobOptions, selectedJobId],
+  );
+
+  const hasActiveJobOptions = jobOptions.some((option) => option.isActive);
+  const hasLoadedPersistedJobSelection = useRef(false);
+  const selectedJobContextRef = useRef<{
+    selectedJobId?: string;
+    selectedJobTitle?: string;
+    selectedJobOrganizationId?: string;
+    selectedJobStatus?: 'active';
+  }>({});
+
+  selectedJobContextRef.current = {
+    ...(selectedJob?.id ? { selectedJobId: selectedJob.id } : {}),
+    ...(selectedJob?.title ? { selectedJobTitle: selectedJob.title } : {}),
+    ...(selectedJob?.organizationId ? { selectedJobOrganizationId: selectedJob.organizationId } : {}),
+    ...(selectedJob?.isActive ? { selectedJobStatus: 'active' as const } : {}),
+  };
 
   const { messages, sendMessage, status, toolInterrupt, stop, regenerate, setMessages } = useInterruptions((handler) =>
     // eslint-disable-next-line react-hooks/rules-of-hooks
     useChat({
       id: chatThreadId,
-      transport: new DefaultChatTransport({ api: props.endpoint }),
+      transport: new DefaultChatTransport({
+        api: props.endpoint,
+        body: () => ({
+          ...selectedJobContextRef.current,
+        }),
+      }),
       generateId,
       onError: handler((e: Error) => {
         console.error('Error: ', e);
         toast.error(`Error while processing your request`, { description: e.message });
       }),
-      sendAutomaticallyWhen: ({ messages }) => shouldAutoSubmitAfterToolCalls(messages as UIMessage[]),
+      sendAutomaticallyWhen: ({ messages }) => {
+        if (Date.now() < autoSubmitBlockedUntilMsRef.current) {
+          return false;
+        }
+
+        return shouldAutoSubmitAfterToolCalls(messages as UIMessage[]);
+      },
     }),
   );
+
+  const workflowIdCatalog = useMemo(
+    () => buildWorkflowIdCatalog({ messages, selectedJob }),
+    [messages, selectedJob],
+  );
+  const hasWorkflowIds = workflowIdCatalog.entries.length > 0;
 
   const [input, setInput] = useState('');
   const [hydrated, setHydrated] = useState(false);
   const [isAuthorizationFlowRunning, setIsAuthorizationFlowRunning] = useState(false);
   const [activeAuthorizationStep, setActiveAuthorizationStep] = useState<string | null>(null);
   const [isCopyingLogs, setIsCopyingLogs] = useState(false);
+  const [toolTimingByKey, setToolTimingByKey] = useState<ToolTimingByKey>({});
+  const [toolTimingNowMs, setToolTimingNowMs] = useState(() => Date.now());
   const hasLoadedPersistedMessages = useRef(false);
   const statusRef = useRef(status);
   const interruptRef = useRef(toolInterrupt);
 
   const isChatBusy = status === 'submitted' || status === 'streaming';
   const hasAssistantMessages = messages.some((message) => message.role === 'assistant');
+  const pendingToolCount = Object.values(toolTimingByKey).filter((timing) => timing.status === 'pending').length;
+  const runtimeLabel =
+    status === 'streaming' ? 'Streaming response' : status === 'submitted' ? 'Submitting request' : 'Ready';
 
   useEffect(() => {
     statusRef.current = status;
@@ -482,6 +870,51 @@ export function ChatWindow(props: {
   useEffect(() => {
     setHydrated(true);
   }, []);
+
+  useEffect(() => {
+    if (!hydrated || hasLoadedPersistedJobSelection.current) {
+      return;
+    }
+
+    const persistedJobId = window.localStorage.getItem(jobPickerStorageKey);
+    if (
+      persistedJobId &&
+      jobOptions.some((option) => option.id === persistedJobId && option.isActive)
+    ) {
+      setSelectedJobId(persistedJobId);
+    } else {
+      setSelectedJobId(defaultSelectableJobId);
+    }
+
+    hasLoadedPersistedJobSelection.current = true;
+  }, [defaultSelectableJobId, hydrated, jobOptions, jobPickerStorageKey]);
+
+  useEffect(() => {
+    if (!hydrated || !hasLoadedPersistedJobSelection.current) {
+      return;
+    }
+
+    if (!selectedJob?.id) {
+      window.localStorage.removeItem(jobPickerStorageKey);
+      return;
+    }
+
+    window.localStorage.setItem(jobPickerStorageKey, selectedJob.id);
+  }, [hydrated, jobPickerStorageKey, selectedJob]);
+
+  useEffect(() => {
+    if (!selectedJobId) {
+      return;
+    }
+
+    const isStillActive = jobOptions.some(
+      (option) => option.id === selectedJobId && option.isActive,
+    );
+
+    if (!isStillActive) {
+      setSelectedJobId(defaultSelectableJobId);
+    }
+  }, [defaultSelectableJobId, jobOptions, selectedJobId]);
 
   useEffect(() => {
     if (!hydrated || hasLoadedPersistedMessages.current) {
@@ -514,6 +947,88 @@ export function ChatWindow(props: {
     window.localStorage.setItem(chatStorageKey, JSON.stringify(messages));
   }, [messages, hydrated, chatStorageKey]);
 
+  useEffect(() => {
+    if (messages.length === 0) {
+      return;
+    }
+
+    setToolTimingByKey((current) => {
+      const next = { ...current };
+      let changed = false;
+      const activeKeys = new Set<string>();
+
+      for (const message of messages) {
+        const messageCreatedAt = getMessageCreatedAtMs(message) ?? Date.now();
+        const toolParts = extractToolParts(message);
+
+        for (const part of toolParts) {
+          if (!part.toolCallId) {
+            continue;
+          }
+
+          const key = `${message.id}:${part.toolCallId}`;
+          activeKeys.add(key);
+          const runtimeStatus = deriveToolPartRuntimeStatus(part);
+          const existing = next[key];
+
+          if (!existing) {
+            next[key] = {
+              startedAt: messageCreatedAt,
+              ...(runtimeStatus !== 'pending' ? { completedAt: messageCreatedAt } : {}),
+              status: runtimeStatus,
+            };
+            changed = true;
+            continue;
+          }
+
+          const updates: Partial<ToolCallTimingInfo> = {};
+          if (existing.status !== runtimeStatus) {
+            updates.status = runtimeStatus;
+          }
+
+          if ((runtimeStatus === 'complete' || runtimeStatus === 'error') && !existing.completedAt) {
+            updates.completedAt = Date.now();
+          }
+
+          if (!existing.startedAt || existing.startedAt <= 0) {
+            updates.startedAt = messageCreatedAt;
+          }
+
+          if (Object.keys(updates).length > 0) {
+            next[key] = { ...existing, ...updates };
+            changed = true;
+          }
+        }
+      }
+
+      for (const key of Object.keys(next)) {
+        if (activeKeys.has(key)) {
+          continue;
+        }
+
+        delete next[key];
+        changed = true;
+      }
+
+      return changed ? next : current;
+    });
+  }, [messages]);
+
+  useEffect(() => {
+    const hasPendingTool = Object.values(toolTimingByKey).some((timing) => timing.status === 'pending');
+    if (!hasPendingTool) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      setToolTimingNowMs(Date.now());
+    }, 200);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [toolTimingByKey]);
+
   async function onSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     if (!input.trim() || isChatBusy) return;
@@ -527,6 +1042,57 @@ export function ChatWindow(props: {
     }
 
     await sendMessage({ text: RUN_CONNECTION_DIAGNOSTICS_PROMPT });
+  }
+
+  function onStopGeneration() {
+    autoSubmitBlockedUntilMsRef.current = Date.now() + 3000;
+    stop();
+  }
+
+  function applyOperatorTemplateContext(template: string) {
+    const replacements: Record<string, string | undefined> = {
+      '<job_id>': selectedJob?.id ?? workflowIdCatalog.latest.jobId,
+      '<org_id>': selectedJob?.organizationId ?? workflowIdCatalog.latest.organizationId,
+      '<candidate_id>': workflowIdCatalog.latest.candidateId,
+      '<interview_id>': workflowIdCatalog.latest.interviewId,
+      '<offer_id>': workflowIdCatalog.latest.offerId,
+      '<auth_req_id>': workflowIdCatalog.latest.authReqId,
+      '<selected_start_iso>': workflowIdCatalog.latest.selectedStartISO,
+    };
+
+    let output = template;
+    for (const [placeholder, value] of Object.entries(replacements)) {
+      if (!value) {
+        continue;
+      }
+
+      output = output.replace(new RegExp(placeholder, 'g'), value);
+    }
+
+    return output;
+  }
+
+  function onInsertOperatorCommand(template: string) {
+    if (isChatBusy) {
+      return;
+    }
+
+    setInput(applyOperatorTemplateContext(template));
+  }
+
+  function onSelectJob(jobId: string) {
+    const option = jobOptions.find((item) => item.id === jobId);
+    if (!option?.isActive) {
+      toast.error('Selected job is not active.', {
+        description: 'Pick an active job or run the demo seed command to create active options.',
+      });
+      return;
+    }
+
+    setSelectedJobId(option.id);
+    toast.success('Target job updated.', {
+      description: `${option.title} (${option.id})`,
+    });
   }
 
   async function waitForStepCompletion() {
@@ -578,7 +1144,33 @@ export function ChatWindow(props: {
 
   function onClearChat() {
     setMessages([]);
+    setToolTimingByKey({});
     window.localStorage.removeItem(chatStorageKey);
+  }
+
+  async function onCopyWorkflowId(entry: WorkflowIdEntry) {
+    try {
+      await writeClipboardText(entry.value);
+      toast.success(`${formatWorkflowIdLabel(entry.key)} copied.`, {
+        description: entry.value,
+      });
+    } catch (error) {
+      toast.error('Failed to copy ID.', {
+        description: error instanceof Error ? error.message : 'Unknown clipboard error.',
+      });
+    }
+  }
+
+  async function onCopyAllWorkflowIds() {
+    try {
+      const payload = safeJsonStringify(workflowIdCatalog.latest);
+      await writeClipboardText(payload);
+      toast.success('Latest workflow IDs copied as JSON.');
+    } catch (error) {
+      toast.error('Failed to copy workflow IDs.', {
+        description: error instanceof Error ? error.message : 'Unknown clipboard error.',
+      });
+    }
   }
 
   async function onCopyLogs(mode: ChatLogMode) {
@@ -635,7 +1227,13 @@ export function ChatWindow(props: {
             <div>{props.emptyStateComponent}</div>
           ) : (
             <>
-              <ChatMessages aiEmoji={props.emoji} messages={messages} emptyStateComponent={props.emptyStateComponent} />
+              <ChatMessages
+                aiEmoji={props.emoji}
+                messages={messages}
+                emptyStateComponent={props.emptyStateComponent}
+                toolTimingByKey={toolTimingByKey}
+                toolTimingNowMs={toolTimingNowMs}
+              />
               <div className="flex flex-col max-w-[768px] mx-auto pb-12 w-full">
                 <TokenVaultInterruptHandler interrupt={toolInterrupt} />
               </div>
@@ -645,7 +1243,76 @@ export function ChatWindow(props: {
         footer={
           <div className="sticky bottom-8 px-2">
             <ScrollToBottom className="absolute bottom-full left-1/2 -translate-x-1/2 mb-4" />
+            <details className="max-w-[768px] mx-auto mb-3 rounded-md border border-input bg-background/85 px-3 py-2">
+              <summary className="cursor-pointer text-sm font-medium select-none">Founder Scheduling Panel (Cal link flow)</summary>
+              <div className="pt-3">
+                <FounderSlotSelectionPanel
+                  defaultJobId={selectedJob?.id ?? null}
+                  defaultOrganizationId={selectedJob?.organizationId ?? null}
+                  disabled={isChatBusy}
+                />
+              </div>
+            </details>
             <div className="max-w-[768px] mx-auto mb-3 flex justify-end gap-2">
+              <span
+                className={cn(
+                  'mr-auto text-[11px] px-2 py-1 rounded-full font-medium uppercase tracking-wide self-center',
+                  runtimeBadgeClass(status),
+                )}
+              >
+                {runtimeLabel}
+                {pendingToolCount > 0 ? ` · ${pendingToolCount} tool${pendingToolCount === 1 ? '' : 's'} running` : ''}
+              </span>
+
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="outline" size="sm" disabled={isChatBusy || !hasActiveJobOptions}>
+                    Job: {selectedJob?.title ?? 'Select Active Job'}
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" className="w-[340px]">
+                  <DropdownMenuLabel>Target Job For Recruiting Actions</DropdownMenuLabel>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuRadioGroup value={selectedJob?.id ?? ''} onValueChange={onSelectJob}>
+                    {jobOptions.map((option) => (
+                      <DropdownMenuRadioItem key={option.id} value={option.id} disabled={!option.isActive}>
+                        {option.title}
+                        <DropdownMenuShortcut>{option.isActive ? 'active' : 'inactive'}</DropdownMenuShortcut>
+                      </DropdownMenuRadioItem>
+                    ))}
+                  </DropdownMenuRadioGroup>
+                </DropdownMenuContent>
+              </DropdownMenu>
+
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="outline" size="sm" disabled={!hasWorkflowIds}>
+                    ID Sonar
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" className="w-[360px]">
+                  <DropdownMenuLabel>Latest Workflow IDs (Click To Copy)</DropdownMenuLabel>
+                  <DropdownMenuSeparator />
+                  {hasWorkflowIds ? (
+                    workflowIdCatalog.entries.slice(0, 20).map((entry) => (
+                      <DropdownMenuItem
+                        key={`${entry.key}:${entry.value}`}
+                        onSelect={() => void onCopyWorkflowId(entry)}
+                      >
+                        {formatWorkflowIdLabel(entry.key)}
+                        <DropdownMenuShortcut>{formatWorkflowIdShortcut(entry.value)}</DropdownMenuShortcut>
+                      </DropdownMenuItem>
+                    ))
+                  ) : (
+                    <DropdownMenuItem disabled>No workflow IDs detected yet.</DropdownMenuItem>
+                  )}
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onSelect={() => void onCopyAllWorkflowIds()}>
+                    Copy IDs As JSON
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+
               <Button
                 variant="outline"
                 size="sm"
@@ -663,8 +1330,26 @@ export function ChatWindow(props: {
                 Run Diagnostics
               </Button>
 
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="outline" size="sm" disabled={isChatBusy}>
+                    / Commands
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  {OPERATOR_COMMAND_TEMPLATES.map((template) => (
+                    <DropdownMenuItem
+                      key={template.label}
+                      onSelect={() => onInsertOperatorCommand(template.value)}
+                    >
+                      {template.label}
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+
               {isChatBusy ? (
-                <Button variant="outline" size="sm" onClick={() => stop()}>
+                <Button variant="outline" size="sm" onClick={onStopGeneration}>
                   <Square className="w-4 h-4 mr-1" />
                   Stop
                 </Button>
@@ -703,6 +1388,14 @@ export function ChatWindow(props: {
                 </Button>
               ) : null}
             </div>
+            <p className="max-w-[768px] mx-auto mb-3 text-xs text-muted-foreground px-1">
+              {selectedJob
+                ? `Selected active job: ${selectedJob.title} (${selectedJob.id}).`
+                : hasActiveJobOptions
+                  ? 'Pick an active job to use as the default for intake, scheduling, and offer workflows.'
+                  : 'No active jobs found yet. Run `npm run seed:demo -- --reset` or activate a job in the database first.'}
+              {' '}Use ID Sonar to copy IDs and / Commands to auto-fill available placeholders.
+            </p>
             <ChatInput
               value={input}
               onChange={(e) => setInput(e.target.value)}

@@ -12,6 +12,18 @@ export const OFFER_STATUSES = ['draft', 'awaiting_approval', 'approved', 'sent',
 export const OFFER_CANDIDATE_RESPONSES = ['accepted', 'declined'] as const;
 export const offerStatusSchema = z.enum(OFFER_STATUSES);
 export const offerCandidateResponseSchema = z.enum(OFFER_CANDIDATE_RESPONSES);
+const offerTermScalarSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
+
+export const offerTermsSchema = z.object({
+  baseSalary: z.number().int().positive(),
+  currency: z.string().trim().length(3),
+  startDate: z.string().date(),
+  equityPercent: z.number().min(0).max(100).optional(),
+  signOnBonus: z.number().int().min(0).optional(),
+  bonusTargetPercent: z.number().min(0).max(100).optional(),
+  notes: z.string().max(2000).optional(),
+  additional: z.record(z.string(), offerTermScalarSchema).optional(),
+});
 
 export const offers = pgTable(
   'offers',

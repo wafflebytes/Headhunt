@@ -3,10 +3,12 @@ import { eq } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { CandidateIngestAccessError, ingestCandidateFromEmail } from '@/lib/actions/candidates-ingest';
+import { buildIdempotencyKey, enqueueAutomationRun } from '@/lib/automation/queue';
 import { withGmailRead } from '@/lib/auth0-ai';
 import { auth0 } from '@/lib/auth0';
 import { db } from '@/lib/db';
 import { auditLogs } from '@/lib/db/schema/audit-logs';
+import { candidates } from '@/lib/db/schema/candidates';
 import { jobs } from '@/lib/db/schema/jobs';
 import { organizations } from '@/lib/db/schema/organizations';
 import { fetchInterceptMessages } from '@/lib/tools/intercept';
@@ -15,9 +17,13 @@ import { generateIntelCard, runTriage } from '@/lib/tools/triage-intel';
 const runIntakeE2EInputSchema = z.object({
   organizationId: z.string().optional(),
   jobId: z.string().optional(),
-  query: z.string().default('in:inbox newer_than:7d'),
-  maxResults: z.number().int().min(1).max(25).default(8),
-  processLimit: z.number().int().min(1).max(10).default(3),
+  query: z
+    .string()
+    .default(
+      'in:inbox newer_than:14d -category:promotions -category:social -subject:newsletter -subject:digest -subject:unsubscribe',
+    ),
+  maxResults: z.number().int().min(1).max(25).default(20),
+  processLimit: z.number().int().min(1).max(10).default(8),
   candidateLikeOnly: z.boolean().default(true),
   includeBody: z.boolean().default(true),
   generateIntel: z.boolean().default(true),
@@ -29,40 +35,167 @@ function normalizeEmail(value: string | null): string | null {
   return value.trim().toLowerCase();
 }
 
-function titleCaseFromEmail(email: string) {
-  const local = email.split('@')[0] ?? 'candidate';
-  return local
-    .split(/[._+-]+/)
+function parseSenderEmail(from: string | null): string | null {
+  if (!from) return null;
+  const firstEmail = from.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0] ?? null;
+  return normalizeEmail(firstEmail);
+}
+
+const NAME_STOP_WORDS = new Set([
+  'application',
+  'applying',
+  'apply',
+  'resume',
+  'cv',
+  'cover',
+  'letter',
+  'founding',
+  'engineer',
+  'designer',
+  'role',
+  'position',
+  'intern',
+  'job',
+  'interview',
+  'availability',
+  'schedule',
+  'thread',
+]);
+
+function toTitleCaseName(value: string): string {
+  return value
+    .split(/\s+/)
     .filter(Boolean)
-    .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
+    .map((part) => part[0].toUpperCase() + part.slice(1).toLowerCase())
     .join(' ');
 }
 
-function parseSender(from: string | null) {
-  const fallback = {
-    name: 'Unknown Candidate',
-    email: null as string | null,
-  };
+function normalizePossibleName(value: string | null): string | null {
+  if (!value) return null;
 
-  if (!from) return fallback;
+  const cleaned = value
+    .replace(/[|,:;()\[\]{}<>]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 
-  const bracketMatch = from.match(/^(.*)<([^>]+)>\s*$/);
-  if (bracketMatch) {
-    const email = normalizeEmail(bracketMatch[2]);
-    const name = bracketMatch[1].replace(/"/g, '').trim() || (email ? titleCaseFromEmail(email) : fallback.name);
-    return { name, email };
+  if (!cleaned || cleaned.includes('@')) return null;
+
+  const words = cleaned.split(' ').filter(Boolean);
+  if (words.length < 2 || words.length > 4) return null;
+
+  for (const word of words) {
+    if (!/^[A-Za-z][A-Za-z'\-]{0,39}$/.test(word)) {
+      return null;
+    }
+
+    if (NAME_STOP_WORDS.has(word.toLowerCase())) {
+      return null;
+    }
   }
 
-  const firstEmail = from.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0] ?? null;
-  if (firstEmail) {
-    const email = normalizeEmail(firstEmail);
+  return toTitleCaseName(words.join(' '));
+}
+
+function extractNameFromSubject(subject: string | null): string | null {
+  if (!subject) return null;
+
+  const normalized = subject.replace(/\s+/g, ' ').trim();
+
+  const explicitPatterns = [
+    /\bapplication\b\s*[-:|]\s*[^-:|]{2,120}\s*[-:|]\s*([^-:|]{2,120})$/i,
+    /^([^-:|]{2,120})\s*[-:|]\s*(?:application|applying|resume|cv)\b/i,
+    /\b(?:application|applying)\s+(?:for|to)\b[^-:|]{0,120}\s*[-:|]\s*([^-:|]{2,120})$/i,
+  ] as const;
+
+  for (const pattern of explicitPatterns) {
+    const match = normalized.match(pattern);
+    const candidateName = normalizePossibleName(match?.[1] ?? null);
+    if (candidateName) {
+      return candidateName;
+    }
+  }
+
+  const segments = normalized.split(/[-|:]/).map((segment) => segment.trim());
+  for (const segment of segments) {
+    const candidateName = normalizePossibleName(segment);
+    if (candidateName) {
+      return candidateName;
+    }
+  }
+
+  return null;
+}
+
+function extractNameFromBody(body: string): string | null {
+  const normalized = body.replace(/\r\n/g, '\n');
+
+  const bodyPatterns = [
+    /^\s*name\s*:\s*([^\n]{2,100})$/im,
+    /\bmy\s+name\s+is\s+([A-Za-z][A-Za-z'\- ]{1,80})\b/i,
+    /\bi\s+am\s+([A-Za-z][A-Za-z'\- ]{1,80})\b/i,
+    /\bi'm\s+([A-Za-z][A-Za-z'\- ]{1,80})\b/i,
+  ] as const;
+
+  for (const pattern of bodyPatterns) {
+    const match = normalized.match(pattern);
+    const candidateName = normalizePossibleName(match?.[1] ?? null);
+    if (candidateName) {
+      return candidateName;
+    }
+  }
+
+  const signoffPattern = /^(thanks|thank you|regards|best|sincerely|cheers)[!,.]?$/i;
+  const lines = normalized
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  for (let index = lines.length - 1; index >= 1; index -= 1) {
+    const line = lines[index];
+    const previousLine = lines[index - 1];
+
+    if (!signoffPattern.test(previousLine)) {
+      continue;
+    }
+
+    const candidateName = normalizePossibleName(line);
+    if (candidateName) {
+      return candidateName;
+    }
+  }
+
+  return null;
+}
+
+function extractCandidateIdentity(params: {
+  from: string | null;
+  subject: string | null;
+  body: string;
+  snippet: string;
+}) {
+  const nameFromSubject = extractNameFromSubject(params.subject);
+  if (nameFromSubject) {
     return {
-      name: titleCaseFromEmail(email ?? firstEmail),
-      email,
+      name: nameFromSubject,
+      nameSource: 'subject' as const,
+      email: parseSenderEmail(params.from),
     };
   }
 
-  return fallback;
+  const nameFromBody = extractNameFromBody(params.body || params.snippet);
+  if (nameFromBody) {
+    return {
+      name: nameFromBody,
+      nameSource: 'body' as const,
+      email: parseSenderEmail(params.from),
+    };
+  }
+
+  return {
+    name: 'Candidate Applicant',
+    nameSource: 'fallback' as const,
+    email: parseSenderEmail(params.from),
+  };
 }
 
 function compact(value: string, limit = 6000): string {
@@ -129,6 +262,16 @@ export const runIntakeE2ETool = withGmailRead(
           )[0] ?? null
         : null;
 
+      if (requestedJob && requestedJob.status !== 'active') {
+        return {
+          check: 'run_intake_e2e',
+          status: 'error',
+          message: `Requested job ${requestedJob.id} is ${requestedJob.status}. Pick an active job before running intake.`,
+          requestedJobId,
+          requestedJobStatus: requestedJob.status,
+        };
+      }
+
       const resolvedOrganizationId = requestedOrganization?.id ?? requestedJob?.organizationId ?? null;
       const activeJobs = await loadActiveJobs(resolvedOrganizationId ?? undefined);
       const fallbackJobId = requestedJob?.id ?? activeJobs[0]?.id ?? null;
@@ -151,9 +294,14 @@ export const runIntakeE2ETool = withGmailRead(
 
       for (const message of messages) {
         const rawEmailText = buildEmailText(message);
-        const sender = parseSender(message.from);
+        const candidateIdentity = extractCandidateIdentity({
+          from: message.from,
+          subject: message.subject,
+          body: message.body,
+          snippet: message.snippet,
+        });
 
-        if (!sender.email) {
+        if (!candidateIdentity.email) {
           messageResults.push({
             messageId: message.messageId,
             subject: message.subject,
@@ -174,6 +322,82 @@ export const runIntakeE2ETool = withGmailRead(
             jobs: activeJobs.map((job: { id: string; title: string }) => ({ id: job.id, title: job.title })),
           });
 
+          if (triage.classification === 'scheduling_reply') {
+            const schedulingJobId = requestedJob?.id ?? triage.jobId ?? fallbackJobId;
+
+            if (!schedulingJobId) {
+              messageResults.push({
+                messageId: message.messageId,
+                threadId: message.threadId,
+                from: message.from,
+                subject: message.subject,
+                status: 'skipped',
+                reason: 'Scheduling reply detected but no active job context was resolved.',
+                triage,
+              });
+              continue;
+            }
+
+            const [matchedCandidate] = await db
+              .select({ id: candidates.id, jobId: candidates.jobId })
+              .from(candidates)
+              .where(eq(candidates.contactEmail, candidateIdentity.email))
+              .limit(1);
+
+            if (!matchedCandidate || matchedCandidate.jobId !== schedulingJobId) {
+              messageResults.push({
+                messageId: message.messageId,
+                threadId: message.threadId,
+                from: message.from,
+                subject: message.subject,
+                status: 'skipped',
+                reason: 'Scheduling reply detected but no matching candidate record found for resolved job.',
+                triage,
+              });
+              continue;
+            }
+
+            const schedulingRun = await enqueueAutomationRun({
+              handlerType: 'scheduling.reply.parse_book',
+              resourceType: 'candidate',
+              resourceId: matchedCandidate.id,
+              idempotencyKey: buildIdempotencyKey(['scheduling-reply', matchedCandidate.id, message.messageId]),
+              payload: {
+                candidateId: matchedCandidate.id,
+                jobId: schedulingJobId,
+                organizationId: resolvedOrganizationId,
+                actorUserId: actorId,
+                sendMode: 'draft',
+                timezone: 'America/Los_Angeles',
+                threadId: message.threadId ?? undefined,
+                query: `rfc822msgid:${message.messageId}`,
+                lookbackDays: 14,
+                maxResults: 10,
+                durationMinutes: 30,
+              },
+              maxAttempts: 6,
+            });
+
+            messageResults.push({
+              messageId: message.messageId,
+              threadId: message.threadId,
+              from: message.from,
+              subject: message.subject,
+              candidateName: candidateIdentity.name,
+              candidateNameSource: candidateIdentity.nameSource,
+              candidateEmail: candidateIdentity.email,
+              candidateId: matchedCandidate.id,
+              jobId: schedulingJobId,
+              status: 'processed',
+              triage,
+              automation: {
+                schedulingEnqueued: schedulingRun.inserted,
+                schedulingRunId: schedulingRun.runId,
+              },
+            });
+            continue;
+          }
+
           if (triage.classification !== 'application') {
             messageResults.push({
               messageId: message.messageId,
@@ -188,6 +412,20 @@ export const runIntakeE2ETool = withGmailRead(
           }
 
           const triageJobId = triage.jobId ?? null;
+
+          if (requestedJob?.id && triageJobId && triageJobId !== requestedJob.id) {
+            messageResults.push({
+              messageId: message.messageId,
+              threadId: message.threadId,
+              from: message.from,
+              subject: message.subject,
+              status: 'skipped',
+              reason: `Triage matched ${triageJobId}, which does not match requested job ${requestedJob.id}.`,
+              triage,
+            });
+            continue;
+          }
+
           const resolvedJobId = requestedJob?.id ?? triageJobId ?? fallbackJobId;
 
           if (!resolvedJobId) {
@@ -205,8 +443,8 @@ export const runIntakeE2ETool = withGmailRead(
           const ingest = await ingestCandidateFromEmail({
             jobId: resolvedJobId,
             organizationId: resolvedOrganizationId ?? undefined,
-            candidateName: sender.name,
-            candidateEmail: sender.email,
+            candidateName: candidateIdentity.name,
+            candidateEmail: candidateIdentity.email,
             rawEmailText,
             source: {
               gmailMessageId: message.messageId,
@@ -241,17 +479,41 @@ export const runIntakeE2ETool = withGmailRead(
             }
           }
 
+          const scoreRun = await enqueueAutomationRun({
+            handlerType: 'candidate.score',
+            resourceType: 'candidate',
+            resourceId: ingest.candidate.id,
+            idempotencyKey: buildIdempotencyKey(['candidate-score', ingest.candidate.id, message.messageId]),
+            payload: {
+              candidateId: ingest.candidate.id,
+              jobId: resolvedJobId,
+              organizationId: resolvedOrganizationId,
+              actorUserId: actorId,
+              emailText: rawEmailText,
+              requirements: input.requirements ?? [],
+              turns: 3,
+              maxEvidenceChars: 9000,
+            },
+            maxAttempts: 6,
+          });
+
           messageResults.push({
             messageId: message.messageId,
             threadId: message.threadId,
             from: message.from,
             subject: message.subject,
-            candidateEmail: sender.email,
+            candidateName: candidateIdentity.name,
+            candidateNameSource: candidateIdentity.nameSource,
+            candidateEmail: candidateIdentity.email,
             candidateId: ingest.candidate.id,
             jobId: resolvedJobId,
             ingestStatus: ingest.idempotent ? 'idempotent' : 'created',
             triage,
             intel,
+            automation: {
+              scoreEnqueued: scoreRun.inserted,
+              scoreRunId: scoreRun.runId,
+            },
             status: 'processed',
           });
         } catch (error) {

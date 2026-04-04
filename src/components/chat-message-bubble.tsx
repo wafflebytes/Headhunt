@@ -4,7 +4,13 @@ import { Loader2, CheckCircle, AlertCircle } from 'lucide-react';
 import { MemoizedMarkdown } from './memoized-markdown';
 import { cn } from '@/utils/cn';
 
-type ToolCallStatus = 'pending' | 'complete' | 'error';
+export type ToolCallStatus = 'pending' | 'complete' | 'error';
+
+export type ToolCallTimingInfo = {
+  startedAt: number;
+  completedAt?: number;
+  status: ToolCallStatus;
+};
 
 type ToolCallView = {
   toolCallId: string;
@@ -12,6 +18,10 @@ type ToolCallView = {
   args: Record<string, unknown>;
   result?: unknown;
   status: ToolCallStatus;
+  resultCheck?: string | null;
+  resultStatus?: string | null;
+  resultMode?: string | null;
+  elapsedMs?: number;
 };
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -233,6 +243,11 @@ function getToolCallsFromMessage(message: UIMessage): ToolCallView[] {
       }
     }
 
+    const metadata = getToolResultMetadata(existing.result);
+    existing.resultCheck = metadata.check;
+    existing.resultStatus = metadata.status;
+    existing.resultMode = metadata.mode;
+
     byId.set(parsed.toolCallId, existing);
   }
 
@@ -258,15 +273,204 @@ function summarizeToolResult(result: unknown): string | null {
     return 'Authorization is required to continue. Click Authorize in the popup.';
   }
 
+  const transcriptCheck = (result as { check?: unknown }).check;
+  const transcriptStatus = (result as { status?: unknown }).status;
+  if (transcriptCheck === 'run_multi_agent_candidate_score') {
+    if (transcriptStatus === 'error') {
+      const message = asNonEmptyString((result as { message?: unknown }).message) ?? 'Unknown consensus scoring error.';
+      return `Multi-agent candidate scoring failed: ${message}`;
+    }
+
+    if (transcriptStatus === 'success') {
+      const consensus = asRecord((result as { consensus?: unknown }).consensus);
+      const agentScores = asRecord((result as { agentScores?: unknown }).agentScores);
+
+      const recommendation = asNonEmptyString(consensus?.recommendation);
+      const finalScore = typeof consensus?.finalScore === 'number' ? consensus.finalScore : null;
+      const confidence = typeof consensus?.confidence === 'number' ? consensus.confidence : null;
+
+      const technical = typeof agentScores?.technical === 'number' ? agentScores.technical : null;
+      const social = typeof agentScores?.social === 'number' ? agentScores.social : null;
+      const atsObjective = typeof agentScores?.atsObjective === 'number' ? agentScores.atsObjective : null;
+
+      const strengths = Array.isArray(consensus?.strengths) ? consensus.strengths : [];
+      const risks = Array.isArray(consensus?.risks) ? consensus.risks : [];
+
+      const lines = ['Multi-agent candidate scoring completed.'];
+      if (typeof finalScore === 'number') {
+        lines.push(`Final consensus score: ${finalScore}/100`);
+      }
+      if (typeof confidence === 'number') {
+        lines.push(`Confidence: ${confidence}/100`);
+      }
+      if (recommendation) {
+        lines.push(`Recommendation: ${recommendation}`);
+      }
+
+      const evaluatorParts = [
+        typeof technical === 'number' ? `technical ${technical}` : null,
+        typeof social === 'number' ? `social ${social}` : null,
+        typeof atsObjective === 'number' ? `ats objective ${atsObjective}` : null,
+      ].filter((part): part is string => Boolean(part));
+
+      if (evaluatorParts.length > 0) {
+        lines.push(`Evaluator scores: ${evaluatorParts.join(', ')}`);
+      }
+
+      if (strengths.length > 0 && typeof strengths[0] === 'string') {
+        lines.push(`Top strength: ${strengths[0]}`);
+      }
+
+      if (risks.length > 0 && typeof risks[0] === 'string') {
+        lines.push(`Top risk: ${risks[0]}`);
+      }
+
+      return lines.join('\n');
+    }
+  }
+
+  if (
+    (transcriptCheck === 'summarize_cal_booking_transcript' ||
+      transcriptCheck === 'summarize_drive_transcript_pdf') &&
+    transcriptStatus === 'success'
+  ) {
+    const summary = asRecord((result as { summary?: unknown }).summary);
+    const recommendation = asNonEmptyString(summary?.recommendation);
+    const score = summary?.overallRubricScore;
+    const strengths = Array.isArray(summary?.candidateStrengths) ? summary?.candidateStrengths : [];
+    const risks = Array.isArray(summary?.candidateRisks) ? summary?.candidateRisks : [];
+
+    const lines = ['Interview transcript summary generated.'];
+    if (recommendation) {
+      lines.push(`Recommendation: ${recommendation}`);
+    }
+    if (typeof score === 'number' && Number.isFinite(score)) {
+      lines.push(`Rubric score: ${score}/30`);
+    }
+    if (strengths.length > 0 && typeof strengths[0] === 'string') {
+      lines.push(`Top strength: ${strengths[0]}`);
+    }
+    if (risks.length > 0 && typeof risks[0] === 'string') {
+      lines.push(`Top risk: ${risks[0]}`);
+    }
+
+    return lines.join('\n');
+  }
+
   const check = (result as { check?: unknown }).check;
   const status = (result as { status?: unknown }).status;
   if (typeof check === 'string' && typeof status === 'string') {
     const readableCheck = check.replace(/^verify_/, '').replace(/_/g, ' ').trim();
-    const readableStatus = status === 'healthy' ? 'healthy' : 'needs attention';
+    const normalizedStatus = status.trim().toLowerCase();
+    const healthyStatuses = new Set(['healthy', 'success', 'complete', 'approved', 'sent']);
+    const needsAttentionStatuses = new Set(['error', 'failed', 'denied', 'unhealthy']);
+    const readableStatus = healthyStatuses.has(normalizedStatus)
+      ? 'healthy'
+      : needsAttentionStatuses.has(normalizedStatus)
+        ? 'needs attention'
+        : status;
     return `${readableCheck}: ${readableStatus}.`;
   }
 
   return null;
+}
+
+function getToolResultMetadata(result: unknown): {
+  check: string | null;
+  status: string | null;
+  mode: string | null;
+} {
+  const record = asRecord(result);
+  if (!record) {
+    return {
+      check: null,
+      status: null,
+      mode: null,
+    };
+  }
+
+  return {
+    check: asNonEmptyString(record.check),
+    status: asNonEmptyString(record.status),
+    mode: asNonEmptyString(record.mode),
+  };
+}
+
+function normalizeStatusLabel(value: string): string {
+  return value.replace(/_/g, ' ').trim();
+}
+
+function statusBadgeClass(status: string): string {
+  const normalized = status.toLowerCase();
+
+  if (
+    normalized.includes('error') ||
+    normalized.includes('failed') ||
+    normalized.includes('denied') ||
+    normalized.includes('expired') ||
+    normalized.includes('unhealthy')
+  ) {
+    return 'bg-red-100 text-red-800 dark:bg-red-950/40 dark:text-red-300';
+  }
+
+  if (
+    normalized.includes('pending') ||
+    normalized.includes('awaiting') ||
+    normalized.includes('running') ||
+    normalized.includes('queued')
+  ) {
+    return 'bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300';
+  }
+
+  if (
+    normalized.includes('success') ||
+    normalized.includes('healthy') ||
+    normalized.includes('sent') ||
+    normalized.includes('approved') ||
+    normalized.includes('complete')
+  ) {
+    return 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300';
+  }
+
+  return 'bg-slate-100 text-slate-800 dark:bg-slate-800 dark:text-slate-200';
+}
+
+function formatElapsed(elapsedMs: number | undefined): string | null {
+  if (typeof elapsedMs !== 'number' || Number.isNaN(elapsedMs) || elapsedMs < 0) {
+    return null;
+  }
+
+  if (elapsedMs < 1000) {
+    return `${Math.round(elapsedMs)} ms`;
+  }
+
+  return `${(elapsedMs / 1000).toFixed(1)} s`;
+}
+
+function summarizeToolOutput(toolCall: ToolCallView): string {
+  const scheduleSummary = formatScheduleToolResult(toolCall.result);
+  if (scheduleSummary) {
+    return scheduleSummary;
+  }
+
+  const genericSummary = summarizeToolResult(toolCall.result);
+  if (genericSummary) {
+    return genericSummary;
+  }
+
+  if (toolCall.result === undefined) {
+    return '';
+  }
+
+  if (typeof toolCall.result === 'string') {
+    return toolCall.result;
+  }
+
+  try {
+    return JSON.stringify(toolCall.result, null, 2);
+  } catch {
+    return String(toolCall.result);
+  }
 }
 
 function formatScheduleToolResult(result: unknown): string | null {
@@ -276,7 +480,101 @@ function formatScheduleToolResult(result: unknown): string | null {
   }
 
   const check = asNonEmptyString(resultRecord.check);
-  if (check !== 'schedule_interview_slots') {
+  if (check === 'run_final_schedule_flow') {
+    const status = asNonEmptyString(resultRecord.status);
+    const mode = asNonEmptyString(resultRecord.mode);
+
+    if (status === 'error') {
+      const message = asNonEmptyString(resultRecord.message) ?? 'Unknown final scheduling error.';
+      return `Final scheduling failed: ${message}`;
+    }
+
+    if (status !== 'success') {
+      return null;
+    }
+
+    if (mode === 'request_sent' || mode === 'request_drafted') {
+      const candidateEmail = asNonEmptyString(resultRecord.candidateEmail);
+      const threadId = asNonEmptyString(resultRecord.threadId);
+      const requestRecord = asRecord(resultRecord.request);
+      const slotOptionsRaw = Array.isArray(requestRecord?.slotOptions) ? requestRecord?.slotOptions : [];
+      const lines = [
+        mode === 'request_sent'
+          ? 'Availability request sent to candidate.'
+          : 'Availability request drafted for candidate.',
+      ];
+
+      if (candidateEmail) {
+        lines.push(`Candidate email: ${candidateEmail}`);
+      }
+
+      if (threadId) {
+        lines.push(`Thread ID: ${threadId}`);
+      }
+
+      if (slotOptionsRaw.length > 0) {
+        lines.push('Proposed slots:');
+        slotOptionsRaw.slice(0, 4).forEach((slotRaw, index) => {
+          const slot = asRecord(slotRaw);
+          const displayLabel = asNonEmptyString(slot?.displayLabel);
+          if (displayLabel) {
+            lines.push(`${index + 1}. ${displayLabel}`);
+          }
+        });
+      }
+
+      return lines.join('\n');
+    }
+
+    if (mode === 'waiting_for_candidate_reply') {
+      const candidateEmail = asNonEmptyString(resultRecord.candidateEmail);
+      const threadId = asNonEmptyString(resultRecord.threadId);
+      const lines = ['Waiting for candidate availability reply.'];
+
+      if (candidateEmail) {
+        lines.push(`Candidate email: ${candidateEmail}`);
+      }
+
+      if (threadId) {
+        lines.push(`Thread ID: ${threadId}`);
+      }
+
+      return lines.join('\n');
+    }
+
+    if (mode === 'scheduled') {
+      const eventRecord = asRecord(resultRecord.event);
+      const overlapRecord = asRecord(resultRecord.overlap);
+      const bookingUid = asNonEmptyString(eventRecord?.bookingUid);
+      const displayLabel = asNonEmptyString(overlapRecord?.displayLabel);
+      const meetLink = asNonEmptyString(eventRecord?.meetLink);
+      const location = asNonEmptyString(eventRecord?.location);
+
+      const lines = ['Final scheduling flow completed: Cal booking created.'];
+
+      if (bookingUid) {
+        lines.push(`Booking ID: ${bookingUid}`);
+      }
+
+      if (displayLabel) {
+        lines.push(`Slot: ${displayLabel}`);
+      }
+
+      if (location) {
+        lines.push(`Location: ${location}`);
+      }
+
+      if (meetLink) {
+        lines.push(`Meet link: ${meetLink}`);
+      }
+
+      return lines.join('\n');
+    }
+
+    return null;
+  }
+
+  if (check !== 'schedule_interview_slots' && check !== 'schedule_with_cal') {
     return null;
   }
 
@@ -293,6 +591,10 @@ function formatScheduleToolResult(result: unknown): string | null {
   }
 
   if (mode === 'propose') {
+    const recoveryRecord = asRecord(resultRecord.recovery);
+    const recoveryMessage = asNonEmptyString(recoveryRecord?.message);
+    const recoveryReason = asNonEmptyString(recoveryRecord?.reason);
+
     const slotsValue = resultRecord.slots;
     const slots = Array.isArray(slotsValue) ? slotsValue : [];
     const recommendedRaw = resultRecord.recommendedSlotIndex;
@@ -317,8 +619,14 @@ function formatScheduleToolResult(result: unknown): string | null {
       })
       .filter((line): line is string => Boolean(line));
 
+    const intro =
+      recoveryMessage ??
+      (recoveryReason === 'stale_selected_start_iso'
+        ? 'Selected slot was stale. Here are refreshed interview slots.'
+        : 'Interview slots proposed successfully.');
+
     if (slotLines.length === 0) {
-      return 'Interview slots proposed, but no available slots were returned in the current window.';
+      return `${intro}\n\nNo available slots were returned in the current window.`;
     }
 
     const recommendedSlot =
@@ -329,22 +637,36 @@ function formatScheduleToolResult(result: unknown): string | null {
       ? `Reply with selectedStartISO \"${recommendedStartISO}\" to confirm scheduling.`
       : 'Reply with the chosen selectedStartISO value to confirm scheduling.';
 
-    return `Interview slots proposed successfully.\n\n${slotLines.join('\n')}\n\n${confirmHint}`;
+    return `${intro}\n\n${slotLines.join('\n')}\n\n${confirmHint}`;
   }
 
   if (mode === 'schedule') {
+    const provider = asNonEmptyString(resultRecord.provider);
     const eventRecord = asRecord(resultRecord.event);
+    const bookingUid = asNonEmptyString(eventRecord?.bookingUid);
     const displayLabel = asNonEmptyString(eventRecord?.displayLabel);
     const startISO = asNonEmptyString(eventRecord?.startISO);
     const endISO = asNonEmptyString(eventRecord?.endISO);
     const meetLink = asNonEmptyString(eventRecord?.meetLink);
+    const location = asNonEmptyString(eventRecord?.location);
     const htmlLink = asNonEmptyString(eventRecord?.htmlLink);
 
-    const lines = ['Interview scheduled successfully.'];
+    const lines = [
+      provider === 'cal' ? 'Interview scheduled successfully via Cal.com.' : 'Interview scheduled successfully.',
+    ];
+
+    if (bookingUid) {
+      lines.push(`Booking ID: ${bookingUid}`);
+    }
+
     if (displayLabel) {
       lines.push(`Slot: ${displayLabel}`);
     } else if (startISO && endISO) {
       lines.push(`Slot: ${startISO} -> ${endISO}`);
+    }
+
+    if (location) {
+      lines.push(`Location: ${location}`);
     }
 
     if (meetLink) {
@@ -419,19 +741,50 @@ function isLikelyAssistantStub(text: string): boolean {
 }
 
 function ToolCallDisplay({ toolCall }: { toolCall: ToolCallView }) {
-  const { toolName, args, result, status } = toolCall;
+  const { toolName, args, result, status, resultStatus, elapsedMs } = toolCall;
+  const elapsed = formatElapsed(elapsedMs);
+  const runtimeStatusLabel =
+    status === 'pending' ? 'running' : status === 'complete' ? 'completed' : 'failed';
+  const outputSummary = summarizeToolOutput(toolCall);
+  const hasRawObjectOutput = result !== undefined && typeof result === 'object' && result !== null;
+  const normalizedResultStatus = resultStatus ? normalizeStatusLabel(resultStatus) : null;
 
   return (
     <div className="border border-gray-200 rounded-lg p-3 mb-2 bg-gray-50 dark:bg-gray-800 dark:border-gray-600">
-      <div className="flex items-center gap-2 mb-2">
-        {status === 'pending' && <Loader2 className="w-4 h-4 animate-spin text-blue-500" />}
-        {status === 'complete' && <CheckCircle className="w-4 h-4 text-green-500" />}
-        {status === 'error' && <AlertCircle className="w-4 h-4 text-red-500" />}
-        <span className="font-medium text-sm text-gray-900 dark:text-gray-100">
-          {status === 'pending' && `Calling ${toolName}...`}
-          {status === 'complete' && `Called ${toolName}`}
-          {status === 'error' && `Error calling ${toolName}`}
-        </span>
+      <div className="flex items-start justify-between gap-2 mb-2">
+        <div className="flex items-center flex-wrap gap-2">
+          {status === 'pending' && <Loader2 className="w-4 h-4 animate-spin text-blue-500" />}
+          {status === 'complete' && <CheckCircle className="w-4 h-4 text-green-500" />}
+          {status === 'error' && <AlertCircle className="w-4 h-4 text-red-500" />}
+
+          <span className="font-medium text-sm text-gray-900 dark:text-gray-100">{toolName}</span>
+
+          <span
+            className={cn(
+              'text-[10px] px-2 py-0.5 rounded-full font-medium uppercase tracking-wide',
+              statusBadgeClass(runtimeStatusLabel),
+            )}
+          >
+            {runtimeStatusLabel}
+          </span>
+
+          {normalizedResultStatus ? (
+            <span
+              className={cn(
+                'text-[10px] px-2 py-0.5 rounded-full font-medium uppercase tracking-wide',
+                statusBadgeClass(normalizedResultStatus),
+              )}
+            >
+              result: {normalizedResultStatus}
+            </span>
+          ) : null}
+        </div>
+
+        {elapsed ? (
+          <span className="text-[10px] px-2 py-0.5 rounded-full font-medium bg-slate-100 text-slate-700 dark:bg-slate-700/40 dark:text-slate-200">
+            elapsed: {elapsed}
+          </span>
+        ) : null}
       </div>
 
       {Object.keys(args).length > 0 && (
@@ -453,25 +806,50 @@ function ToolCallDisplay({ toolCall }: { toolCall: ToolCallView }) {
       {result !== undefined && (
         <div>
           <div className="text-xs text-gray-600 dark:text-gray-400 mb-1 font-medium">Output:</div>
-          <div className="bg-green-50 dark:bg-green-900/20 rounded px-3 py-2 text-xs border border-green-200 dark:border-green-800">
-            <span className="text-green-800 dark:text-green-200">
-              {typeof result === 'string' ? result : JSON.stringify(result, null, 2)}
-            </span>
+          <div className="bg-green-50 dark:bg-green-900/20 rounded px-3 py-2 text-xs border border-green-200 dark:border-green-800 whitespace-pre-wrap text-green-900 dark:text-green-100">
+            {outputSummary || '(no output details)'}
           </div>
+
+          {hasRawObjectOutput ? (
+            <details className="mt-2">
+              <summary className="cursor-pointer text-xs text-gray-600 dark:text-gray-300">Raw output JSON</summary>
+              <pre className="mt-2 bg-white dark:bg-gray-900 rounded px-3 py-2 text-xs font-mono border border-gray-200 dark:border-gray-700 overflow-x-auto whitespace-pre-wrap break-all">
+                {JSON.stringify(result, null, 2)}
+              </pre>
+            </details>
+          ) : null}
         </div>
       )}
     </div>
   );
 }
 
-export function ChatMessageBubble(props: { message: UIMessage; aiEmoji?: string }) {
-  const { message, aiEmoji } = props;
-  const toolCalls = getToolCallsFromMessage(message);
+export function ChatMessageBubble(props: {
+  message: UIMessage;
+  aiEmoji?: string;
+  toolTimingByKey?: Record<string, ToolCallTimingInfo>;
+  nowMs?: number;
+}) {
+  const { message, aiEmoji, toolTimingByKey, nowMs } = props;
+  const toolCalls = getToolCallsFromMessage(message).map((toolCall) => {
+    const timing = toolTimingByKey ? toolTimingByKey[`${message.id}:${toolCall.toolCallId}`] : undefined;
+
+    return {
+      ...toolCall,
+      status: timing?.status ?? toolCall.status,
+      elapsedMs: timing ? Math.max(0, (timing.completedAt ?? nowMs ?? Date.now()) - timing.startedAt) : undefined,
+    };
+  });
   const authoritativeScheduleText =
     message.role === 'assistant'
       ? [...toolCalls]
           .reverse()
-          .filter((toolCall) => toolCall.toolName === 'schedule_interview_slots' && toolCall.status === 'complete')
+          .filter(
+            (toolCall) =>
+              (toolCall.toolName === 'schedule_interview_slots' ||
+                toolCall.toolName === 'schedule_interview_with_cal') &&
+              toolCall.status === 'complete',
+          )
           .map((toolCall) => formatScheduleToolResult(toolCall.result))
           .find((value): value is string => Boolean(value)) ?? ''
       : '';
