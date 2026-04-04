@@ -208,6 +208,7 @@ export async function executeAutomationHandler(run: {
       actorUserId,
       founderUserId,
       authReqId: asString(run.payload.authReqId),
+      allowSystemBypass: true,
     }, {} as any);
   }
 
