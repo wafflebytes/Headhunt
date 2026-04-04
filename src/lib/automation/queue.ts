@@ -132,6 +132,32 @@ function extractCalBookingUid(eventId: string | undefined): string | null {
   return null;
 }
 
+async function resolveOfferClearanceActor(payload: AutomationPayload) {
+  const explicitActor = asString(payload.actorUserId);
+  if (explicitActor) {
+    return explicitActor;
+  }
+
+  const offerId = asString(payload.offerId);
+  if (offerId) {
+    const [offerRow] = await db
+      .select({
+        initiatedBy: offers.initiatedBy,
+        cibaApprovedBy: offers.cibaApprovedBy,
+      })
+      .from(offers)
+      .where(eq(offers.id, offerId))
+      .limit(1);
+
+    const fallbackActor = asString(offerRow?.initiatedBy) ?? asString(offerRow?.cibaApprovedBy);
+    if (fallbackActor) {
+      return fallbackActor;
+    }
+  }
+
+  return process.env.HEADHUNT_FOUNDER_USER_ID?.trim() ?? process.env.AUTH0_FOUNDER_USER_ID?.trim();
+}
+
 export async function executeAutomationHandler(run: {
   handlerType: string;
   payload: AutomationPayload;
@@ -170,11 +196,17 @@ export async function executeAutomationHandler(run: {
       };
     }
 
+    const actorUserId = await resolveOfferClearanceActor(run.payload);
+    const founderUserId =
+      asString(run.payload.founderUserId) ??
+      process.env.HEADHUNT_FOUNDER_USER_ID?.trim() ??
+      process.env.AUTH0_FOUNDER_USER_ID?.trim();
+
     return pollOfferClearanceTool.execute({
       offerId: asString(run.payload.offerId) ?? '',
       organizationId: asString(run.payload.organizationId),
-      actorUserId: asString(run.payload.actorUserId),
-      founderUserId: asString(run.payload.founderUserId),
+      actorUserId,
+      founderUserId,
       authReqId: asString(run.payload.authReqId),
     }, {} as any);
   }
