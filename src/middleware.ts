@@ -15,6 +15,12 @@ export async function middleware(request: NextRequest) {
     return authRes;
   }
 
+  // Secret-protected automation APIs must be reachable by Supabase workers
+  // that do not carry an Auth0 browser session cookie.
+  if (request.nextUrl.pathname.startsWith('/api/automation/')) {
+    return authRes;
+  }
+
   const { origin } = new URL(request.url);
   const session = await auth0.getSession(request);
 
