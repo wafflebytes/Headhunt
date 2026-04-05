@@ -1,6 +1,7 @@
 import { Button } from '@/components/ui/button';
+import { Login01Icon } from '@hugeicons/core-free-icons';
+import { HugeIcon } from '@/components/ui/huge-icon';
 import { cn } from '@/utils/cn';
-import { LogIn } from 'lucide-react';
 
 export interface PromptUserContainerProps {
   title: React.ReactNode;
@@ -44,7 +45,7 @@ export function PromptUserContainer({
         <div className="w-full sm:w-fit">
           <Button asChild variant="default" size="default" onClick={action.onClick}>
             <a className="flex items-center gap-2">
-              <LogIn />
+              <HugeIcon icon={Login01Icon} size={18} strokeWidth={2.2} />
               <span>{action.label}</span>
             </a>
           </Button>

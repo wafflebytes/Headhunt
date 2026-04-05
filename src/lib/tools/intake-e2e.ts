@@ -8,6 +8,7 @@ import { withGmailRead } from '@/lib/auth0-ai';
 import { auth0 } from '@/lib/auth0';
 import { db } from '@/lib/db';
 import { auditLogs } from '@/lib/db/schema/audit-logs';
+import { candidateIdentityKeys } from '@/lib/db/schema/candidate-identity-keys';
 import { candidates } from '@/lib/db/schema/candidates';
 import { jobs } from '@/lib/db/schema/jobs';
 import { organizations } from '@/lib/db/schema/organizations';
@@ -29,6 +30,9 @@ const runIntakeE2EInputSchema = z.object({
   generateIntel: z.boolean().default(true),
   requirements: z.array(z.string().min(1)).optional(),
 });
+
+const MIN_TRIAGE_CONFIDENCE_FOR_AUTOMATION = 0.62;
+const MIN_IDENTITY_CONFIDENCE_FOR_AUTO_INGEST = 0.45;
 
 function normalizeEmail(value: string | null): string | null {
   if (!value) return null;
@@ -198,6 +202,18 @@ function extractCandidateIdentity(params: {
   };
 }
 
+function getCandidateIdentityConfidence(nameSource: 'subject' | 'body' | 'fallback'): number {
+  if (nameSource === 'subject') {
+    return 0.9;
+  }
+
+  if (nameSource === 'body') {
+    return 0.75;
+  }
+
+  return 0.4;
+}
+
 function compact(value: string, limit = 6000): string {
   return value.replace(/\s+/g, ' ').trim().slice(0, limit);
 }
@@ -231,6 +247,174 @@ function isIsoAfter(left: string | null, right: string | null) {
   }
 
   return leftMs > rightMs;
+}
+
+type SchedulingReplyMatchSource = 'thread_key' | 'email_key' | 'none';
+
+type SchedulingReplyCandidateMatch = {
+  id: string;
+  jobId: string;
+  stage: string;
+};
+
+function dedupeCandidateMatches(rows: SchedulingReplyCandidateMatch[]): SchedulingReplyCandidateMatch[] {
+  const seen = new Set<string>();
+
+  return rows.filter((row) => {
+    if (seen.has(row.id)) {
+      return false;
+    }
+
+    seen.add(row.id);
+    return true;
+  });
+}
+
+async function loadIdentityKeyCandidateMatches(params: {
+  jobId: string;
+  keyType: 'gmail_thread_id' | 'email_job';
+  keyValue: string;
+}) {
+  const rows: Array<{ id: string; jobId: string; stage: string; updatedAt: Date | null }> = await db
+    .select({
+      id: candidates.id,
+      jobId: candidates.jobId,
+      stage: candidates.stage,
+      updatedAt: candidates.updatedAt,
+    })
+    .from(candidateIdentityKeys)
+    .innerJoin(candidates, eq(candidateIdentityKeys.candidateId, candidates.id))
+    .where(
+      and(
+        eq(candidateIdentityKeys.jobId, params.jobId),
+        eq(candidateIdentityKeys.keyType, params.keyType),
+        eq(candidateIdentityKeys.keyValue, params.keyValue),
+      ),
+    )
+    .orderBy(desc(candidates.updatedAt))
+    .limit(5);
+
+  return dedupeCandidateMatches(
+    rows.map((row) => ({
+      id: row.id,
+      jobId: row.jobId,
+      stage: row.stage,
+    })),
+  );
+}
+
+async function resolveSchedulingReplyCandidateMatches(params: {
+  jobId: string;
+  senderEmail: string | null;
+  sourceThreadId: string | null;
+}) {
+  if (params.sourceThreadId) {
+    const threadMatches = await loadIdentityKeyCandidateMatches({
+      jobId: params.jobId,
+      keyType: 'gmail_thread_id',
+      keyValue: params.sourceThreadId,
+    });
+
+    if (threadMatches.length > 0) {
+      return {
+        matchSource: 'thread_key' as const,
+        matches: threadMatches,
+      };
+    }
+  }
+
+  if (params.senderEmail) {
+    const emailMatches = await loadIdentityKeyCandidateMatches({
+      jobId: params.jobId,
+      keyType: 'email_job',
+      keyValue: params.senderEmail,
+    });
+
+    if (emailMatches.length > 0) {
+      return {
+        matchSource: 'email_key' as const,
+        matches: emailMatches,
+      };
+    }
+  }
+
+  return {
+    matchSource: 'none' as const,
+    matches: [] as SchedulingReplyCandidateMatch[],
+  };
+}
+
+async function upsertSchedulingReplyIdentitySignals(params: {
+  candidateId: string;
+  jobId: string;
+  organizationId: string | null;
+  senderEmail: string | null;
+  sourceMessageId: string;
+  sourceThreadId: string | null;
+  receivedAt: string | null;
+  matchSource: SchedulingReplyMatchSource;
+  triageConfidence: number;
+}) {
+  const seenAt = params.receivedAt ? new Date(params.receivedAt) : new Date();
+  const now = new Date();
+
+  const keyInputs: Array<{ keyType: 'gmail_message_id' | 'gmail_thread_id' | 'email_job'; keyValue: string }> = [
+    {
+      keyType: 'gmail_message_id',
+      keyValue: params.sourceMessageId,
+    },
+  ];
+
+  if (params.sourceThreadId) {
+    keyInputs.push({
+      keyType: 'gmail_thread_id',
+      keyValue: params.sourceThreadId,
+    });
+  }
+
+  if (params.senderEmail) {
+    keyInputs.push({
+      keyType: 'email_job',
+      keyValue: params.senderEmail,
+    });
+  }
+
+  for (const keyInput of keyInputs) {
+    await db
+      .insert(candidateIdentityKeys)
+      .values({
+        organizationId: params.organizationId,
+        jobId: params.jobId,
+        candidateId: params.candidateId,
+        keyType: keyInput.keyType,
+        keyValue: keyInput.keyValue,
+        metadata: {
+          source: 'intake_scheduling_reply',
+          matchSource: params.matchSource,
+          triageConfidence: params.triageConfidence,
+        },
+        firstSeenAt: seenAt,
+        lastSeenAt: seenAt,
+      })
+      .onConflictDoUpdate({
+        target: [
+          candidateIdentityKeys.keyType,
+          candidateIdentityKeys.keyValue,
+          candidateIdentityKeys.jobId,
+        ],
+        set: {
+          candidateId: params.candidateId,
+          organizationId: params.organizationId,
+          lastSeenAt: seenAt,
+          metadata: {
+            source: 'intake_scheduling_reply',
+            matchSource: params.matchSource,
+            triageConfidence: params.triageConfidence,
+          },
+          updatedAt: now,
+        },
+      });
+  }
 }
 
 async function loadLatestAvailabilityRequestContext(candidateId: string) {
@@ -349,6 +533,8 @@ export const runIntakeE2ETool = withGmailRead(
       let ingestedCreated = 0;
       let ingestedIdempotent = 0;
       let intelGenerated = 0;
+      let uncertainManualReviewCount = 0;
+      let ambiguousIdentityCount = 0;
 
       for (const message of messages) {
         const rawEmailText = buildEmailText(message);
@@ -360,11 +546,14 @@ export const runIntakeE2ETool = withGmailRead(
         });
 
         if (!candidateIdentity.email) {
+          uncertainManualReviewCount += 1;
           messageResults.push({
             messageId: message.messageId,
             subject: message.subject,
             status: 'skipped',
             reason: 'No parseable sender email in From header.',
+            reasonCode: 'missing_sender_email',
+            manualReviewRequired: true,
           });
           continue;
         }
@@ -379,6 +568,25 @@ export const runIntakeE2ETool = withGmailRead(
             sourceThreadId: message.threadId ?? undefined,
             jobs: activeJobs.map((job: { id: string; title: string }) => ({ id: job.id, title: job.title })),
           });
+
+          if (
+            (triage.classification === 'application' || triage.classification === 'scheduling_reply') &&
+            triage.automationSafe === false
+          ) {
+            uncertainManualReviewCount += 1;
+            messageResults.push({
+              messageId: message.messageId,
+              threadId: message.threadId,
+              from: message.from,
+              subject: message.subject,
+              status: 'skipped',
+              reason: `Triage boundary blocked auto-routing (${triage.boundaryReason ?? 'uncertain_input'}).`,
+              reasonCode: triage.boundaryReason ?? 'uncertain_input',
+              manualReviewRequired: true,
+              triage,
+            });
+            continue;
+          }
 
           if (triage.classification === 'scheduling_reply') {
             const schedulingJobId = requestedJob?.id ?? triage.jobId ?? fallbackJobId;
@@ -396,13 +604,34 @@ export const runIntakeE2ETool = withGmailRead(
               continue;
             }
 
-            const [matchedCandidate] = await db
-              .select({ id: candidates.id, jobId: candidates.jobId, stage: candidates.stage })
-              .from(candidates)
-              .where(eq(candidates.contactEmail, candidateIdentity.email))
-              .limit(1);
+            const identityMatch = await resolveSchedulingReplyCandidateMatches({
+              jobId: schedulingJobId,
+              senderEmail: candidateIdentity.email,
+              sourceThreadId: message.threadId ?? null,
+            });
+            const matchedCandidates = identityMatch.matches;
 
-            if (!matchedCandidate || matchedCandidate.jobId !== schedulingJobId) {
+            if (matchedCandidates.length > 1) {
+              ambiguousIdentityCount += 1;
+              uncertainManualReviewCount += 1;
+              messageResults.push({
+                messageId: message.messageId,
+                threadId: message.threadId,
+                from: message.from,
+                subject: message.subject,
+                status: 'skipped',
+                reason: 'Scheduling reply matched multiple candidate records for the same job/email; manual merge required.',
+                reasonCode: 'ambiguous_candidate_email_match',
+                manualReviewRequired: true,
+                identityMatchSource: identityMatch.matchSource,
+                triage,
+              });
+              continue;
+            }
+
+            const matchedCandidate = matchedCandidates[0];
+
+            if (!matchedCandidate) {
               messageResults.push({
                 messageId: message.messageId,
                 threadId: message.threadId,
@@ -410,10 +639,24 @@ export const runIntakeE2ETool = withGmailRead(
                 subject: message.subject,
                 status: 'skipped',
                 reason: 'Scheduling reply detected but no matching candidate record found for resolved job.',
+                reasonCode: 'candidate_not_found_for_scheduling_reply',
+                identityMatchSource: identityMatch.matchSource,
                 triage,
               });
               continue;
             }
+
+            await upsertSchedulingReplyIdentitySignals({
+              candidateId: matchedCandidate.id,
+              jobId: schedulingJobId,
+              organizationId: resolvedOrganizationId,
+              senderEmail: candidateIdentity.email,
+              sourceMessageId: message.messageId,
+              sourceThreadId: message.threadId ?? null,
+              receivedAt: message.receivedAt ?? null,
+              matchSource: identityMatch.matchSource,
+              triageConfidence: triage.confidence,
+            });
 
             if (['interview_scheduled', 'interviewed', 'offer_sent', 'hired'].includes(matchedCandidate.stage)) {
               messageResults.push({
@@ -423,6 +666,7 @@ export const runIntakeE2ETool = withGmailRead(
                 subject: message.subject,
                 status: 'skipped',
                 reason: `Candidate ${matchedCandidate.id} is already at stage ${matchedCandidate.stage}; skipping additional scheduling booking.`,
+                reasonCode: 'candidate_stage_already_advanced',
                 triage,
               });
               continue;
@@ -438,6 +682,7 @@ export const runIntakeE2ETool = withGmailRead(
                 status: 'skipped',
                 reason:
                   'Scheduling reply detected but no prior availability request context exists; waiting for liaison request step first.',
+                reasonCode: 'missing_prior_availability_request',
                 triage,
               });
               continue;
@@ -452,6 +697,7 @@ export const runIntakeE2ETool = withGmailRead(
                 subject: message.subject,
                 status: 'skipped',
                 reason: 'Scheduling reply is on a different thread than the latest availability request; skipping.',
+                reasonCode: 'reply_thread_mismatch',
                 triage,
               });
               continue;
@@ -465,6 +711,7 @@ export const runIntakeE2ETool = withGmailRead(
                 subject: message.subject,
                 status: 'skipped',
                 reason: 'Scheduling reply is not newer than the latest availability request; waiting for a fresh candidate reply.',
+                reasonCode: 'reply_not_newer_than_request',
                 triage,
               });
               continue;
@@ -512,8 +759,14 @@ export const runIntakeE2ETool = withGmailRead(
               candidateEmail: candidateIdentity.email,
               candidateId: matchedCandidate.id,
               jobId: schedulingJobId,
+              identityMatchSource: identityMatch.matchSource,
               status: 'processed',
               triage,
+              automationBoundary: {
+                automationSafe: triage.automationSafe,
+                boundaryReason: triage.boundaryReason,
+                suggestedAction: triage.suggestedAction,
+              },
               automation: {
                 schedulingEnqueued: schedulingRun.inserted,
                 schedulingRunId: schedulingRun.runId,
@@ -553,6 +806,7 @@ export const runIntakeE2ETool = withGmailRead(
           const resolvedJobId = requestedJob?.id ?? triageJobId ?? fallbackJobId;
 
           if (!resolvedJobId) {
+            uncertainManualReviewCount += 1;
             messageResults.push({
               messageId: message.messageId,
               subject: message.subject,
@@ -560,6 +814,30 @@ export const runIntakeE2ETool = withGmailRead(
               triage,
               status: 'skipped',
               reason: 'No active or resolved job id available for ingest.',
+              reasonCode: 'missing_job_context',
+              manualReviewRequired: true,
+            });
+            continue;
+          }
+
+          const identityConfidence = getCandidateIdentityConfidence(candidateIdentity.nameSource);
+          if (
+            candidateIdentity.nameSource === 'fallback' &&
+            identityConfidence < MIN_IDENTITY_CONFIDENCE_FOR_AUTO_INGEST &&
+            triage.confidence < MIN_TRIAGE_CONFIDENCE_FOR_AUTOMATION
+          ) {
+            uncertainManualReviewCount += 1;
+            messageResults.push({
+              messageId: message.messageId,
+              threadId: message.threadId,
+              from: message.from,
+              subject: message.subject,
+              status: 'skipped',
+              reason:
+                'Application-like email has low-confidence candidate identity extraction and low triage confidence; manual review required before ingest.',
+              reasonCode: 'low_identity_confidence',
+              manualReviewRequired: true,
+              triage,
             });
             continue;
           }
@@ -633,8 +911,14 @@ export const runIntakeE2ETool = withGmailRead(
             candidateEmail: candidateIdentity.email,
             candidateId: ingest.candidate.id,
             jobId: resolvedJobId,
+            identityResolution: ingest.identityResolution,
             ingestStatus: ingest.idempotent ? 'idempotent' : 'created',
             triage,
+            automationBoundary: {
+              automationSafe: triage.automationSafe,
+              boundaryReason: triage.boundaryReason,
+              suggestedAction: triage.suggestedAction,
+            },
             intel,
             automation: {
               scoreEnqueued: scoreRun.inserted,
@@ -684,6 +968,8 @@ export const runIntakeE2ETool = withGmailRead(
           ingestedCreated,
           ingestedIdempotent,
           intelGenerated,
+          uncertainManualReviewCount,
+          ambiguousIdentityCount,
         },
         result: 'success',
       });
@@ -705,6 +991,8 @@ export const runIntakeE2ETool = withGmailRead(
         ingestedCreated,
         ingestedIdempotent,
         intelGenerated,
+        uncertainManualReviewCount,
+        ambiguousIdentityCount,
         messages: messageResults,
       };
     },

@@ -5,12 +5,23 @@ import { type UIMessage, DefaultChatTransport, generateId, lastAssistantMessageI
 import { useChat } from '@ai-sdk/react';
 import { toast } from 'sonner';
 import { StickToBottom, useStickToBottomContext } from 'use-stick-to-bottom';
-import { Activity, ArrowDown, ArrowUpIcon, Copy, KeyRound, LoaderCircle, RotateCcw, Square, Trash2 } from 'lucide-react';
+import {
+  Activity01Icon,
+  ArrowDown01Icon,
+  ArrowUp01Icon,
+  Copy01Icon,
+  Delete02Icon,
+  Key01Icon,
+  Loading03Icon,
+  RefreshIcon,
+  SquareIcon,
+} from '@hugeicons/core-free-icons';
 import { useInterruptions } from '@auth0/ai-vercel/react';
 
 import { TokenVaultInterruptHandler } from '@/components/TokenVaultInterruptHandler';
 import { ChatMessageBubble, type ToolCallStatus, type ToolCallTimingInfo } from '@/components/chat-message-bubble';
 import { FounderSlotSelectionPanel } from '@/components/founder-slot-selection-panel';
+import { HugeIcon } from '@/components/ui/huge-icon';
 import { Button } from '@/components/ui/button';
 import {
   DropdownMenu,
@@ -34,6 +45,37 @@ const RUN_CONNECTION_DIAGNOSTICS_PROMPT =
 const AUTHORIZATION_STEP_TIMEOUT_MS = 10 * 60 * 1000;
 const AUTHORIZATION_STEP_POLL_MS = 400;
 const CHAT_LOG_JSON_MARKER = 'HHLOG_JSON';
+const TOKEN_VAULT_AUTHORIZATION_REQUIRED_PATTERN = /authorization required to access the token vault/i;
+const TOKEN_VAULT_CONNECTION_PATTERN = /authorization required to access the token vault:\s*([a-z0-9._-]+)/i;
+
+const TOKEN_VAULT_DEFAULT_SCOPES_BY_CONNECTION: Record<string, string[]> = {
+  'google-oauth2': [
+    'openid',
+    'https://www.googleapis.com/auth/userinfo.email',
+    'https://www.googleapis.com/auth/gmail.readonly',
+    'https://www.googleapis.com/auth/gmail.compose',
+    'https://www.googleapis.com/auth/calendar.events',
+  ],
+  'sign-in-with-slack': ['channels:read', 'channels:history', 'chat:write'],
+  slack: ['channels:read', 'channels:history', 'chat:write'],
+  'slack-oauth2': ['channels:read', 'channels:history', 'chat:write'],
+  'cal-connection': [
+    'PROFILE_READ',
+    'SCHEDULE_READ',
+    'SCHEDULE_WRITE',
+    'BOOKING_READ',
+    'BOOKING_WRITE',
+    'EVENT_TYPE_READ',
+    'EVENT_TYPE_WRITE',
+  ],
+};
+
+const TOKEN_VAULT_DEFAULT_AUTHORIZATION_PARAMS_BY_CONNECTION: Record<string, Record<string, string>> = {
+  'sign-in-with-slack': { prompt: 'consent' },
+  slack: { prompt: 'consent' },
+  'slack-oauth2': { prompt: 'consent' },
+  'cal-connection': { prompt: 'consent' },
+};
 
 const OPERATOR_COMMAND_TEMPLATES: Array<{ label: string; value: string }> = [
   {
@@ -144,6 +186,14 @@ type WorkflowIdEntry = {
 type WorkflowIdCatalog = {
   entries: WorkflowIdEntry[];
   latest: Partial<Record<WorkflowIdKey, string>>;
+};
+
+type TokenVaultFallbackInterrupt = {
+  fallbackKey: string;
+  connection: string;
+  requiredScopes: string[];
+  authorizationParams?: Record<string, string>;
+  message: string;
 };
 
 function normalizeIdString(value: unknown): string | undefined {
@@ -480,6 +530,104 @@ function extractToolParts(message: UIMessage) {
     .filter((part): part is NonNullable<typeof part> => Boolean(part));
 }
 
+function parseScopeList(raw: string): string[] {
+  return raw
+    .split(',')
+    .map((scope) => scope.trim())
+    .filter(Boolean);
+}
+
+function extractRequiredScopesFromTokenVaultMessage(message: string): string[] {
+  const missingScopesMatch = message.match(/missing scopes:\s*([^\n]+)/i);
+  if (missingScopesMatch?.[1]) {
+    return parseScopeList(missingScopesMatch[1]);
+  }
+
+  const requiredScopesMatch = message.match(/required scopes:\s*([^\n]+)/i);
+  if (requiredScopesMatch?.[1]) {
+    return parseScopeList(requiredScopesMatch[1]);
+  }
+
+  return [];
+}
+
+function inferConnectionFromToolName(toolName: string | null): string | null {
+  if (!toolName) {
+    return null;
+  }
+
+  const normalized = toolName.toLowerCase();
+  if (normalized.includes('slack')) {
+    return 'sign-in-with-slack';
+  }
+
+  if (normalized.includes('gmail') || normalized.includes('google') || normalized.includes('calendar')) {
+    return 'google-oauth2';
+  }
+
+  if (normalized.includes('verify_cal_connection') || normalized.includes('schedule_with_cal')) {
+    return 'cal-connection';
+  }
+
+  return null;
+}
+
+function getDefaultScopesForConnection(connection: string): string[] {
+  return TOKEN_VAULT_DEFAULT_SCOPES_BY_CONNECTION[connection.toLowerCase()] ?? [];
+}
+
+function getDefaultAuthorizationParamsForConnection(connection: string): Record<string, string> | undefined {
+  const params = TOKEN_VAULT_DEFAULT_AUTHORIZATION_PARAMS_BY_CONNECTION[connection.toLowerCase()];
+  return params ? { ...params } : undefined;
+}
+
+function deriveTokenVaultFallbackInterrupt(messages: UIMessage[]): TokenVaultFallbackInterrupt | null {
+  const latestAssistantMessage = [...messages].reverse().find((message) => message.role === 'assistant');
+  if (!latestAssistantMessage) {
+    return null;
+  }
+
+  const toolParts = extractToolParts(latestAssistantMessage);
+  for (let index = toolParts.length - 1; index >= 0; index -= 1) {
+    const part = toolParts[index];
+    if (typeof part.error !== 'string') {
+      continue;
+    }
+
+    const errorMessage = part.error.trim();
+    if (!TOKEN_VAULT_AUTHORIZATION_REQUIRED_PATTERN.test(errorMessage)) {
+      continue;
+    }
+
+    const connectionFromMessage = errorMessage.match(TOKEN_VAULT_CONNECTION_PATTERN)?.[1]?.trim() ?? null;
+    const connection = connectionFromMessage ?? inferConnectionFromToolName(part.toolName);
+    if (!connection) {
+      continue;
+    }
+
+    const requiredScopes = (() => {
+      const fromMessage = extractRequiredScopesFromTokenVaultMessage(errorMessage);
+      if (fromMessage.length > 0) {
+        return fromMessage;
+      }
+
+      return getDefaultScopesForConnection(connection);
+    })();
+
+    const authorizationParams = getDefaultAuthorizationParamsForConnection(connection);
+
+    return {
+      fallbackKey: `${latestAssistantMessage.id}:${part.toolCallId ?? String(index)}:${connection}`,
+      connection,
+      requiredScopes,
+      ...(authorizationParams ? { authorizationParams } : {}),
+      message: errorMessage,
+    };
+  }
+
+  return null;
+}
+
 function getMessageCreatedAtMs(message: UIMessage): number | undefined {
   const value = (message as { createdAt?: unknown }).createdAt;
   if (value instanceof Date) {
@@ -696,7 +844,7 @@ function ScrollToBottom(props: { className?: string }) {
   if (isAtBottom) return null;
   return (
     <Button variant="outline" className={props.className} onClick={() => scrollToBottom()}>
-      <ArrowDown className="w-4 h-4" />
+      <HugeIcon icon={ArrowDown01Icon} size={16} strokeWidth={2.2} className="w-4 h-4" />
       <span>Scroll to bottom</span>
     </Button>
   );
@@ -736,7 +884,11 @@ function ChatInput(props: {
             type="submit"
             disabled={props.loading}
           >
-            {props.loading ? <LoaderCircle className="animate-spin" /> : <ArrowUpIcon size={14} />}
+            {props.loading ? (
+              <HugeIcon icon={Loading03Icon} size={14} strokeWidth={2.2} className="animate-spin" />
+            ) : (
+              <HugeIcon icon={ArrowUp01Icon} size={14} strokeWidth={2.2} />
+            )}
           </Button>
         </div>
       </div>
@@ -776,6 +928,7 @@ export function ChatWindow(props: {
   userId: string;
   jobOptions?: ChatJobPickerOption[];
   defaultJobId?: string;
+  initialQuery?: { text: string; id: number } | null;
 }) {
   const scopedUserId = normalizeIdentity(props.userId);
   const chatStorageKey = `${CHAT_STORAGE_KEY_PREFIX}:${CHAT_STORAGE_VERSION}:${scopedUserId}`;
@@ -846,12 +999,45 @@ export function ChatWindow(props: {
   const [hydrated, setHydrated] = useState(false);
   const [isAuthorizationFlowRunning, setIsAuthorizationFlowRunning] = useState(false);
   const [activeAuthorizationStep, setActiveAuthorizationStep] = useState<string | null>(null);
+  
+  const lastProcessedQueryIdRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (
+      props.initialQuery &&
+      props.initialQuery.id !== lastProcessedQueryIdRef.current
+    ) {
+      lastProcessedQueryIdRef.current = props.initialQuery.id;
+      const queryText = props.initialQuery.text;
+      // Defer to let useChat fully hydrate before programmatic submit
+      const timer = setTimeout(() => {
+        sendMessage({ text: queryText });
+      }, 250);
+      return () => clearTimeout(timer);
+    }
+  }, [props.initialQuery, sendMessage]);
   const [isCopyingLogs, setIsCopyingLogs] = useState(false);
+  const [dismissedFallbackInterruptKey, setDismissedFallbackInterruptKey] = useState<string | null>(null);
   const [toolTimingByKey, setToolTimingByKey] = useState<ToolTimingByKey>({});
   const [toolTimingNowMs, setToolTimingNowMs] = useState(() => Date.now());
   const hasLoadedPersistedMessages = useRef(false);
   const statusRef = useRef(status);
-  const interruptRef = useRef(toolInterrupt);
+
+  const fallbackTokenVaultInterrupt = useMemo(() => deriveTokenVaultFallbackInterrupt(messages), [messages]);
+  const activeFallbackTokenVaultInterrupt = useMemo(() => {
+    if (!fallbackTokenVaultInterrupt) {
+      return null;
+    }
+
+    if (fallbackTokenVaultInterrupt.fallbackKey === dismissedFallbackInterruptKey) {
+      return null;
+    }
+
+    return fallbackTokenVaultInterrupt;
+  }, [dismissedFallbackInterruptKey, fallbackTokenVaultInterrupt]);
+
+  const effectiveToolInterrupt = toolInterrupt ?? activeFallbackTokenVaultInterrupt;
+  const interruptRef = useRef(effectiveToolInterrupt);
 
   const isChatBusy = status === 'submitted' || status === 'streaming';
   const hasAssistantMessages = messages.some((message) => message.role === 'assistant');
@@ -864,8 +1050,23 @@ export function ChatWindow(props: {
   }, [status]);
 
   useEffect(() => {
-    interruptRef.current = toolInterrupt;
-  }, [toolInterrupt]);
+    interruptRef.current = effectiveToolInterrupt;
+  }, [effectiveToolInterrupt]);
+
+  useEffect(() => {
+    if (!fallbackTokenVaultInterrupt && dismissedFallbackInterruptKey !== null) {
+      setDismissedFallbackInterruptKey(null);
+      return;
+    }
+
+    if (
+      fallbackTokenVaultInterrupt &&
+      dismissedFallbackInterruptKey &&
+      fallbackTokenVaultInterrupt.fallbackKey !== dismissedFallbackInterruptKey
+    ) {
+      setDismissedFallbackInterruptKey(null);
+    }
+  }, [dismissedFallbackInterruptKey, fallbackTokenVaultInterrupt]);
 
   useEffect(() => {
     setHydrated(true);
@@ -1142,6 +1343,12 @@ export function ChatWindow(props: {
     }
   }
 
+  function onTokenVaultInterruptFinish() {
+    if (activeFallbackTokenVaultInterrupt) {
+      setDismissedFallbackInterruptKey(activeFallbackTokenVaultInterrupt.fallbackKey);
+    }
+  }
+
   function onClearChat() {
     setMessages([]);
     setToolTimingByKey({});
@@ -1235,7 +1442,7 @@ export function ChatWindow(props: {
                 toolTimingNowMs={toolTimingNowMs}
               />
               <div className="flex flex-col max-w-[768px] mx-auto pb-12 w-full">
-                <TokenVaultInterruptHandler interrupt={toolInterrupt} />
+                <TokenVaultInterruptHandler interrupt={effectiveToolInterrupt} onFinish={onTokenVaultInterruptFinish} />
               </div>
             </>
           )
@@ -1319,14 +1526,14 @@ export function ChatWindow(props: {
                 disabled={isChatBusy || isAuthorizationFlowRunning}
                 onClick={onAuthorizeConnectionsOneByOne}
               >
-                <KeyRound className="w-4 h-4 mr-1" />
+                <HugeIcon icon={Key01Icon} size={16} strokeWidth={2.2} className="w-4 h-4 mr-1" />
                 {isAuthorizationFlowRunning
                   ? `Authorizing ${activeAuthorizationStep ?? 'Integrations'}...`
                   : 'Authorize Integrations'}
               </Button>
 
               <Button variant="outline" size="sm" disabled={isChatBusy} onClick={onRunConnectionDiagnostics}>
-                <Activity className="w-4 h-4 mr-1" />
+                <HugeIcon icon={Activity01Icon} size={16} strokeWidth={2.2} className="w-4 h-4 mr-1" />
                 Run Diagnostics
               </Button>
 
@@ -1350,14 +1557,14 @@ export function ChatWindow(props: {
 
               {isChatBusy ? (
                 <Button variant="outline" size="sm" onClick={onStopGeneration}>
-                  <Square className="w-4 h-4 mr-1" />
+                  <HugeIcon icon={SquareIcon} size={16} strokeWidth={2.2} className="w-4 h-4 mr-1" />
                   Stop
                 </Button>
               ) : null}
 
               {!isChatBusy && hasAssistantMessages ? (
                 <Button variant="outline" size="sm" onClick={() => regenerate()}>
-                  <RotateCcw className="w-4 h-4 mr-1" />
+                  <HugeIcon icon={RefreshIcon} size={16} strokeWidth={2.2} className="w-4 h-4 mr-1" />
                   Regenerate
                 </Button>
               ) : null}
@@ -1366,7 +1573,7 @@ export function ChatWindow(props: {
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <Button variant="outline" size="sm" disabled={isCopyingLogs}>
-                      <Copy className="w-4 h-4 mr-1" />
+                      <HugeIcon icon={Copy01Icon} size={16} strokeWidth={2.2} className="w-4 h-4 mr-1" />
                       {isCopyingLogs ? 'Copying...' : 'Copy Logs'}
                     </Button>
                   </DropdownMenuTrigger>
@@ -1383,7 +1590,7 @@ export function ChatWindow(props: {
 
               {messages.length > 0 ? (
                 <Button variant="outline" size="sm" onClick={onClearChat}>
-                  <Trash2 className="w-4 h-4 mr-1" />
+                  <HugeIcon icon={Delete02Icon} size={16} strokeWidth={2.2} className="w-4 h-4 mr-1" />
                   Clear
                 </Button>
               ) : null}

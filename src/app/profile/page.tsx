@@ -1,7 +1,8 @@
 import { Suspense } from 'react';
 import { redirect } from 'next/navigation';
-import { Loader2 } from 'lucide-react';
+import { Loading03Icon } from '@hugeicons/core-free-icons';
 
+import { HugeIcon } from '@/components/ui/huge-icon';
 import { auth0 } from '@/lib/auth0';
 import ProfileContent from '@/components/auth0/profile/profile-content';
 
@@ -23,7 +24,7 @@ export default async function ProfilePage() {
         <Suspense
           fallback={
             <div className="flex items-center justify-center min-h-[400px]">
-              <Loader2 className="h-8 w-8 animate-spin text-white/60" />
+              <HugeIcon icon={Loading03Icon} size={32} strokeWidth={2.2} className="animate-spin text-white/60" />
             </div>
           }
         >

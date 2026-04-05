@@ -1,9 +1,9 @@
 # Headhunt Tracker - Full Flow Execution
 
-Last updated: 2026-04-04
+Last updated: 2026-04-05
 Owner: Lead Founding Engineer
 Execution mode: ship plumbing first, polish later
-Current implementation focus: M2.3 scheduling hardening + transcript summarization flow (Cal-first, Drive fallback) under demo-phase operator control.
+Current implementation focus: M2.4 clearance reliability + M2.6 MCP stabilization under demo-phase operator control (Cal-first scheduling is the default).
 
 ## Legend
 
@@ -36,11 +36,28 @@ The MVP is "real" only when all of this works in sequence:
 5. Founder/hiring_manager permissions are enforced through FGA checks for sensitive transitions.
 6. Final scheduling flow sends live Cal slot options (3 options max, one per day), parses candidate reply, and books in Cal.
 7. Cal-managed bookings avoid duplicate founder confirmation email (Cal invite is source of truth).
-8. Transcript summary is generated from Cal booking transcripts, with Drive PDF fallback when needed.
-9. Offer send path is gated by CIBA when initiated by hiring_manager.
-10. MCP tools can query pipeline with Auth0 JWT + FGA filtering.
+8. Scheduling reply candidate resolution prefers identity keys (thread match first, email fallback) and escalates ambiguous matches to manual review.
+9. Transcript summary is generated from Cal booking transcripts, with Drive PDF fallback when needed.
+10. Offer send path is gated by CIBA when initiated by hiring_manager.
+11. MCP tools can query pipeline with Auth0 JWT + FGA filtering.
 
 Anything not supporting this chain is secondary.
+
+## Validated Flow Chain (2026-04-05)
+
+- [x] Request send (`scheduling.request.send`) delivers live Cal slot options.
+- [x] Reply parse + book (`scheduling.reply.parse_book`) creates Cal booking and sets `interview_scheduled`.
+- [x] Auto follow-up draft (`offer.draft.create`) triggers after successful booking when `autoSubmitOffer=true`.
+- [x] Auto clearance submit (`offer.submit.clearance`) enqueues CIBA and persists awaiting-clearance state.
+- [/] Clearance poll completion (`offer.clearance.poll`) transitions to sent-after-clearance once live approval occurs in-window.
+
+Recent validated run ids from flow context:
+
+- `scheduling.request.send`: `a79d8181d1f6464b830ac12fccddc1de`
+- `scheduling.reply.parse_book`: `c08c77d3b6ac4bfaa9bb05a0f137f678`
+- `offer.draft.create`: `45806057f3bc48d1a612aa1ec3101a18`
+- `offer.submit.clearance`: `68bffce24cb249f79a6e07d0f248b4c4`
+- stale draft dead-letter validation: `e4d3bf7af9f542b9aae7e4c0f3f70e89`
 
 ## Current Reality Snapshot
 
@@ -52,19 +69,21 @@ Anything not supporting this chain is secondary.
 - [x] Existing Assistant0 chat UI is functional and can be swapped without changing core tool logic.
 - [x] Gmail tools already wired (search + draft) in src/lib/tools/gmail.ts.
 - [x] Calendar read tool exists in src/lib/tools/google-calender.ts.
+- [x] Cal scheduling toolchain exists in src/lib/tools/scheduling.ts and src/lib/tools/cal-scheduling.ts.
 - [x] Slack channels tool exists in src/lib/tools/list-slack-channels.ts.
 - [x] Transcript summarization tools exist in src/lib/tools/interview-transcripts.ts (Cal-first + Drive fallback).
 - [x] Drizzle database wiring + migrations in src/lib/db.
+- [x] Candidate identity graph table exists (`candidate_identity_keys`) with ingest + scheduling-reply upserts.
 - [x] Existing write path to DB + embeddings in src/lib/actions/documents.ts.
 - [x] FGA bootstrap + basic doc model in src/lib/fga.
 
 ### Missing For Headhunt Spec
 
 - [x] Jobs/Candidates/Applications/Interviews/Templates/Offers/Audit schema.
-- [ ] Agent-specific API routes (intercept/triage/analyst/liaison/dispatch).
-- [ ] CIBA initiate/poll implementation for clearance queue.
-- [ ] FGA model evolution from doc-level to org/job/candidate relations.
-- [ ] FastMCP server scaffold + MCP transport + tool handlers.
+- [/] Agent-specific API and edge handlers (intercept/triage/analyst/liaison/dispatch) are present but still being normalized under one runbook.
+- [x] CIBA initiate/poll implementation for clearance queue.
+- [/] FGA model evolution from doc-level to org/job/candidate relations.
+- [/] FastMCP server scaffold + MCP transport + tool handlers.
 - [ ] No-chat Ops Board experience.
 
 ## MCP Grounding Log (Required Before Architectural Decisions)
@@ -150,10 +169,10 @@ Exit criteria: deterministic E2E smoke from authenticated request -> tokenized p
 
 Acceptance checks:
 
-- [ ] Conversation streams incrementally end-to-end.
-- [ ] Tool call outputs are visible and understandable in-chat.
-- [ ] Stop generation works reliably.
-- [ ] Refresh/resume restores thread messages for active session.
+- [x] Conversation streams incrementally end-to-end.
+- [x] Tool call outputs are visible and understandable in-chat.
+- [x] Stop generation works reliably.
+- [/] Refresh/resume restores thread messages for active session.
 
 ### M1.1 Token Vault Verification First
 
@@ -171,9 +190,9 @@ Acceptance checks:
 
 Acceptance checks:
 
-- [ ] Authenticated user can trigger Gmail profile/read check without manual token handling.
-- [ ] Missing consent path triggers interrupt UX and succeeds after user consent.
-- [ ] Failures produce normalized error JSON (no raw stack leaks).
+- [x] Authenticated user can trigger Gmail profile/read check without manual token handling.
+- [x] Missing consent path triggers interrupt UX and succeeds after user consent.
+- [x] Failures produce normalized error JSON (no raw stack leaks).
 
 ### M1.2 Supabase/DB Foundation For Hiring Domain
 
@@ -231,7 +250,7 @@ Acceptance checks:
 
 Exit gate for M1:
 
-- [ ] "fetch Gmail + create candidate" works from authenticated session with no manual credentials.
+- [/] "fetch Gmail + create candidate" works from authenticated session with no manual credentials.
 
 ---
 
@@ -250,7 +269,7 @@ Exit criteria: Headhunt core actions callable as tools with structured outputs a
 	- [x] generate_intel_card
 	- [x] schedule_interview_slots
 	- [x] draft_offer_letter
-	- [ ] submit_offer_for_clearance
+	- [x] submit_offer_for_clearance
 
 - [/] Each tool must enforce:
 	- [/] input validation (zod)
@@ -269,9 +288,9 @@ Exit criteria: Headhunt core actions callable as tools with structured outputs a
 
 Acceptance checks:
 
-- [ ] Manual run on test inbox returns deterministic structured output.
-- [ ] scheduling_reply is routed without candidate creation.
-- [ ] irrelevant messages are logged and ignored.
+- [x] Manual run on test inbox returns deterministic structured output.
+- [x] scheduling_reply is routed without candidate creation.
+- [x] irrelevant messages are logged and ignored.
 
 ### M2.2 Analyst (Intel Card Generation)
 
@@ -299,7 +318,7 @@ Acceptance checks:
 
 Acceptance checks:
 
-- [x] At least one end-to-end schedule flow creates event id + meet link.
+- [x] At least one end-to-end schedule flow creates Cal booking UID + persisted interview record.
 - [x] First scheduling outreach email always uses live Cal free slots (not generic availability ask).
 - [x] Founder can constrain outreach days (for example `days sat,sun`) while keeping auto day-pick defaults.
 - [x] Candidate stage becomes interview_scheduled after booking persistence.
@@ -325,17 +344,17 @@ Acceptance checks:
 
 - [x] Add offer term capture schema.
 - [x] Add draft generation tool.
-- [ ] Add CIBA initiation service.
-- [ ] Add CIBA polling handler.
-- [ ] Enforce rule:
-	- [ ] founder can send directly
-	- [ ] hiring_manager requires CIBA approval
+- [x] Add CIBA initiation service.
+- [x] Add CIBA polling handler.
+- [x] Enforce rule:
+	- [x] founder can send directly
+	- [x] hiring_manager requires CIBA approval
 
 Acceptance checks:
 
-- [ ] Pending clearance state persists with expiry timestamp.
-- [ ] Deny path does not send offer.
-- [ ] Approve path sends offer and updates stage to offer_sent.
+- [x] Pending clearance state persists with expiry timestamp.
+- [/] Deny path does not send offer.
+- [/] Approve path sends offer and updates stage to offer_sent.
 
 ### M2.5 Chat Console UX For Operators
 
@@ -349,15 +368,15 @@ Acceptance checks:
 
 ### M2.6 MCP Server Build (FastMCP)
 
-- [ ] Scaffold `mcp-server/` using FastMCP.
-- [ ] Implement MVP tools in FastMCP handlers:
-	- [ ] list_jobs
-	- [ ] list_pipeline
-	- [ ] get_candidate_detail
-	- [ ] summarize_pipeline_health
-- [ ] Add Auth0 JWT verification at MCP boundary.
-- [ ] Add FGA checks inside each MCP tool before data return.
-- [ ] Expose transport endpoint for local and hosted usage.
+- [x] Scaffold `mcp-server/` using FastMCP.
+- [x] Implement MVP tools in FastMCP handlers:
+	- [x] list_jobs
+	- [x] list_pipeline
+	- [x] get_candidate_detail
+	- [x] summarize_pipeline_health
+- [x] Add Auth0 JWT verification at MCP boundary.
+- [/] Add FGA checks inside each MCP tool before data return.
+- [x] Expose transport endpoint for local and hosted usage.
 
 Acceptance checks:
 
@@ -367,7 +386,7 @@ Acceptance checks:
 
 Exit gate for M2:
 
-- [ ] Operator can run full manual pipeline in chat from intake to offer clearance.
+- [/] Operator can run full manual pipeline in chat from intake to offer clearance.
 
 ---
 
@@ -436,15 +455,15 @@ Exit gate for M3:
 
 ### Auditability
 
-- [ ] Write audit event on every agent and user action.
-- [ ] Include cibaAuthReqId and approval actor where applicable.
-- [ ] Build query helpers for candidate-centric timelines.
+- [/] Write audit event on every agent and user action.
+- [/] Include cibaAuthReqId and approval actor where applicable.
+- [/] Build query helpers for candidate-centric timelines.
 
 ### Reliability + Observability
 
-- [ ] Add per-tool structured logs with request id.
-- [ ] Add retry policy for transient Gmail/Google API errors.
-- [ ] Add dead-letter handling for failed intake runs.
+- [/] Add per-tool structured logs with request id.
+- [/] Add retry policy for transient Gmail/Google API errors.
+- [x] Add dead-letter handling for terminal automation failures.
 
 ### Test Strategy
 
@@ -454,6 +473,8 @@ Exit gate for M3:
 	- [x] Deterministic DB seed script exists (`npm run seed:demo`).
 	- [x] Chat-log smoke checker exists for `HHLOG_JSON` exports (`npm run smoke:chat-log`).
 	- [x] Add authenticated endpoint replay script for fixture emails (`npm run smoke:ingest-endpoint`).
+	- [x] Boundary guard smoke exists for missing-context/manual-review assertions (`npm run smoke:boundary-guards`).
+	- [x] Edge E2E smoke chain exists for schedule -> draft -> clearance handoff (`npm run smoke:edge-e2e`).
 
 ### Demo Seed Strategy
 
@@ -491,7 +512,8 @@ For any feature PR, complete this checklist first:
 
 - [x] Run deterministic seed: `npm run seed:demo -- --reset`.
 - [x] Confirm stage matrix includes applied/reviewed/interview_scheduled/interviewed/offer_sent/hired/rejected.
-- [ ] Run chat-log smoke checker: `npm run smoke:chat-log -- --file /tmp/hhlog.txt --require-scheduling --verbose`.
+- [x] Run chat-log smoke checker: `npm run smoke:chat-log -- --file /tmp/hhlog.txt --require-scheduling --verbose`.
+- [x] Run boundary guard smoke checker: `npm run smoke:boundary-guards`.
 - [ ] Run authenticated endpoint replay: `HEADHUNT_SMOKE_COOKIE='...' npm run smoke:ingest-endpoint -- --fixture all --verbose`.
 - [ ] Run one-command intake replay in chat: `run_intake_e2e` and confirm processed message summary.
 - [ ] Create candidate ingest payload via route/tool.
@@ -517,9 +539,9 @@ For any feature PR, complete this checklist first:
 
 ### Clearance Smoke
 
-- [ ] Create offer draft as hiring_manager.
-- [ ] Confirm CIBA request enters awaiting_clearance.
-- [ ] Simulate approval path and verify offer sent transition.
+- [x] Create offer draft as hiring_manager.
+- [x] Confirm CIBA request enters awaiting_clearance.
+- [/] Simulate approval path and verify offer sent transition.
 
 ## Risks and Mitigations
 
@@ -537,37 +559,33 @@ For any feature PR, complete this checklist first:
 
 ## Immediate Next 72 Hours
 
-### Day 1
+### Day 1 (Reliability Closure)
 
-- [x] Finalize Headhunt domain schema migration set.
-- [x] Replace Assistant0 UI shell with AI SDK UI `useChat` baseline.
-- [x] Add candidate ingest lite route with audit logging.
-- [x] Add connection diagnostics tools in chat.
+- [ ] Complete a clean live approval run for `offer.clearance.poll` in-window and capture evidence.
+- [ ] Add explicit smoke assertions for CIBA denied/expired paths.
+- [ ] Lock runbook defaults for `sendMode` safety in non-production validations.
 
-### Day 2
+### Day 2 (Acceptance Closure)
 
-- [x] Implement run_triage + generate_intel_card tools.
-- [x] Persist score outputs and stage transitions.
-- [x] Add first FGA checks for candidate visibility.
-- [/] Add AI SDK UI message persistence and stop/regenerate hardening.
-- [x] Add deterministic demo seed + scope playbook for operator runbook.
+- [ ] Run end-to-end intake -> schedule -> transcript -> clearance chain from a reset candidate state.
+- [ ] Capture acceptance artifacts in `product/smoke-*.json` with linked run ids.
+- [ ] Finalize hackathon demo script against current operator flow.
 
-### Day 3
+### Day 3 (Handoff + Product Truth)
 
-- [ ] Implement offer draft + CIBA hold skeleton.
-- [ ] Scaffold FastMCP server with first two tools (`list_jobs`, `list_pipeline`).
-- [ ] Add approvals API surface and pending state model.
-- [/] Demo script dry run from chat operator flow (data seed + one-command intake replay runner ready).
+- [ ] Freeze and publish "current-state" docs for spec, tracker, and flow context.
+- [ ] Define M3 no-chat UI API contracts from current tool outputs.
+- [ ] Add explicit MCP acceptance run and FGA denial proof artifacts.
 
 ## Definition of Done For Hackathon Demo
 
-- [ ] M1 operator chat runs on AI SDK UI (`useChat`) with tool output visibility + stop control.
-- [ ] Intake can process at least 3 realistic applications from Gmail.
-- [ ] At least 1 candidate goes end-to-end: reviewed -> interview_scheduled -> interviewed -> offer_sent.
-- [ ] At least 1 completed interview has transcript summary generated (Cal-first or Drive fallback).
-- [ ] Hiring manager initiated offer requires founder CIBA approval.
-- [ ] FastMCP endpoint can answer list_jobs + list_pipeline + candidate detail for authorized user.
-- [ ] Audit timeline clearly shows agent and human actions.
+- [x] M1 operator chat runs on AI SDK UI (`useChat`) with tool output visibility + stop control.
+- [/] Intake can process at least 3 realistic applications from Gmail.
+- [/] At least 1 candidate goes end-to-end: reviewed -> interview_scheduled -> interviewed -> offer_sent.
+- [/] At least 1 completed interview has transcript summary generated (Cal-first or Drive fallback).
+- [x] Hiring manager initiated offer requires founder CIBA approval.
+- [/] FastMCP endpoint can answer list_jobs + list_pipeline + candidate detail for authorized user.
+- [/] Audit timeline clearly shows agent and human actions.
 
 ## Out of Scope Until Core Flow Is Green
 

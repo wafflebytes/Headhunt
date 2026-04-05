@@ -159,14 +159,38 @@ function buildScopeCheck(params: {
   };
 }
 
-function makeAuthorizationInterruptMessage(params: { check: string; provider: string; connection: string; scopes: string[] }) {
+function resolveAuthorizeStep(connection: string): string | null {
+  switch (connection) {
+    case GOOGLE_TOKEN_VAULT_CONNECTION:
+      return 'authorize_connections_step:google';
+    case CAL_COM_TOKEN_VAULT_CONNECTION:
+      return 'authorize_connections_step:cal';
+    case SLACK_TOKEN_VAULT_CONNECTION:
+      return 'authorize_connections_step:slack';
+    default:
+      return null;
+  }
+}
+
+function makeAuthorizationInterruptMessage(params: {
+  check: string;
+  provider: string;
+  connection: string;
+  scopes: string[];
+  reason?: string;
+}) {
+  const authorizeStep = resolveAuthorizeStep(params.connection);
+
   return [
     'Authorization required to run connection diagnostics.',
     `Check: ${params.check}`,
     `Provider: ${params.provider}`,
     `Connection: ${params.connection}`,
+    params.reason ? `Reason: ${params.reason}` : null,
     `Required scopes: ${params.scopes.join(', ')}`,
-    'Use Authorize to grant access and rerun run_connection_diagnostics.',
+    authorizeStep
+      ? `Next step: run ${authorizeStep}, complete authorization, then rerun run_connection_diagnostics.`
+      : 'Use Authorize to grant access and rerun run_connection_diagnostics.',
   ].join(' ');
 }
 
@@ -183,8 +207,49 @@ function isGoogleAuthorizationError(error: unknown): boolean {
   return message.includes('insufficient authentication scopes') || message.includes('invalid credentials');
 }
 
-function throwAuthorizationInterrupt(params: { check: string; provider: string; connection: string; scopes: string[] }) {
+function throwAuthorizationInterrupt(params: {
+  check: string;
+  provider: string;
+  connection: string;
+  scopes: string[];
+  reason?: string;
+}) {
   throw new TokenVaultError(makeAuthorizationInterruptMessage(params));
+}
+
+async function assertConnectedAccountScope(params: {
+  check: string;
+  provider: string;
+  connection: string;
+  requiredScopes: string[];
+}) {
+  try {
+    const accounts = await loadConnectedAccountsSnapshot();
+    const snapshotCheck = buildScopeCheck({
+      check: params.check,
+      provider: params.provider,
+      connection: params.connection,
+      requiredScopes: params.requiredScopes,
+      accounts,
+    });
+
+    if (snapshotCheck.status === 'unhealthy') {
+      throwAuthorizationInterrupt({
+        check: params.check,
+        provider: params.provider,
+        connection: params.connection,
+        scopes: params.requiredScopes,
+        reason: snapshotCheck.message,
+      });
+    }
+  } catch (error) {
+    if (error instanceof TokenVaultError) {
+      throw error;
+    }
+
+    // Do not block live connection checks if My Account diagnostics metadata is
+    // temporarily unavailable; runtime API checks below will still verify health.
+  }
 }
 
 function isGoogleIdentityMismatchError(error: unknown): boolean {
@@ -193,6 +258,14 @@ function isGoogleIdentityMismatchError(error: unknown): boolean {
     typeof error.message === 'string' &&
     error.message.includes('does not match your signed-in account')
   );
+}
+
+function isTokenVaultAuthorizationRequiredError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  return /authorization required to access the token vault/i.test(error.message);
 }
 
 function isMissingFederatedRefreshTokenError(error: unknown): boolean {
@@ -225,6 +298,13 @@ export const verifyGoogleConnectionTool = withGoogle(
     inputSchema: z.object({}),
     execute: async () => {
       try {
+        await assertConnectedAccountScope({
+          check: 'verify_google_connection',
+          provider: 'google',
+          connection: GOOGLE_TOKEN_VAULT_CONNECTION,
+          requiredScopes: normalizeRequiredScopes(GOOGLE_UNIFIED_SCOPES),
+        });
+
         const accessToken = await getGoogleAccessToken();
         const auth = new google.auth.OAuth2();
         auth.setCredentials({ access_token: accessToken });
@@ -292,6 +372,13 @@ export const verifyGmailReadConnectionTool = withGmailRead(
     inputSchema: z.object({}),
     execute: async () => {
       try {
+        await assertConnectedAccountScope({
+          check: 'verify_gmail_read_connection',
+          provider: 'google',
+          connection: GOOGLE_TOKEN_VAULT_CONNECTION,
+          requiredScopes: normalizeRequiredScopes(GMAIL_READ_SCOPES),
+        });
+
         const accessToken = await getGoogleAccessToken();
         const auth = new google.auth.OAuth2();
         auth.setCredentials({ access_token: accessToken });
@@ -344,6 +431,13 @@ export const verifyGmailSendConnectionTool = withGmailWrite(
     inputSchema: z.object({}),
     execute: async () => {
       try {
+        await assertConnectedAccountScope({
+          check: 'verify_gmail_send_connection',
+          provider: 'google',
+          connection: GOOGLE_TOKEN_VAULT_CONNECTION,
+          requiredScopes: normalizeRequiredScopes(GMAIL_WRITE_SCOPES),
+        });
+
         const accessToken = await getGoogleAccessToken();
         const auth = new google.auth.OAuth2();
         auth.setCredentials({ access_token: accessToken });
@@ -394,6 +488,13 @@ export const verifyCalendarConnectionTool = withCalendar(
     inputSchema: z.object({}),
     execute: async () => {
       try {
+        await assertConnectedAccountScope({
+          check: 'verify_calendar_connection',
+          provider: 'google',
+          connection: GOOGLE_TOKEN_VAULT_CONNECTION,
+          requiredScopes: normalizeRequiredScopes(CALENDAR_SCOPES),
+        });
+
         const accessToken = await getGoogleAccessToken();
         const auth = new google.auth.OAuth2();
         auth.setCredentials({ access_token: accessToken });
@@ -453,6 +554,13 @@ export const verifyCalConnectionTool = withCal(
     inputSchema: z.object({}),
     execute: async () => {
       try {
+        await assertConnectedAccountScope({
+          check: 'verify_cal_connection',
+          provider: 'cal',
+          connection: CAL_COM_TOKEN_VAULT_CONNECTION,
+          requiredScopes: CAL_COM_SCOPES,
+        });
+
         const accessToken = await getAccessToken();
         const response = await fetch(`${CAL_COM_API_BASE_URL}/me`, {
           headers: {
@@ -533,6 +641,13 @@ export const verifySlackConnectionTool = withSlack(
     inputSchema: z.object({}),
     execute: async () => {
       try {
+        await assertConnectedAccountScope({
+          check: 'verify_slack_connection',
+          provider: 'slack',
+          connection: SLACK_TOKEN_VAULT_CONNECTION,
+          requiredScopes: SLACK_SCOPES,
+        });
+
         const accessToken = await getAccessToken();
         const web = new WebClient(accessToken);
 
@@ -570,6 +685,15 @@ export const verifySlackConnectionTool = withSlack(
         }
 
         if (error && typeof error === 'object' && 'code' in error && error.code === ErrorCode.HTTPError) {
+          throwAuthorizationInterrupt({
+            check: 'verify_slack_connection',
+            provider: 'slack',
+            connection: SLACK_TOKEN_VAULT_CONNECTION,
+            scopes: SLACK_SCOPES,
+          });
+        }
+
+        if (isTokenVaultAuthorizationRequiredError(error)) {
           throwAuthorizationInterrupt({
             check: 'verify_slack_connection',
             provider: 'slack',

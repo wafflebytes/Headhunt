@@ -1,9 +1,11 @@
 'use client';
 
-import { UserPlus, Loader2, ExternalLink, Trash2 } from 'lucide-react';
+import { Delete02Icon, LinkSquare02Icon, Loading03Icon, UserAdd01Icon } from '@hugeicons/core-free-icons';
 import { ConnectedAccount, deleteConnectedAccount } from '@/lib/actions/profile';
 import { format } from 'date-fns';
 import { useState } from 'react';
+
+import { HugeIcon } from '@/components/ui/huge-icon';
 
 interface ConnectedAccountsCardProps {
   connectedAccounts: ConnectedAccount[];
@@ -47,7 +49,7 @@ export default function ConnectedAccountsCard({
 
       {loading ? (
         <div className="flex items-center justify-center py-8">
-          <Loader2 className="h-6 w-6 animate-spin text-white/60" />
+          <HugeIcon icon={Loading03Icon} size={24} strokeWidth={2.2} className="h-6 w-6 animate-spin text-white/60" />
         </div>
       ) : (
         <div className="space-y-4">
@@ -70,9 +72,9 @@ export default function ConnectedAccountsCard({
                           title="Delete connected account"
                         >
                           {deletingId === account.id ? (
-                            <Loader2 className="h-4 w-4 animate-spin" />
+                            <HugeIcon icon={Loading03Icon} size={16} strokeWidth={2.2} className="h-4 w-4 animate-spin" />
                           ) : (
-                            <Trash2 className="h-4 w-4" />
+                            <HugeIcon icon={Delete02Icon} size={16} strokeWidth={2.2} className="h-4 w-4" />
                           )}
                         </button>
                       </div>
@@ -109,7 +111,7 @@ export default function ConnectedAccountsCard({
             </div>
           ) : (
             <div className="text-center py-8">
-              <UserPlus className="h-12 w-12 text-white/40 mx-auto mb-3" />
+              <HugeIcon icon={UserAdd01Icon} size={48} strokeWidth={2.2} className="h-12 w-12 text-white/40 mx-auto mb-3" />
               <p className="text-white/60">No additional accounts connected</p>
             </div>
           )}
@@ -117,7 +119,7 @@ export default function ConnectedAccountsCard({
           {/* Information Box */}
           <div className="bg-blue-500/10 border border-blue-500/20 rounded-lg p-4 mt-6">
             <div className="flex items-start space-x-3">
-              <ExternalLink className="h-5 w-5 text-blue-400 flex-shrink-0 mt-0.5" />
+              <HugeIcon icon={LinkSquare02Icon} size={20} strokeWidth={2.2} className="h-5 w-5 text-blue-400 flex-shrink-0 mt-0.5" />
               <div className="text-sm">
                 <p className="text-blue-100 font-medium mb-1">
                   <a

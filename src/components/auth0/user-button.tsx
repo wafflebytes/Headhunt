@@ -1,7 +1,8 @@
-import { LogOut, User } from 'lucide-react';
+import { Logout01Icon, User03Icon } from '@hugeicons/core-free-icons';
 
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Button } from '@/components/ui/button';
+import { HugeIcon } from '@/components/ui/huge-icon';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -35,7 +36,7 @@ function getAvatarFallback(user: KeyValueMap) {
 export default function UserButton({
   user,
   children,
-  logoutUrl = '/api/auth/logout',
+  logoutUrl = '/logout',
 }: {
   user: KeyValueMap;
   children?: React.ReactNode;
@@ -80,14 +81,14 @@ export default function UserButton({
 
         <DropdownMenuItem>
           <a href="/profile" className="flex gap-2 items-center">
-            <User />
+            <HugeIcon icon={User03Icon} size={18} strokeWidth={2.2} />
             Profile
           </a>
         </DropdownMenuItem>
 
         <DropdownMenuItem>
           <a href={resolvedLogoutUrl} className="flex gap-2 items-center">
-            <LogOut />
+            <HugeIcon icon={Logout01Icon} size={18} strokeWidth={2.2} />
             Log out
           </a>
         </DropdownMenuItem>

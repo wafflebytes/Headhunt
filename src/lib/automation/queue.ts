@@ -1,15 +1,28 @@
 import { and, asc, eq, inArray, lte, sql } from 'drizzle-orm';
+import { generateObject } from 'ai';
+import { z } from 'zod';
 
 import { db } from '@/lib/db';
 import { automationRuns } from '@/lib/db/schema/automation-runs';
 import { auditLogs } from '@/lib/db/schema/audit-logs';
+import { candidates } from '@/lib/db/schema/candidates';
 import { interviews } from '@/lib/db/schema/interviews';
+import { jobs } from '@/lib/db/schema/jobs';
 import { offers } from '@/lib/db/schema/offers';
+import {
+  buildTranscriptJdAlignmentPrompt,
+  buildTranscriptSlackDigestMessage,
+} from '@/lib/prompts/interview-transcript-digest';
+import { nim, nimChatModelId } from '@/lib/nim';
 import { runIntakeE2ETool } from '@/lib/tools/intake-e2e';
 import { runFinalScheduleFlowTool } from '@/lib/tools/scheduling';
-import { summarizeCalBookingTranscriptTool } from '@/lib/tools/interview-transcripts';
+import {
+  summarizeCalBookingTranscriptTool,
+  summarizeDriveTranscriptPdfTool,
+} from '@/lib/tools/interview-transcripts';
 import { runMultiAgentCandidateScoreTool } from '@/lib/tools/multi-agent-candidate-score';
 import { draftOfferLetterTool, pollOfferClearanceTool, submitOfferForClearanceTool } from '@/lib/tools/offers';
+import { sendSlackMessageTool } from '@/lib/tools/slack';
 
 type RunStatus = 'pending' | 'running' | 'retrying' | 'completed' | 'dead_letter' | 'cancelled';
 
@@ -25,6 +38,31 @@ type EnqueueInput = {
   nextAttemptAt?: Date;
   maxAttempts?: number;
 };
+
+type TranscriptSummaryPayload = {
+  executiveSummary: string;
+  recommendation: string;
+  recommendationRationale: string;
+  overallRubricScore: number;
+  candidateStrengths: string[];
+  candidateRisks: string[];
+  actionableFollowUps: string[];
+  quotedEvidence: Array<{
+    quote: string;
+    whyItMatters: string;
+  }>;
+};
+
+const transcriptJdAlignmentSchema = z.object({
+  jdFitVerdict: z.enum(['Strong Match', 'Match', 'Mixed', 'Weak Match']),
+  jdAlignmentSummary: z.string().min(1),
+  matchedSignals: z.array(z.string().min(1)).min(2).max(8),
+  gapSignals: z.array(z.string().min(1)).min(1).max(8),
+  riskFlags: z.array(z.string().min(1)).min(1).max(8),
+  founderFollowUps: z.array(z.string().min(1)).min(2).max(8),
+});
+
+type TranscriptJdAlignment = z.infer<typeof transcriptJdAlignmentSchema>;
 
 export function buildIdempotencyKey(parts: Array<string | number | null | undefined>): string {
   return parts
@@ -133,6 +171,181 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+function asStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
+
+function asQuotedEvidence(
+  value: unknown,
+): Array<{ quote: string; whyItMatters: string }> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((entry) => {
+      const row = asRecord(entry);
+      if (!row) {
+        return null;
+      }
+
+      const quote = asString(row.quote);
+      const whyItMatters = asString(row.whyItMatters);
+      if (!quote || !whyItMatters) {
+        return null;
+      }
+
+      return {
+        quote,
+        whyItMatters,
+      };
+    })
+    .filter((entry): entry is { quote: string; whyItMatters: string } => Boolean(entry));
+}
+
+function asTranscriptSummary(value: unknown): TranscriptSummaryPayload | null {
+  const row = asRecord(value);
+  if (!row) {
+    return null;
+  }
+
+  const executiveSummary = asString(row.executiveSummary);
+  const recommendation = asString(row.recommendation);
+  const recommendationRationale = asString(row.recommendationRationale);
+  const overallRubricScore = asNumber(row.overallRubricScore);
+
+  if (!executiveSummary || !recommendation || !recommendationRationale || typeof overallRubricScore !== 'number') {
+    return null;
+  }
+
+  return {
+    executiveSummary,
+    recommendation,
+    recommendationRationale,
+    overallRubricScore,
+    candidateStrengths: asStringArray(row.candidateStrengths),
+    candidateRisks: asStringArray(row.candidateRisks),
+    actionableFollowUps: asStringArray(row.actionableFollowUps),
+    quotedEvidence: asQuotedEvidence(row.quotedEvidence),
+  };
+}
+
+function buildFallbackTranscriptJdAlignment(summary: TranscriptSummaryPayload): TranscriptJdAlignment {
+  const matchedSignals = summary.candidateStrengths.slice(0, 5);
+  const gapSignals = summary.candidateRisks.slice(0, 5);
+  const riskFlags = summary.candidateRisks.slice(0, 5);
+  const founderFollowUps = summary.actionableFollowUps.slice(0, 5);
+
+  const fitVerdict =
+    summary.recommendation === 'Strong Hire' || summary.recommendation === 'Hire'
+      ? 'Match'
+      : summary.recommendation === 'Leaning Hire'
+        ? 'Mixed'
+        : 'Weak Match';
+
+  return {
+    jdFitVerdict: fitVerdict,
+    jdAlignmentSummary: summary.recommendationRationale,
+    matchedSignals: matchedSignals.length > 0 ? matchedSignals : ['No explicit matched signals were captured.'],
+    gapSignals: gapSignals.length > 0 ? gapSignals : ['No explicit JD gaps were captured.'],
+    riskFlags: riskFlags.length > 0 ? riskFlags : ['No explicit risk flags were captured.'],
+    founderFollowUps:
+      founderFollowUps.length > 0
+        ? founderFollowUps
+        : ['Run one additional focused interview round to validate role-critical requirements.'],
+  };
+}
+
+async function resolveTranscriptDigestContext(payload: AutomationPayload) {
+  const candidateId = asString(payload.candidateId);
+  const jobId = asString(payload.jobId);
+
+  const [candidateRow] = candidateId
+    ? await db
+      .select({
+        id: candidates.id,
+        name: candidates.name,
+        contactEmail: candidates.contactEmail,
+      })
+      .from(candidates)
+      .where(eq(candidates.id, candidateId))
+      .limit(1)
+    : [];
+
+  const [jobRow] = jobId
+    ? await db
+      .select({
+        id: jobs.id,
+        title: jobs.title,
+      })
+      .from(jobs)
+      .where(eq(jobs.id, jobId))
+      .limit(1)
+    : [];
+
+  return {
+    candidateId,
+    jobId,
+    candidateName: asString(payload.candidateName) ?? candidateRow?.name ?? 'Unknown candidate',
+    candidateEmail: asString(payload.candidateEmail) ?? candidateRow?.contactEmail ?? 'unknown@example.com',
+    jobTitle: asString(payload.jobTitle) ?? jobRow?.title ?? 'Unknown role',
+    jobRequirements: asStringArray(payload.jobRequirements),
+  };
+}
+
+function transcriptSourceLabel(source: string | undefined): string {
+  if (source === 'cal_transcript') {
+    return 'Cal.com transcript';
+  }
+
+  if (source === 'drive_pdf') {
+    return 'Google Drive transcript PDF';
+  }
+
+  return source ?? 'Transcript source unavailable';
+}
+
+async function generateTranscriptJdAlignment(params: {
+  summary: TranscriptSummaryPayload;
+  candidateName: string;
+  candidateEmail: string;
+  jobTitle: string;
+  jobRequirements: string[];
+}) {
+  try {
+    const { object } = await generateObject({
+      model: nim.chatModel(nimChatModelId),
+      schema: transcriptJdAlignmentSchema,
+      temperature: 0.1,
+      prompt: buildTranscriptJdAlignmentPrompt({
+        candidateName: params.candidateName,
+        candidateEmail: params.candidateEmail,
+        jobTitle: params.jobTitle,
+        jobRequirements: params.jobRequirements,
+        executiveSummary: params.summary.executiveSummary,
+        recommendation: params.summary.recommendation,
+        recommendationRationale: params.summary.recommendationRationale,
+        overallRubricScore: params.summary.overallRubricScore,
+        candidateStrengths: params.summary.candidateStrengths,
+        candidateRisks: params.summary.candidateRisks,
+        actionableFollowUps: params.summary.actionableFollowUps,
+        quotedEvidence: params.summary.quotedEvidence,
+      }),
+    });
+
+    return object;
+  } catch {
+    return buildFallbackTranscriptJdAlignment(params.summary);
+  }
+}
+
 function extractCalBookingUid(eventId: string | undefined): string | null {
   if (!eventId) return null;
   if (eventId.startsWith('cal:')) {
@@ -168,10 +381,20 @@ async function resolveOfferClearanceActor(payload: AutomationPayload) {
   return process.env.HEADHUNT_FOUNDER_USER_ID?.trim() ?? process.env.AUTH0_FOUNDER_USER_ID?.trim();
 }
 
+function missingAutomationContextError(params: { handlerType: string; missing: string[] }) {
+  return {
+    check: 'automation_context',
+    status: 'error',
+    handlerType: params.handlerType,
+    boundary: 'manual_review_required',
+    message: `Missing required automation context: ${params.missing.join(', ')}. Provide explicit ids before retrying.`,
+  };
+}
+
 export async function executeAutomationHandler(run: {
   handlerType: string;
   payload: AutomationPayload;
-}) {
+}): Promise<any> {
   if (run.handlerType === 'scheduling.request.send') {
     if (typeof runFinalScheduleFlowTool.execute !== 'function') {
       return {
@@ -185,10 +408,22 @@ export async function executeAutomationHandler(run: {
       asString(run.payload.actorUserId) ??
       process.env.HEADHUNT_FOUNDER_USER_ID?.trim() ??
       process.env.AUTH0_FOUNDER_USER_ID?.trim();
+    const candidateId = asString(run.payload.candidateId);
+    const jobId = asString(run.payload.jobId);
+
+    if (!candidateId || !jobId) {
+      return missingAutomationContextError({
+        handlerType: run.handlerType,
+        missing: [
+          ...(candidateId ? [] : ['candidateId']),
+          ...(jobId ? [] : ['jobId']),
+        ],
+      });
+    }
 
     return runFinalScheduleFlowTool.execute({
-      candidateId: asString(run.payload.candidateId) ?? '',
-      jobId: asString(run.payload.jobId) ?? '',
+      candidateId,
+      jobId,
       organizationId: asString(run.payload.organizationId),
       actorUserId,
       action: 'request_candidate_windows',
@@ -272,13 +507,21 @@ export async function executeAutomationHandler(run: {
     }
 
     const actorUserId = await resolveOfferClearanceActor(run.payload);
+    const offerId = asString(run.payload.offerId);
     const founderUserId =
       asString(run.payload.founderUserId) ??
       process.env.HEADHUNT_FOUNDER_USER_ID?.trim() ??
       process.env.AUTH0_FOUNDER_USER_ID?.trim();
 
+    if (!offerId) {
+      return missingAutomationContextError({
+        handlerType: run.handlerType,
+        missing: ['offerId'],
+      });
+    }
+
     return pollOfferClearanceTool.execute({
-      offerId: asString(run.payload.offerId) ?? '',
+      offerId,
       organizationId: asString(run.payload.organizationId),
       actorUserId,
       founderUserId,
@@ -296,9 +539,21 @@ export async function executeAutomationHandler(run: {
       };
     }
 
+    const candidateId = asString(run.payload.candidateId);
+    const jobId = asString(run.payload.jobId);
+    if (!candidateId || !jobId) {
+      return missingAutomationContextError({
+        handlerType: run.handlerType,
+        missing: [
+          ...(candidateId ? [] : ['candidateId']),
+          ...(jobId ? [] : ['jobId']),
+        ],
+      });
+    }
+
     return runFinalScheduleFlowTool.execute({
-      candidateId: asString(run.payload.candidateId) ?? '',
-      jobId: asString(run.payload.jobId) ?? '',
+      candidateId,
+      jobId,
       organizationId: asString(run.payload.organizationId),
       actorUserId: asString(run.payload.actorUserId),
       action: 'auto',
@@ -333,6 +588,18 @@ export async function executeAutomationHandler(run: {
       asString(run.payload.actorUserId) ??
       process.env.HEADHUNT_FOUNDER_USER_ID?.trim() ??
       process.env.AUTH0_FOUNDER_USER_ID?.trim();
+    const candidateId = asString(run.payload.candidateId);
+    const jobId = asString(run.payload.jobId);
+
+    if (!candidateId || !jobId) {
+      return missingAutomationContextError({
+        handlerType: run.handlerType,
+        missing: [
+          ...(candidateId ? [] : ['candidateId']),
+          ...(jobId ? [] : ['jobId']),
+        ],
+      });
+    }
 
     const terms = asRecord(run.payload.terms) ?? {};
     const baseSalary = asNumber(terms.baseSalary) ?? 180_000;
@@ -344,8 +611,8 @@ export async function executeAutomationHandler(run: {
     const notes = asString(terms.notes);
 
     return draftOfferLetterTool.execute({
-      candidateId: asString(run.payload.candidateId) ?? '',
-      jobId: asString(run.payload.jobId) ?? '',
+      candidateId,
+      jobId,
       organizationId: asString(run.payload.organizationId),
       actorUserId,
       templateId: asString(run.payload.templateId),
@@ -407,14 +674,245 @@ export async function executeAutomationHandler(run: {
       };
     }
 
-    return summarizeCalBookingTranscriptTool.execute({
+    let calResult: unknown;
+    let calRecord: Record<string, unknown> | undefined;
+
+    try {
+      calResult = await summarizeCalBookingTranscriptTool.execute({
+        bookingUid,
+        candidateId: asString(run.payload.candidateId),
+        jobId: asString(run.payload.jobId),
+        organizationId: asString(run.payload.organizationId),
+        actorUserId: asString(run.payload.actorUserId),
+        maxTranscriptChars: asNumber(run.payload.maxTranscriptChars) ?? 28000,
+        jobRequirements: asStringArray(run.payload.jobRequirements),
+      }, {} as any);
+
+      calRecord = asRecord(calResult);
+    } catch (error) {
+      calRecord = {
+        check: 'summarize_cal_booking_transcript',
+        status: 'error',
+        message: error instanceof Error ? error.message : 'Cal transcript summary failed.',
+        fallback: {
+          nextTool: 'summarize_drive_transcript_pdf',
+          reason: 'cal_transcript_exception',
+        },
+      };
+      calResult = calRecord;
+    }
+
+    if (asString(calRecord?.status) === 'success') {
+      return calResult;
+    }
+
+    if (typeof summarizeDriveTranscriptPdfTool.execute !== 'function') {
+      return calResult;
+    }
+
+    const shouldTryDriveFallback =
+      Boolean(asString(run.payload.driveFileId)) ||
+      Boolean(asString(run.payload.driveQuery)) ||
+      Boolean(asString(run.payload.driveFolderId)) ||
+      Boolean(asString(run.payload.driveFolderName)) ||
+      asString(asRecord(calRecord?.fallback)?.nextTool) === 'summarize_drive_transcript_pdf';
+
+    if (!shouldTryDriveFallback) {
+      return calResult;
+    }
+
+    let driveResult: unknown;
+    let driveRecord: Record<string, unknown> | undefined;
+
+    try {
+      driveResult = await summarizeDriveTranscriptPdfTool.execute({
+        driveFileId: asString(run.payload.driveFileId),
+        driveQuery: asString(run.payload.driveQuery),
+        driveFolderId: asString(run.payload.driveFolderId),
+        driveFolderName: asString(run.payload.driveFolderName),
+        candidateId: asString(run.payload.candidateId),
+        jobId: asString(run.payload.jobId),
+        organizationId: asString(run.payload.organizationId),
+        actorUserId: asString(run.payload.actorUserId),
+        maxTranscriptChars: asNumber(run.payload.maxTranscriptChars) ?? 28000,
+        jobRequirements: asStringArray(run.payload.jobRequirements),
+      }, {} as any);
+
+      driveRecord = asRecord(driveResult);
+    } catch (error) {
+      driveRecord = {
+        check: 'summarize_drive_transcript_pdf',
+        status: 'error',
+        message: error instanceof Error ? error.message : 'Drive transcript summary fallback failed.',
+      };
+      driveResult = driveRecord;
+    }
+
+    if (asString(driveRecord?.status) === 'success') {
+      return {
+        ...(driveRecord ?? {}),
+        fallbackUsed: true,
+        fallbackFrom: 'cal_transcript',
+        calFailure: {
+          status: asString(calRecord?.status) ?? 'error',
+          message: asString(calRecord?.message) ?? 'Cal transcript summary failed before Drive fallback.',
+        },
+      };
+    }
+
+    return {
+      ...(driveRecord ?? {}),
+      check: asString(driveRecord?.check) ?? 'summarize_drive_transcript_pdf',
+      status: 'error',
+      message: asString(driveRecord?.message) ?? asString(calRecord?.message) ?? 'Transcript summary failed on Cal and Drive fallback.',
+      fallbackUsed: true,
+      fallbackFrom: 'cal_transcript',
+      calFailure: {
+        status: asString(calRecord?.status) ?? 'error',
+        message: asString(calRecord?.message) ?? 'Cal transcript summary failed.',
+      },
+      driveFailure: {
+        status: asString(driveRecord?.status) ?? 'error',
+        message: asString(driveRecord?.message) ?? 'Drive transcript summary fallback failed.',
+      },
+    };
+  }
+
+  if (run.handlerType === 'interview.transcript.debrief.slack') {
+    if (typeof sendSlackMessageTool.execute !== 'function') {
+      return {
+        check: 'interview_transcript_slack_digest',
+        status: 'error',
+        message: 'Slack message tool is unavailable in automation runtime.',
+      };
+    }
+
+    let transcriptResult = asRecord(run.payload.transcriptResult);
+    let summary = asTranscriptSummary(run.payload.summary) ?? asTranscriptSummary(run.payload.transcriptSummary);
+
+    if (!summary) {
+      const fetched = await executeAutomationHandler({
+        handlerType: 'interview.transcript.fetch',
+        payload: run.payload,
+      });
+
+      const fetchedRecord = asRecord(fetched);
+      if (!fetchedRecord || asString(fetchedRecord.status) !== 'success') {
+        return {
+          check: 'interview_transcript_slack_digest',
+          status: 'error',
+          message:
+            asString(fetchedRecord?.message) ??
+            'Unable to summarize transcript before generating Slack digest.',
+          transcriptResult: fetched,
+        };
+      }
+
+      transcriptResult = fetchedRecord;
+      summary = asTranscriptSummary(fetchedRecord.summary);
+    }
+
+    if (!summary) {
+      return {
+        check: 'interview_transcript_slack_digest',
+        status: 'error',
+        message: 'Transcript summary payload is missing required fields.',
+      };
+    }
+
+    const candidateId = asString(run.payload.candidateId) ?? asString(transcriptResult?.candidateId);
+    const jobId = asString(run.payload.jobId) ?? asString(transcriptResult?.jobId);
+
+    const digestContext = await resolveTranscriptDigestContext({
+      ...run.payload,
+      ...(candidateId ? { candidateId } : {}),
+      ...(jobId ? { jobId } : {}),
+    });
+
+    const jdAlignment = await generateTranscriptJdAlignment({
+      summary,
+      candidateName: digestContext.candidateName,
+      candidateEmail: digestContext.candidateEmail,
+      jobTitle: digestContext.jobTitle,
+      jobRequirements: digestContext.jobRequirements,
+    });
+
+    const source = asString(run.payload.source) ?? asString(transcriptResult?.source);
+    const bookingUid = asString(run.payload.bookingUid) ?? asString(transcriptResult?.bookingUid);
+    const slackChannel =
+      asString(run.payload.slackChannel) ??
+      process.env.HEADHUNT_TRANSCRIPT_SLACK_CHANNEL?.trim() ??
+      'new-channel';
+
+    const slackMessage = buildTranscriptSlackDigestMessage({
+      candidateName: digestContext.candidateName,
+      candidateEmail: digestContext.candidateEmail,
+      candidateId: digestContext.candidateId,
+      jobTitle: digestContext.jobTitle,
+      jobId: digestContext.jobId,
       bookingUid,
-      candidateId: asString(run.payload.candidateId),
-      jobId: asString(run.payload.jobId),
-      organizationId: asString(run.payload.organizationId),
-      actorUserId: asString(run.payload.actorUserId),
-      maxTranscriptChars: asNumber(run.payload.maxTranscriptChars) ?? 28000,
-    }, {} as any);
+      sourceLabel: transcriptSourceLabel(source),
+      recommendation: summary.recommendation,
+      overallRubricScore: summary.overallRubricScore,
+      jdFitVerdict: jdAlignment.jdFitVerdict,
+      jdAlignmentSummary: jdAlignment.jdAlignmentSummary,
+      matchedSignals: jdAlignment.matchedSignals,
+      gapSignals: jdAlignment.gapSignals,
+      riskFlags: jdAlignment.riskFlags,
+      founderFollowUps: jdAlignment.founderFollowUps,
+    });
+
+    let slackResult: unknown;
+    let slackRecord: Record<string, unknown> | undefined;
+
+    try {
+      slackResult = await sendSlackMessageTool.execute(
+        {
+          channel: slackChannel,
+          text: slackMessage,
+        },
+        {} as any,
+      );
+      slackRecord = asRecord(slackResult);
+    } catch (error) {
+      slackRecord = {
+        check: 'send_slack_message',
+        status: 'error',
+        message: error instanceof Error ? error.message : 'Slack digest delivery failed.',
+      };
+      slackResult = slackRecord;
+    }
+
+    if (asString(slackRecord?.status) === 'error') {
+      return {
+        check: 'interview_transcript_slack_digest',
+        status: 'error',
+        channel: slackChannel,
+        message: asString(slackRecord?.message) ?? 'Slack digest delivery failed.',
+        digest: {
+          recommendation: summary.recommendation,
+          overallRubricScore: summary.overallRubricScore,
+          jdFitVerdict: jdAlignment.jdFitVerdict,
+        },
+      };
+    }
+
+    return {
+      check: 'interview_transcript_slack_digest',
+      status: 'success',
+      mode: 'sent',
+      channel: slackChannel,
+      candidateId: digestContext.candidateId,
+      jobId: digestContext.jobId,
+      bookingUid,
+      source,
+      digest: {
+        recommendation: summary.recommendation,
+        overallRubricScore: summary.overallRubricScore,
+        jdAlignment: jdAlignment,
+      },
+      slack: slackResult,
+    };
   }
 
   if (run.handlerType === 'dead_letter.notify') {
