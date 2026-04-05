@@ -7,8 +7,7 @@ export const auth0 = new Auth0Client({
 
 const TOKEN_VAULT_SUBJECT_AUDIENCE =
   process.env.AUTH0_TOKEN_VAULT_SUBJECT_AUDIENCE?.trim() ||
-  process.env.MCP_AUTH_AUDIENCE?.trim() ||
-  process.env.SHOP_API_AUDIENCE?.trim();
+  process.env.MCP_AUTH_AUDIENCE?.trim();
 const TOKEN_VAULT_SUBJECT_SCOPE = process.env.AUTH0_TOKEN_VAULT_SUBJECT_SCOPE?.trim();
 
 const isJwtLike = (value: string) => value.split('.').length === 3;

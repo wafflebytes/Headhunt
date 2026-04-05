@@ -98,10 +98,9 @@ body {
 @keyframes blurFadeIn {
   0% {
     opacity: 0;
-    filter: blur(2px);
-    transform: scale(0.995);
+    filter: blur(8px);
+    transform: scale(0.99);
   }
-
   100% {
     opacity: 1;
     filter: blur(0);
@@ -110,7 +109,7 @@ body {
 }
 
 .animate-blur-fade-in {
-  animation: blurFadeIn 0.16s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  animation: blurFadeIn 0.3s cubic-bezier(0.2, 0, 0, 1) forwards;
 }
 
 @keyframes blurFadeOut {
@@ -119,16 +118,15 @@ body {
     filter: blur(0);
     transform: scale(1);
   }
-
   100% {
     opacity: 0;
-    filter: blur(1.5px);
-    transform: scale(0.995);
+    filter: blur(6px);
+    transform: scale(0.99);
   }
 }
 
 .animate-blur-fade-out {
-  animation: blurFadeOut 0.1s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+  animation: blurFadeOut 0.25s cubic-bezier(0.2, 0, 0, 1) forwards;
 }
 
 @keyframes slideUpFade {

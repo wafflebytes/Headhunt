@@ -72,8 +72,7 @@ function resolveCibaConfig(params: { audience?: string; scope?: string }): CibaB
   const clientSecret = requireEnv('AUTH0_CLIENT_SECRET');
   const audience =
     params.audience ??
-    process.env.AUTH0_CIBA_AUDIENCE?.trim() ??
-    process.env.SHOP_API_AUDIENCE?.trim();
+    process.env.AUTH0_CIBA_AUDIENCE?.trim();
 
   const scope = params.scope ?? process.env.AUTH0_CIBA_SCOPE?.trim() ?? 'openid';
   const issuer = normalizeIssuer(process.env.AUTH0_CIBA_LOGIN_HINT_ISSUER?.trim() ?? `https://${domain}`);

@@ -1,5 +1,4 @@
 import { ArrowRight01Icon, ShieldCheck } from '@hugeicons/core-free-icons';
-import Link from 'next/link';
 
 import { HugeIcon } from '@/components/ui/huge-icon';
 import { Button } from '@/components/ui/button';
@@ -29,7 +28,7 @@ export default function LoginPage() {
           </Button>
         </a>
 
-        <a href="/auth/login?screen_hint=signup&prompt=login&max_age=0" className="w-full">
+        <a href="/auth/login?screen_hint=signup&prompt=login&max_age=0&returnTo=/onboarding&reset_onboarding=1" className="w-full">
           <Button
             variant="outline"
             className="w-full bg-white h-[48px] rounded-[10px] border-[#e2e8f0] shadow-[0_1px_3px_rgba(0,0,0,0.02)] hover:bg-[#f8fafc] text-[14px] font-medium text-[#374151] flex items-center gap-3 transition-colors"
@@ -51,11 +50,11 @@ export default function LoginPage() {
           className="h-[52px] bg-white border-[#e2e8f0] text-[15px] font-sans rounded-[14px] placeholder:text-[#94a3b8] shadow-sm focus-visible:border-[#0f172a] focus-visible:shadow-[0_0_0_1px_#0f172a]"
         />
 
-        <Link href="/onboarding" className="w-full mt-2">
+        <a href="/auth/login?screen_hint=signup&prompt=login&max_age=0&returnTo=/onboarding&reset_onboarding=1" className="w-full mt-2">
           <Button className="w-full h-[54px] rounded-[16px] bg-[#0f172a] hover:bg-[#1e293b] text-white text-[15px] font-bold flex items-center justify-center gap-2 shadow-[0_8px_20px_rgba(15,23,42,0.15)] transition-all active:scale-[0.98]">
             Continue <HugeIcon icon={ArrowRight01Icon} size={18} strokeWidth={2.2} />
           </Button>
-        </Link>
+        </a>
 
         <p className="text-center text-[12px] text-[#9ca3af] mt-8 max-w-[280px] mx-auto leading-relaxed font-sans pb-10">
           By continuing, you agree to our{' '}
