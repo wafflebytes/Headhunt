@@ -15,12 +15,8 @@ import { serpApiTool } from '@/lib/tools/serpapi';
 import { getUserInfoTool } from '@/lib/tools/user-info';
 import { gmailDraftTool, gmailSearchTool } from '@/lib/tools/gmail';
 import { getCalendarEventsTool } from '@/lib/tools/google-calender';
-import { getTasksTool, createTasksTool } from '@/lib/tools/google-tasks';
-import { shopOnlineTool } from '@/lib/tools/shop-online';
 import { sendSlackMessageTool } from '@/lib/tools/slack';
 import { getContextDocumentsTool } from '@/lib/tools/context-docs';
-import { listRepositories } from '@/lib/tools/list-gh-repos';
-import { listGitHubEvents } from '@/lib/tools/list-gh-events';
 import { listSlackChannels } from '@/lib/tools/list-slack-channels';
 import {
   runConnectionDiagnosticsTool,
@@ -56,10 +52,10 @@ import { generateIntelCardTool, runTriageTool } from '@/lib/tools/triage-intel';
 
 const date = new Date().toISOString();
 
-const AGENT_SYSTEM_TEMPLATE = `You are a personal assistant named Assistant0. You are a helpful assistant that can answer questions and help with tasks. 
+const AGENT_SYSTEM_TEMPLATE = `You are a personal assistant named Assistant0. You are a helpful assistant that can answer questions and help with hiring workflows. 
 You have access to a set of tools. When using tools, you MUST provide valid JSON arguments. Always format tool call arguments as proper JSON objects.
-For example, when calling shop_online tool, format like this:
-{"product": "iPhone", "qty": 1, "priceLimit": 1000}
+For example, when calling schedule_interview_slots, format like this:
+{"candidateId": "cand_123", "jobId": "job_456", "action": "propose"}
 Use the tools as needed to answer the user's question. Render the email body as a markdown block, do not wrap it in code blocks.
 Never output raw serialized tool payloads such as "functions.tool_name:1{}" or "[{'type': 'text', 'text': '...'}]". Always return plain-language text.
 Never output tool marker tokens like "<|tool_call_end|>" or "<|tool_calls_section_end|>".
@@ -999,7 +995,38 @@ function applyForcedArgsToTools(
  * This handler initializes and calls an tool calling agent.
  */
 export async function POST(req: NextRequest) {
-  const { id, messages }: { id: string; messages: Array<UIMessage> } = await req.json();
+  let payload: unknown;
+  try {
+    payload = await req.json();
+  } catch {
+    return NextResponse.json(
+      {
+        message: 'Invalid or empty JSON body.',
+      },
+      { status: 400 },
+    );
+  }
+
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return NextResponse.json(
+      {
+        message: 'Request body must be a JSON object.',
+      },
+      { status: 400 },
+    );
+  }
+
+  const { id, messages } = payload as { id?: unknown; messages?: unknown };
+  if (typeof id !== 'string' || !Array.isArray(messages)) {
+    return NextResponse.json(
+      {
+        message: 'Request body must include a string id and array messages.',
+      },
+      { status: 400 },
+    );
+  }
+
+  const safeMessages = messages as Array<UIMessage>;
 
   const session = await auth0.getSession();
   if (!session?.user?.sub) {
@@ -1014,12 +1041,7 @@ export async function POST(req: NextRequest) {
     gmailSearchTool,
     gmailDraftTool,
     getCalendarEventsTool,
-    getTasksTool,
-    createTasksTool,
-    shopOnlineTool,
     getContextDocumentsTool,
-    listRepositories,
-    listGitHubEvents,
     listSlackChannels,
     send_slack_message: sendSlackMessageTool,
     run_connection_diagnostics: runConnectionDiagnosticsTool,
@@ -1048,12 +1070,12 @@ export async function POST(req: NextRequest) {
     poll_offer_clearance: pollOfferClearanceTool,
   };
 
-  const modelMessages = await convertToModelMessages(messages);
-  const forcedToolDecision = getForcedToolDecision(messages);
+  const modelMessages = await convertToModelMessages(safeMessages);
+  const forcedToolDecision = getForcedToolDecision(safeMessages);
   const effectiveTools = applyForcedArgsToTools(tools as Record<string, any>, forcedToolDecision);
 
   const stream = createUIMessageStream({
-    originalMessages: messages,
+    originalMessages: safeMessages,
     execute: withInterruptions(
       async ({ writer }) => {
         const result = streamText({

@@ -57,7 +57,7 @@ Offer emails are gated by CIBA clearance in this project: `submit_offer_for_clea
 - Reference: [Configure Client-Initiated Backchannel Authentication](https://auth0.com/docs/get-started/applications/configure-client-initiated-backchannel-authentication).
 
 2. Configure API audience + CIBA policy
-- Set up/confirm the API audience used by the app (`AUTH0_CIBA_AUDIENCE`, or `SHOP_API_AUDIENCE` fallback).
+- Set up/confirm the API audience used by the app (`AUTH0_CIBA_AUDIENCE`).
 - In the API CIBA settings/policy, allow the founder user(s) who can approve offers.
 
 3. Enable phone approvals (Guardian push)
@@ -144,7 +144,7 @@ Set these values in your app and Supabase function environment:
 - `AUTOMATION_AUTO_INTAKE_ENABLED` (optional, defaults to `true`)
 - `AUTOMATION_INTAKE_QUERY` (optional Gmail query override for cron-driven intake scans)
 - `HEADHUNT_FOUNDER_USER_ID` or `HEADHUNT_FOUNDER_USER_IDS`
-- `AUTH0_CIBA_AUDIENCE` (or reuse `SHOP_API_AUDIENCE`)
+- `AUTH0_CIBA_AUDIENCE`
 - `AUTH0_CIBA_SCOPE` (optional override, defaults to `openid`)
 - `AUTH0_CIBA_LOGIN_HINT_ISSUER` (optional override)
 

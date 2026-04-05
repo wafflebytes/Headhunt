@@ -3,7 +3,7 @@ import { useUser } from "@/app/api-mock";
 import type { Doc, Id } from "@/app/api-mock";
 import { useQuery, useMutation, useAction, api } from "@/app/api-mock";
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { usePathname, useRouter } from 'next/navigation';
+import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import CommandMenuWrapper from '@/components/command-menu-wrapper';
 import { ChatWindow, type ChatJobPickerOption } from '@/components/chat-window';
 import {
@@ -37,9 +37,12 @@ import {
   WorkIcon as WorkHugeIcon,
   ZapIcon as ZapHugeIcon,
   Cancel01Icon as Cancel01HugeIcon,
+  FileUploadIcon,
+  SparklesIcon,
+  File01Icon,
 } from '@hugeicons/core-free-icons';
 import { DropdownMenuCheckboxItem } from '@/components/ui/dropdown-menu';
-import { X } from 'lucide-react';
+import { X, Github } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -110,6 +113,109 @@ type FilterOption = {
   label: string;
   category: string;
 };
+
+type JdSynthesisTemplate = {
+  title: string;
+  department: string;
+  employmentType: string;
+  location: string;
+  compensation: string;
+  roleSummary: string;
+  responsibilities: string[];
+  requirements: string[];
+  preferredQualifications: string[];
+  benefits: string[];
+  hiringSignals: string[];
+};
+
+type JdSynthesisResponse = {
+  status?: string;
+  source?: 'upload' | 'draft';
+  synthesis?: JdSynthesisTemplate;
+  message?: string;
+};
+
+type DraftJdFormState = {
+  companyStage: string;
+  employmentType: string;
+  locationPolicy: string;
+  compensationRange: string;
+  mustHaveRequirements: string;
+  preferredRequirements: string;
+  coreResponsibilities: string;
+  niceToHave: string;
+  benefits: string;
+};
+
+type OfferLetterTemplate = {
+  compensation: string;
+  requirements: string;
+  location: string;
+  startDate: string;
+  additionalTerms: string;
+};
+
+type JobRecord = {
+  id: string;
+  slug: string;
+  title: string;
+  team: string;
+  openedAt: string;
+  status: 'active' | 'paused' | 'draft';
+  statusClass: string;
+  applied: number;
+  reviewed: number;
+  interviewed: number;
+  manager: string;
+  description: string;
+  jdSynthesis: JdSynthesisTemplate | null;
+  offerTemplate: OfferLetterTemplate;
+};
+
+const INITIAL_DRAFT_JD_FORM: DraftJdFormState = {
+  companyStage: '',
+  employmentType: 'Full-time',
+  locationPolicy: '',
+  compensationRange: '',
+  mustHaveRequirements: '',
+  preferredRequirements: '',
+  coreResponsibilities: '',
+  niceToHave: '',
+  benefits: '',
+};
+
+const buildDefaultOfferTemplate = (title: string, team: string): OfferLetterTemplate => ({
+  compensation: `Base salary band to be finalized for ${title}. Include equity and bonus terms before sending.`,
+  requirements: `Standard eligibility checks, reference verification, and role-specific requirements for ${team}.`,
+  location: 'Remote / Hybrid policy to be finalized with the hiring manager.',
+  startDate: 'Target start date: within 30 days after offer acceptance.',
+  additionalTerms: 'Include probation period, confidentiality obligations, and signing bonus terms if applicable.',
+});
+
+const buildDefaultJdTemplate = (job: JobRecord): JdSynthesisTemplate => ({
+  title: job.title,
+  department: job.team,
+  employmentType: 'Not specified',
+  location: 'Not specified',
+  compensation: 'Not specified',
+  roleSummary: job.description,
+  responsibilities: [
+    `Define outcomes and execution priorities for the ${job.title} role.`,
+    `Partner with ${job.team} leadership to calibrate role scope and interview signal quality.`,
+  ],
+  requirements: ['Not specified'],
+  preferredQualifications: ['Not specified'],
+  benefits: ['Not specified'],
+  hiringSignals: ['Not specified'],
+});
+
+const slugifyJobTitle = (value: string) =>
+  value
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-');
 
 interface UnifiedFilterProps {
   options: FilterOption[];
@@ -517,6 +623,43 @@ const SCREEN_TO_ROUTE: Record<string, string> = {
   settings: '/settings',
 };
 
+const SIDEBAR_CURSOR_FALLBACK_POSITION = { x: -1000, y: -1000 };
+const SIDEBAR_CURSOR_POSITION_KEY = '__headhuntSidebarCursorPosition';
+
+function readSidebarCursorPosition() {
+  if (typeof window === 'undefined') {
+    return { ...SIDEBAR_CURSOR_FALLBACK_POSITION };
+  }
+
+  const stored = (window as typeof window & { [SIDEBAR_CURSOR_POSITION_KEY]?: { x?: number; y?: number } })[
+    SIDEBAR_CURSOR_POSITION_KEY
+  ];
+
+  if (
+    stored &&
+    typeof stored.x === 'number' &&
+    Number.isFinite(stored.x) &&
+    typeof stored.y === 'number' &&
+    Number.isFinite(stored.y)
+  ) {
+    return { x: stored.x, y: stored.y };
+  }
+
+  return { ...SIDEBAR_CURSOR_FALLBACK_POSITION };
+}
+
+function writeSidebarCursorPosition(position: { x: number; y: number }) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  (window as typeof window & { [SIDEBAR_CURSOR_POSITION_KEY]?: { x: number; y: number } })[
+    SIDEBAR_CURSOR_POSITION_KEY
+  ] = position;
+}
+
+let lastSidebarCursorPosition = readSidebarCursorPosition();
+
 const ROUTE_TO_SCREEN: Record<string, string> = {
   '/': 'dashboard',
   '/dashboard': 'dashboard',
@@ -531,7 +674,7 @@ const ROUTE_TO_SCREEN: Record<string, string> = {
 };
 
 function resolveScreenFromPath(pathname: string): string {
-  if (pathname === '/jobs') return 'jobs';
+  if (pathname === '/jobs' || pathname.startsWith('/jobs/')) return 'jobs';
   if (pathname === '/pipeline') return 'pipeline';
   if (pathname === '/candidates' || pathname.startsWith('/candidates/')) return 'candidates';
   if (pathname === '/agents' || pathname.startsWith('/agents/')) return 'agents';
@@ -553,8 +696,8 @@ function resolvePathFromScreen(screen: string): string {
   return SCREEN_TO_ROUTE[screen] ?? '/';
 }
 
-const SCREEN_EXIT_TRANSITION_MS = 60; // Snappy exit animation duration
-const SCREEN_NAVIGATION_FALLBACK_MS = 1500;
+const SCREEN_EXIT_TRANSITION_MS = 250;
+const SCREEN_NAVIGATION_FALLBACK_MS = 700;
 
 function AnimatedNumber({ value, prefix = "", suffix = "", delay = 0, padZero = false }: { value: number, prefix?: string, suffix?: string, delay?: number, padZero?: boolean }) {
   const [count, setCount] = useState(0);
@@ -972,7 +1115,7 @@ function PipelineScreen() {
         <DialogContent className="sm:max-w-[400px] rounded-[24px] p-6 bg-white border border-[#dbe4ef] shadow-[0_10px_40px_rgba(15,23,42,0.12)]">
           <div className="flex flex-col items-center text-center py-4">
             <div className="w-12 h-12 rounded-full bg-red-50 flex items-center justify-center text-red-500 mb-4">
-              <Activity02HugeIcon size={24} />
+              <HistoryIcon size={24} />
             </div>
             <DialogTitle className="text-[18px] font-heading font-semibold text-[#0f172a] mb-2 px-4 leading-tight">
               {confirmAction === 'reject' ? 'Reject Candidate?' : 'Fire Candidate?'}
@@ -1675,24 +1818,44 @@ export default function App() {
   const sidebarGradientRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    let rafId: number;
-    const handleMouseMove = (e: MouseEvent) => {
+    lastSidebarCursorPosition = readSidebarCursorPosition();
+
+    if (sidebarGradientRef.current) {
+      sidebarGradientRef.current.style.left = `${lastSidebarCursorPosition.x}px`;
+      sidebarGradientRef.current.style.top = `${lastSidebarCursorPosition.y}px`;
+    }
+
+    let rafId = 0;
+    const handlePointerMove = (e: PointerEvent) => {
+      lastSidebarCursorPosition = {
+        x: e.clientX,
+        y: e.clientY,
+      };
+      writeSidebarCursorPosition(lastSidebarCursorPosition);
+
       cancelAnimationFrame(rafId);
       rafId = requestAnimationFrame(() => {
         if (sidebarGradientRef.current) {
-          sidebarGradientRef.current.style.left = `${e.clientX}px`;
-          sidebarGradientRef.current.style.top = `${e.clientY}px`;
+          sidebarGradientRef.current.style.left = `${lastSidebarCursorPosition.x}px`;
+          sidebarGradientRef.current.style.top = `${lastSidebarCursorPosition.y}px`;
         }
       });
     };
-    window.addEventListener('mousemove', handleMouseMove, { passive: true });
+
+    window.addEventListener('pointermove', handlePointerMove, { passive: true });
+
     return () => {
-      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('pointermove', handlePointerMove);
       cancelAnimationFrame(rafId);
     };
   }, []);
   const { user } = useUser();
   const userInitial = user?.name?.[0]?.toUpperCase() || user?.email?.[0]?.toUpperCase() || 'C';
+
+  useEffect(() => {
+    const uniqueRoutes = new Set<string>([...Object.values(SCREEN_TO_ROUTE), '/workflows']);
+    uniqueRoutes.forEach((route) => router.prefetch(route));
+  }, [router]);
 
   const agentsQueryRaw = useQuery(api.agents.listAgents);
   const pendingApprovalsRaw = useQuery(api.approvals.listPendingApprovals, {
@@ -1863,19 +2026,41 @@ export default function App() {
 
   const setActiveScreen = (screen: string) => {
     const nextPath = resolvePathFromScreen(screen);
-    if (nextPath === pathname || isNavigatingScreen) {
+    const isSamePath = nextPath === pathname;
+    const isSameScreen = activeScreen === screen;
+
+    if (isSamePath && isSameScreen) {
       return;
     }
 
+    if (navigationTimeoutRef.current) {
+      clearTimeout(navigationTimeoutRef.current);
+      navigationTimeoutRef.current = null;
+    }
+
+    if (navigationFallbackRef.current) {
+      clearTimeout(navigationFallbackRef.current);
+      navigationFallbackRef.current = null;
+    }
+
+    // Phase 1: Start Blur Out
     setIsNavigatingScreen(true);
-    
-    // Snappier transition timing: allow exit animation to begin before routing
+
+    // Phase 2: Switch logic with a slight delay so the current content blurs out first
     navigationTimeoutRef.current = setTimeout(() => {
-      router.push(nextPath);
-    }, SCREEN_EXIT_TRANSITION_MS);
+      setActiveScreenState(screen);
 
+      if (isSamePath) {
+        // If same path, we just needed to update state, so blur back in shortly
+        setTimeout(() => setIsNavigatingScreen(false), 50);
+      } else {
+        // If path changed, push router and let the mount handle the blur-in
+        router.push(nextPath);
+      }
+      
+      navigationTimeoutRef.current = null;
+    }, 180); // Transition point: slightly before the full MS to keep things snappy
 
-    // If navigation fails for any reason, recover the current panel visibility.
     navigationFallbackRef.current = setTimeout(() => {
       setIsNavigatingScreen(false);
       navigationFallbackRef.current = null;
@@ -1982,8 +2167,8 @@ export default function App() {
         className="absolute w-[1400px] h-[1400px] rounded-full pointer-events-none z-[-1]"
         style={{
           background: 'radial-gradient(circle, rgba(225, 129, 49, 0.1) 0%, transparent 60%)',
-          left: -1000,
-          top: -1000,
+          left: lastSidebarCursorPosition.x,
+          top: lastSidebarCursorPosition.y,
           transform: 'translate(-50%, -50%)',
           filter: 'blur(150px)',
           willChange: 'left, top',
@@ -2098,7 +2283,7 @@ export default function App() {
         <div className="flex items-center mb-5 w-full">
           {isSidebarOpen ? (
             <div className="flex items-center justify-between w-[220px] mx-auto">
-              <div className="flex items-center gap-2.5 cursor-pointer ml-1" onClick={() => window.location.href='/'}>
+              <div className="flex items-center gap-2.5 cursor-pointer ml-1" onClick={() => setActiveScreen('dashboard')}>
                 <img src="/assets/headie.png" alt="Headhunt" className="w-[30px] h-[30px] object-contain drop-shadow-sm" />
                 <span className="font-display text-[24px] tracking-[-0.02em] text-[#304f67] leading-none mt-0.5">
                   Headhunt
@@ -2183,7 +2368,11 @@ export default function App() {
         
         {/* Footer */}
         <div className="mt-auto px-1 flex w-full justify-center mb-4">
-          <div title={!isSidebarOpen ? "Built with Auth0" : undefined} className={cn("flex items-center p-3 bg-[#0a0a0a] border border-[#222] rounded-xl hover:bg-black cursor-pointer overflow-hidden transition-all shadow-md group", isSidebarOpen ? "gap-2.5 w-[220px]" : "w-11 h-11 justify-center mx-auto")}>
+          <div 
+            onClick={() => window.open('https://auth0.com/docs/secure/call-apis-on-users-behalf/token-vault', '_blank')}
+            title={!isSidebarOpen ? "Built with Auth0" : undefined} 
+            className={cn("flex items-center p-3 bg-[#0a0a0a] border border-[#222] rounded-xl hover:bg-black cursor-pointer overflow-hidden transition-all shadow-md group", isSidebarOpen ? "gap-2.5 w-[220px]" : "w-11 h-11 justify-center mx-auto")}
+          >
             <div className="shrink-0 text-white group-hover:drop-shadow-[0_0_8px_rgba(255,255,255,0.5)] transition-all">
               <svg width="22" height="26" viewBox="0 -1 26 34" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
                 <path d="M 1.68935,13.6673 C 6.93599,12.8036 11.0479,8.69124 11.912,3.4446 l 0.4204,-2.5514 c 0.0807,-0.4935 -0.3246,-0.929 -0.8236,-0.8909 C 7.51403,0.3114 3.74928,1.634 1.67011,2.4864 0.660431,2.9009 0,3.8821 0,4.9742 V 13.039 c 0,0.4744 0.424115,0.8353 0.892565,0.7584 z" fill="currentColor"/>
@@ -2219,6 +2408,14 @@ export default function App() {
               {activeScreen !== 'dashboard' && <CommandMenuWrapper />}
               <Button variant="outline" size="icon" className="w-8 h-8 rounded-full border-[#e2e8f0] text-[#64748b] hover:bg-[#f8fafc] hover:text-[#334155]">
                 <Bell size={16} />
+              </Button>
+              <Button 
+                variant="outline" 
+                size="icon" 
+                className="w-8 h-8 rounded-full border-[#e2e8f0] text-[#64748b] hover:bg-[#f8fafc] hover:text-[#334155]"
+                onClick={() => window.open('https://github.com/wafflebytes/Headhunt', '_blank')}
+              >
+                <Github size={16} />
               </Button>
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
@@ -2771,6 +2968,28 @@ function JobsScreen() {
   const pathname = usePathname();
   const [activeFilters, setActiveFilters] = useState<string[]>([]);
 
+  // Modal State
+  const [showNewJobModal, setShowNewJobModal] = useState(false);
+  const [jobTitle, setJobTitle] = useState('');
+  const [jobDept, setJobDept] = useState('');
+  const [jobDescription, setJobDescription] = useState('');
+  const [showTitleOptions, setShowTitleOptions] = useState(false);
+  const [showDeptOptions, setShowDeptOptions] = useState(false);
+  const [showDraftBuilder, setShowDraftBuilder] = useState(false);
+  const [isStep3PanelOpen, setIsStep3PanelOpen] = useState(false);
+  const [isStep3ModalOpen, setIsStep3ModalOpen] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const [isParsing, setIsParsing] = useState(false);
+  const [isParsed, setIsParsed] = useState(false);
+  const [uploadedFileName, setUploadedFileName] = useState<string | null>(null);
+  const [jdSynthesis, setJdSynthesis] = useState<JdSynthesisTemplate | null>(null);
+  const [draftForm, setDraftForm] = useState<DraftJdFormState>(INITIAL_DRAFT_JD_FORM);
+  const [isEditingJdTemplate, setIsEditingJdTemplate] = useState(false);
+  const [isEditingOfferTemplate, setIsEditingOfferTemplate] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const JOB_TITLES = ['Software Engineer', 'Senior Software Engineer', 'Staff ML Engineer', 'Product Designer', 'Senior Product Designer', 'Product Manager', 'Founding Product Manager'];
+  const DEPTS = ['Engineering', 'Design', 'Product', 'Marketing', 'Sales', 'Operations'];
+
   const filterOptions: FilterOption[] = [
     { id: 'team-design', label: 'Design', category: 'Team' },
     { id: 'team-platform', label: 'Platform', category: 'Team' },
@@ -2787,7 +3006,7 @@ function JobsScreen() {
     );
   };
 
-  const jobs = [
+  const initialJobs: JobRecord[] = [
     {
       id: 'job_spd_001',
       slug: 'senior-product-designer',
@@ -2800,6 +3019,9 @@ function JobsScreen() {
       reviewed: 24,
       interviewed: 8,
       manager: 'Radhika (Founder)',
+      description: 'Design and ship end-to-end product experiences while partnering with engineering and leadership.',
+      jdSynthesis: null,
+      offerTemplate: buildDefaultOfferTemplate('Senior Product Designer', 'Design'),
     },
     {
       id: 'job_mle_002',
@@ -2813,6 +3035,9 @@ function JobsScreen() {
       reviewed: 17,
       interviewed: 4,
       manager: 'Chaitanya (Founder)',
+      description: 'Lead ML platform architecture and ship production-quality models across customer-facing systems.',
+      jdSynthesis: null,
+      offerTemplate: buildDefaultOfferTemplate('Staff ML Engineer', 'Platform'),
     },
     {
       id: 'job_fpm_003',
@@ -2826,6 +3051,9 @@ function JobsScreen() {
       reviewed: 8,
       interviewed: 3,
       manager: 'Anya (Hiring Lead)',
+      description: 'Own roadmap definition, customer discovery, and cross-functional execution for key company bets.',
+      jdSynthesis: null,
+      offerTemplate: buildDefaultOfferTemplate('Founding Product Manager', 'Product'),
     },
     {
       id: 'job_fe_004',
@@ -2839,167 +3067,617 @@ function JobsScreen() {
       reviewed: 0,
       interviewed: 0,
       manager: 'Nora (Eng Lead)',
+      description: 'Define frontend architecture and mentor engineers while owning UI quality and delivery velocity.',
+      jdSynthesis: null,
+      offerTemplate: buildDefaultOfferTemplate('Frontend Lead', 'Engineering'),
     },
   ];
 
-  const jobCandidates = [
-    { id: 'cand_001', name: 'Anya Sharma', stage: 'reviewed', score: 93, next: 'Portfolio deep-dive', jobSlug: 'senior-product-designer' },
-    { id: 'cand_002', name: 'Marco Lin', stage: 'interview_scheduled', score: 89, next: 'System interview Tue 11:00', jobSlug: 'staff-ml-engineer' },
-    { id: 'cand_003', name: 'Riya Patel', stage: 'interviewed', score: 91, next: 'Founder round summary', jobSlug: 'founding-product-manager' },
-    { id: 'cand_004', name: 'Ibrahim Noor', stage: 'offer_sent', score: 87, next: 'Clearance pending', jobSlug: 'frontend-lead' },
-  ];
+  const [jobs, setJobs] = useState(initialJobs);
 
-  const isCreatePage = pathname === '/jobs/new';
   const jobMatch = pathname.match(/^\/jobs\/([^/]+)$/);
-  const jobCandidatesMatch = pathname.match(/^\/jobs\/([^/]+)\/candidates$/);
-  const currentJobSlug = jobCandidatesMatch?.[1] ?? jobMatch?.[1] ?? null;
+  const currentJobSlug = jobMatch?.[1] ?? null;
   const currentJob = jobs.find((job) => job.slug === currentJobSlug);
 
-  if (isCreatePage) {
-    return (
-      <div className="flex flex-col gap-6 max-w-[980px] w-full mx-auto pb-10">
-        <div className="flex items-center justify-between border-b border-[#e2e8f0] pb-4">
-          <div>
-            <div className="text-[20px] font-heading font-medium text-[#1e293b]">Create Job</div>
-            <div className="text-[13px] font-sans text-[#64748b]">Choose a start path. You can edit all fields before publishing.</div>
-          </div>
-          <Button variant="outline" className="h-8 rounded-full border-[#cbd5e1] text-[12px]" onClick={() => router.push('/jobs')}>
-            Back to Jobs
-          </Button>
-        </div>
+  const applySynthesizedTemplate = (template: JdSynthesisTemplate) => {
+    setJdSynthesis(template);
+    setIsParsed(true);
+    setShowDraftBuilder(false);
+    setIsStep3PanelOpen(true);
+    setJobTitle((prev) => (prev.trim().length > 0 ? prev : template.title));
+    setJobDept((prev) => (prev.trim().length > 0 ? prev : template.department));
+    setJobDescription((prev) => (prev.trim().length > 0 ? prev : template.roleSummary));
+  };
 
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          {[
-            { title: 'Upload Job Description', copy: 'Parse JD and prefill role fields with rubric suggestions.' },
-            { title: 'Start Manually', copy: 'Create from scratch with explicit role requirements.' },
-            { title: 'Generate with AI', copy: 'Draft responsibilities, score rubric, and interview loop from prompt.' },
-          ].map((option) => (
-            <Card key={option.title} className="rounded-[16px] border border-[#e2e8f0] hover:border-[#cbd5e1] shadow-sm hover:shadow-[0_6px_18px_rgba(0,0,0,0.05)] transition-all cursor-pointer">
-              <CardContent className="p-5">
-                <div className="text-[14px] font-sans font-semibold text-[#1e293b]">{option.title}</div>
-                <div className="text-[12px] font-sans text-[#64748b] mt-2 leading-relaxed">{option.copy}</div>
-                <Button variant="outline" className="mt-4 h-8 rounded-full border-[#cbd5e1] text-[12px]">Choose</Button>
-              </CardContent>
-            </Card>
-          ))}
-        </div>
+  const synthesizeFromUploadedPdf = async (file: File) => {
+    if (file.type !== 'application/pdf') {
+      return;
+    }
 
-        <Card className="rounded-[16px] border border-[#e2e8f0] shadow-sm">
-          <CardContent className="p-5 grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-heading mb-2">Role title</div>
-              <Input placeholder="e.g. Senior Product Designer" className="h-10 border-[#cbd5e1]" />
-            </div>
-            <div>
-              <div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-heading mb-2">Hiring owner</div>
-              <Input placeholder="e.g. Founder Hiring Pod" className="h-10 border-[#cbd5e1]" />
-            </div>
-            <div>
-              <div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-heading mb-2">Team</div>
-              <Input placeholder="Design / Product / Engineering" className="h-10 border-[#cbd5e1]" />
-            </div>
-            <div>
-              <div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-heading mb-2">Level</div>
-              <Input placeholder="Senior / Staff / Founding" className="h-10 border-[#cbd5e1]" />
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-    );
-  }
+    setIsDragging(false);
+    setShowDraftBuilder(false);
+    setIsParsing(true);
+    setIsParsed(false);
+    setJdSynthesis(null);
+    setUploadedFileName(file.name);
+    setIsStep3PanelOpen(true);
 
-  if (jobCandidatesMatch && currentJob) {
-    const rows = jobCandidates.filter((candidate) => candidate.jobSlug === currentJob.slug);
-    return (
-      <div className="flex flex-col gap-5 max-w-[980px] w-full mx-auto pb-10">
-        <div className="flex items-center justify-between border-b border-[#e2e8f0] pb-4">
-          <div>
-            <div className="text-[20px] font-heading font-medium text-[#1e293b]">{currentJob.title} Candidates</div>
-            <div className="text-[13px] font-sans text-[#64748b]">Manage per-candidate transitions and interview follow-ups.</div>
-          </div>
-          <Button variant="outline" className="h-8 rounded-full border-[#cbd5e1] text-[12px]" onClick={() => router.push(`/jobs/${currentJob.slug}`)}>
-            Back to Job
-          </Button>
-        </div>
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('jobTitle', jobTitle);
+      formData.append('jobDepartment', jobDept);
 
-        <Card className="rounded-[16px] border border-[#e2e8f0] shadow-sm overflow-hidden">
-          <div className="grid grid-cols-12 gap-3 px-5 py-3 bg-[#f8fafc] border-b border-[#e2e8f0] text-[11px] uppercase tracking-wider font-heading text-[#64748b]">
-            <div className="col-span-4">Candidate</div>
-            <div className="col-span-2">Stage</div>
-            <div className="col-span-2 text-right">Score</div>
-            <div className="col-span-2">Next</div>
-            <div className="col-span-2 text-right">Action</div>
-          </div>
-          {rows.map((row) => (
-            <div key={row.id} className="grid grid-cols-12 gap-3 px-5 py-3 border-b border-[#f1f5f9] items-center hover:bg-[#fdfdfd]">
-              <div className="col-span-4 text-[13px] font-sans font-medium text-[#1e293b]">{row.name}</div>
-              <div className="col-span-2 text-[12px] font-sans text-[#64748b]">{row.stage.replace('_', ' ')}</div>
-              <div className="col-span-2 text-right text-[13px] font-sans text-[#0f172a]">{row.score}</div>
-              <div className="col-span-2 text-[12px] font-sans text-[#64748b] truncate">{row.next}</div>
-              <div className="col-span-2 flex justify-end">
-                <Button size="sm" variant="outline" className="h-7 rounded-full border-[#cbd5e1] text-[11px]" onClick={() => router.push(`/candidates/${row.id}`)}>
-                  Open
-                </Button>
-              </div>
-            </div>
-          ))}
-        </Card>
-      </div>
-    );
-  }
+      const response = await fetch('/api/onboarding/jd-synthesize', {
+        method: 'POST',
+        body: formData,
+      });
+
+      const payload = (await response.json()) as JdSynthesisResponse;
+      if (!response.ok || !payload.synthesis) {
+        throw new Error(payload.message ?? 'Failed to parse job description.');
+      }
+
+      applySynthesizedTemplate(payload.synthesis);
+    } catch {
+      setIsParsed(false);
+      setJdSynthesis(null);
+    } finally {
+      setIsParsing(false);
+    }
+  };
+
+  const synthesizeDraftWithAi = async () => {
+    setIsStep3PanelOpen(true);
+    setIsParsing(true);
+    setIsParsed(false);
+    setJdSynthesis(null);
+    setUploadedFileName('AI generated draft');
+
+    try {
+      const response = await fetch('/api/onboarding/jd-synthesize', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          mode: 'draft',
+          jobTitle,
+          jobDepartment: jobDept,
+          ...draftForm,
+        }),
+      });
+
+      const payload = (await response.json()) as JdSynthesisResponse;
+      if (!response.ok || !payload.synthesis) {
+        throw new Error(payload.message ?? 'Failed to generate job description draft.');
+      }
+
+      applySynthesizedTemplate(payload.synthesis);
+    } catch {
+      const fallbackTitle = jobTitle.trim() || 'New Role';
+      const fallbackDept = jobDept.trim() || 'General';
+      const fallbackSummary = jobDescription.trim() || `Help us hire a ${fallbackTitle} for the ${fallbackDept} team.`;
+      applySynthesizedTemplate({
+        title: fallbackTitle,
+        department: fallbackDept,
+        employmentType: draftForm.employmentType || 'Full-time',
+        location: draftForm.locationPolicy || 'Flexible',
+        compensation: draftForm.compensationRange || 'Compensation details to be finalized.',
+        roleSummary: fallbackSummary,
+        responsibilities: draftForm.coreResponsibilities
+          ? draftForm.coreResponsibilities.split(',').map((value) => value.trim()).filter(Boolean)
+          : ['Lead delivery for this role with measurable outcomes.'],
+        requirements: draftForm.mustHaveRequirements
+          ? draftForm.mustHaveRequirements.split(',').map((value) => value.trim()).filter(Boolean)
+          : ['Relevant experience aligned with the position.'],
+        preferredQualifications: draftForm.preferredRequirements
+          ? draftForm.preferredRequirements.split(',').map((value) => value.trim()).filter(Boolean)
+          : ['Cross-functional collaboration and ownership mindset.'],
+        benefits: draftForm.benefits
+          ? draftForm.benefits.split(',').map((value) => value.trim()).filter(Boolean)
+          : ['Comprehensive benefits package.'],
+        hiringSignals: ['Strong communication', 'Bias for execution'],
+      });
+    } finally {
+      setIsParsing(false);
+    }
+  };
+
+  const handleUploadClick = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleFileInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    void synthesizeFromUploadedPdf(file);
+    event.target.value = '';
+  };
+
+  const handleDrop = (event: React.DragEvent) => {
+    event.preventDefault();
+    const file = event.dataTransfer.files?.[0];
+    if (!file) {
+      setIsDragging(false);
+      return;
+    }
+
+    void synthesizeFromUploadedPdf(file);
+  };
+
+  const handleDraftFieldChange = (field: keyof DraftJdFormState, value: string) => {
+    setDraftForm((prev) => ({ ...prev, [field]: value }));
+  };
+
+  const handleCreateJob = () => {
+    if (!jobTitle.trim()) return;
+
+    const baseSlug = slugifyJobTitle(jobTitle);
+    const existingSlugs = new Set(jobs.map((job) => job.slug));
+    let slug = baseSlug;
+    let suffix = 2;
+    while (!slug || existingSlugs.has(slug)) {
+      slug = `${baseSlug || 'job'}-${suffix}`;
+      suffix += 1;
+    }
+
+    const newJob: JobRecord = {
+      id: `job_new_${Date.now()}`,
+      slug,
+      title: jobTitle.trim(),
+      team: jobDept.trim() || 'Engineering',
+      openedAt: 'Opened just now',
+      status: 'draft',
+      statusClass: 'bg-[#f8fafc] text-[#475569] border-[#e2e8f0]',
+      applied: 0,
+      reviewed: 0,
+      interviewed: 0,
+      manager: 'You',
+      description: jobDescription.trim(),
+      jdSynthesis,
+      offerTemplate: buildDefaultOfferTemplate(jobTitle.trim(), jobDept.trim() || 'Engineering'),
+    };
+
+    setJobs((prev) => [newJob, ...prev]);
+    setShowNewJobModal(false);
+    setJobTitle('');
+    setJobDept('');
+    setJobDescription('');
+    setIsParsed(false);
+    setJdSynthesis(null);
+    setUploadedFileName(null);
+    setIsStep3PanelOpen(false);
+    setShowDraftBuilder(false);
+    setDraftForm(INITIAL_DRAFT_JD_FORM);
+    router.push(`/jobs/${slug}`);
+  };
 
   if (jobMatch && currentJob) {
-    const recentCandidates = jobCandidates.filter((candidate) => candidate.jobSlug === currentJob.slug).slice(0, 3);
+    const parsedJdTemplate = currentJob.jdSynthesis ?? buildDefaultJdTemplate(currentJob);
+    const topCandidates = (
+      {
+        'senior-product-designer': ['Aisha Patel', 'Neel Shah', 'Maya Chen'],
+        'staff-ml-engineer': ['Ravi Menon', 'Elena Park', 'Jonas Li'],
+        'founding-product-manager': ['Priya Rao', 'Arjun Mehta', 'Sofia Kim'],
+        'frontend-lead': ['Lina George', 'Kabir Nair', 'Noah Davis'],
+      } as Record<string, string[]>
+    )[currentJob.slug] ?? ['Candidate 1', 'Candidate 2', 'Candidate 3'];
+    const topCandidate = topCandidates[0] ?? 'Candidate 1';
+    const updateCurrentJobJdTemplate = (updater: (template: JdSynthesisTemplate) => JdSynthesisTemplate) => {
+      setJobs((prev) =>
+        prev.map((job) =>
+          job.slug === currentJob.slug
+            ? { ...job, jdSynthesis: updater(job.jdSynthesis ?? buildDefaultJdTemplate(job)) }
+            : job,
+        ),
+      );
+    };
+
     return (
-      <div className="flex flex-col gap-5 max-w-[980px] w-full mx-auto pb-10">
+      <div className="flex flex-col gap-5 max-w-[1020px] w-full mx-auto pb-10">
         <div className="flex items-center justify-between border-b border-[#e2e8f0] pb-4">
           <div>
             <div className="text-[20px] font-heading font-medium text-[#1e293b]">{currentJob.title}</div>
             <div className="text-[13px] font-sans text-[#64748b]">{currentJob.team} · {currentJob.manager} · {currentJob.openedAt}</div>
           </div>
           <div className="flex items-center gap-2">
-            <Button variant="outline" className="h-8 rounded-full border-[#cbd5e1] text-[12px]" onClick={() => router.push(`/jobs/${currentJob.slug}/candidates`)}>
+            <Button variant="outline" className="h-8 rounded-full border-[#cbd5e1] text-[12px]" onClick={() => router.push(`/candidates?job=${currentJob.slug}`)}>
               Candidates
             </Button>
-            <Button className="h-8 rounded-full bg-[#e18131] hover:bg-[#c76922] text-white text-[12px]">Open Pipeline</Button>
+            <Button variant="outline" className="h-8 rounded-full border-[#cbd5e1] text-[12px]" onClick={() => router.push('/jobs')}>
+              Back to Jobs
+            </Button>
           </div>
         </div>
 
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-heading">Applied</div><div className="text-[26px] font-sans text-[#0f172a] mt-1">{currentJob.applied}</div></CardContent></Card>
-          <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-heading">Reviewed</div><div className="text-[26px] font-sans text-[#0f172a] mt-1">{currentJob.reviewed}</div></CardContent></Card>
-          <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-heading">Interviewed</div><div className="text-[26px] font-sans text-[#0f172a] mt-1">{currentJob.interviewed}</div></CardContent></Card>
-          <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-heading">Status</div><Badge className={cn('mt-2 text-[10px] uppercase border shadow-none', currentJob.statusClass)}>{currentJob.status}</Badge></CardContent></Card>
+          <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Applied</div><div className="text-[26px] font-sans text-[#0f172a] mt-1">{currentJob.applied}</div></CardContent></Card>
+          <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Reviewed</div><div className="text-[26px] font-sans text-[#0f172a] mt-1">{currentJob.reviewed}</div></CardContent></Card>
+          <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Interviewed</div><div className="text-[26px] font-sans text-[#0f172a] mt-1">{currentJob.interviewed}</div></CardContent></Card>
+          <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Status</div><Badge className={cn('mt-2 text-[10px] uppercase border shadow-none', currentJob.statusClass)}>{currentJob.status}</Badge></CardContent></Card>
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          <Card className="rounded-[16px] border border-[#e2e8f0] shadow-sm lg:col-span-2">
-            <CardContent className="p-5">
-              <div className="text-[13px] font-sans font-semibold text-[#1e293b] mb-3">Latest Candidates</div>
-              <div className="space-y-2">
-                {recentCandidates.map((candidate) => (
-                  <div key={candidate.id} className="flex items-center justify-between rounded-[10px] border border-[#e2e8f0] px-3 py-2.5 hover:bg-[#f8fafc] cursor-pointer" onClick={() => router.push(`/candidates/${candidate.id}`)}>
-                    <div>
-                      <div className="text-[13px] font-sans font-medium text-[#1e293b]">{candidate.name}</div>
-                      <div className="text-[11px] font-sans text-[#64748b]">{candidate.stage.replace('_', ' ')}</div>
-                    </div>
-                    <Badge className="text-[10px] bg-[#f8fafc] text-[#475569] border border-[#e2e8f0] shadow-none">score {candidate.score}</Badge>
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 items-start">
+          <Card className="rounded-[16px] border border-[#e2e8f0] shadow-sm lg:col-span-2 h-[328px] overflow-hidden">
+            <CardContent className="p-5 h-full flex flex-col">
+              <div className="flex items-center justify-between mb-4 border-b border-[#e2e8f0] pb-4">
+                <div className="text-[14px] font-sans font-semibold text-[#1e293b]">Job Function & JD Parsed</div>
+                <div className="flex items-center gap-2">
+                  <Badge className="bg-[#f0fdf4] text-[#166534] border border-[#bbf7d0] hover:bg-[#f0fdf4] shadow-none text-[10px] font-medium"><HugeIcon icon={File01Icon} size={12} className="mr-1" /> Synthesized Profile</Badge>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 text-[11px] rounded-full border-[#cbd5e1]"
+                    onClick={() => setIsEditingJdTemplate((prev) => !prev)}
+                  >
+                    {isEditingJdTemplate ? 'Done' : 'Edit JD'}
+                  </Button>
+                </div>
+              </div>
+
+              <div className="bg-[#f8fafc] border border-[#e2e8f0] rounded-[12px] p-6 font-serif flex-1 overflow-y-auto">
+                <div className="text-[18px] font-semibold text-[#0f172a] mb-2">{parsedJdTemplate.title} Job Brief</div>
+                <div className="text-[12px] text-[#64748b] font-sans mb-6">Parsed and normalized by Dispatch Agent</div>
+
+                <div className="w-full h-px bg-[#e2e8f0] my-4" />
+
+                <div className="mb-4">
+                  <div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-sans font-bold mb-1">Role Summary</div>
+                  {isEditingJdTemplate ? (
+                    <textarea
+                      value={parsedJdTemplate.roleSummary}
+                      onChange={(event) => {
+                        const value = event.target.value;
+                        updateCurrentJobJdTemplate((template) => ({ ...template, roleSummary: value }));
+                      }}
+                      className="w-full min-h-[90px] rounded-[10px] border border-[#dbe4ef] px-3 py-2 text-[13px] text-[#334155] font-sans focus:outline-none focus:ring-1 focus:ring-[#0f172a]"
+                    />
+                  ) : (
+                    <div className="text-[14px] text-[#334155] whitespace-pre-wrap">{parsedJdTemplate.roleSummary}</div>
+                  )}
+                </div>
+
+                <div className="mb-4">
+                  <div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-sans font-bold mb-1">Responsibilities</div>
+                  {isEditingJdTemplate ? (
+                    <textarea
+                      value={parsedJdTemplate.responsibilities.join('\n')}
+                      onChange={(event) => {
+                        const value = event.target.value
+                          .split('\n')
+                          .map((item) => item.trim())
+                          .filter(Boolean);
+                        updateCurrentJobJdTemplate((template) => ({
+                          ...template,
+                          responsibilities: value.length > 0 ? value : ['Not specified'],
+                        }));
+                      }}
+                      className="w-full min-h-[110px] rounded-[10px] border border-[#dbe4ef] px-3 py-2 text-[13px] text-[#334155] font-sans focus:outline-none focus:ring-1 focus:ring-[#0f172a]"
+                    />
+                  ) : (
+                    <div className="text-[14px] text-[#334155] whitespace-pre-wrap">{parsedJdTemplate.responsibilities.join('\n')}</div>
+                  )}
+                </div>
+
+                <div className="w-full h-px bg-[#e2e8f0] my-4" />
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+                  <div>
+                    <div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-sans font-bold mb-1">Department</div>
+                    {isEditingJdTemplate ? (
+                      <Input
+                        value={parsedJdTemplate.department}
+                        onChange={(event) => {
+                          const value = event.target.value;
+                          updateCurrentJobJdTemplate((template) => ({ ...template, department: value }));
+                        }}
+                        className="h-9 border-[#dbe4ef] text-[13px]"
+                      />
+                    ) : (
+                      <div className="text-[14px] text-[#334155]">{parsedJdTemplate.department}</div>
+                    )}
                   </div>
-                ))}
+                  <div>
+                    <div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-sans font-bold mb-1">Employment Type</div>
+                    {isEditingJdTemplate ? (
+                      <Input
+                        value={parsedJdTemplate.employmentType}
+                        onChange={(event) => {
+                          const value = event.target.value;
+                          updateCurrentJobJdTemplate((template) => ({ ...template, employmentType: value }));
+                        }}
+                        className="h-9 border-[#dbe4ef] text-[13px]"
+                      />
+                    ) : (
+                      <div className="text-[14px] text-[#334155]">{parsedJdTemplate.employmentType}</div>
+                    )}
+                  </div>
+                  <div>
+                    <div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-sans font-bold mb-1">Location</div>
+                    {isEditingJdTemplate ? (
+                      <Input
+                        value={parsedJdTemplate.location}
+                        onChange={(event) => {
+                          const value = event.target.value;
+                          updateCurrentJobJdTemplate((template) => ({ ...template, location: value }));
+                        }}
+                        className="h-9 border-[#dbe4ef] text-[13px]"
+                      />
+                    ) : (
+                      <div className="text-[14px] text-[#334155]">{parsedJdTemplate.location}</div>
+                    )}
+                  </div>
+                  <div>
+                    <div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-sans font-bold mb-1">Compensation</div>
+                    {isEditingJdTemplate ? (
+                      <Input
+                        value={parsedJdTemplate.compensation}
+                        onChange={(event) => {
+                          const value = event.target.value;
+                          updateCurrentJobJdTemplate((template) => ({ ...template, compensation: value }));
+                        }}
+                        className="h-9 border-[#dbe4ef] text-[13px]"
+                      />
+                    ) : (
+                      <div className="text-[14px] text-[#334155]">{parsedJdTemplate.compensation}</div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="w-full h-px bg-[#e2e8f0] my-4" />
+
+                <div className="mb-4">
+                  <div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-sans font-bold mb-1">Requirements</div>
+                  {isEditingJdTemplate ? (
+                    <textarea
+                      value={parsedJdTemplate.requirements.join('\n')}
+                      onChange={(event) => {
+                        const value = event.target.value
+                          .split('\n')
+                          .map((item) => item.trim())
+                          .filter(Boolean);
+                        updateCurrentJobJdTemplate((template) => ({
+                          ...template,
+                          requirements: value.length > 0 ? value : ['Not specified'],
+                        }));
+                      }}
+                      className="w-full min-h-[90px] rounded-[10px] border border-[#dbe4ef] px-3 py-2 text-[13px] text-[#334155] font-sans focus:outline-none focus:ring-1 focus:ring-[#0f172a]"
+                    />
+                  ) : (
+                    <div className="text-[14px] text-[#334155] whitespace-pre-wrap">{parsedJdTemplate.requirements.join('\n')}</div>
+                  )}
+                </div>
+
+                <div className="mb-4">
+                  <div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-sans font-bold mb-1">Preferred Qualifications</div>
+                  {isEditingJdTemplate ? (
+                    <textarea
+                      value={parsedJdTemplate.preferredQualifications.join('\n')}
+                      onChange={(event) => {
+                        const value = event.target.value
+                          .split('\n')
+                          .map((item) => item.trim())
+                          .filter(Boolean);
+                        updateCurrentJobJdTemplate((template) => ({
+                          ...template,
+                          preferredQualifications: value.length > 0 ? value : ['Not specified'],
+                        }));
+                      }}
+                      className="w-full min-h-[90px] rounded-[10px] border border-[#dbe4ef] px-3 py-2 text-[13px] text-[#334155] font-sans focus:outline-none focus:ring-1 focus:ring-[#0f172a]"
+                    />
+                  ) : (
+                    <div className="text-[14px] text-[#334155] whitespace-pre-wrap">{parsedJdTemplate.preferredQualifications.join('\n')}</div>
+                  )}
+                </div>
+
+                <div className="mb-4">
+                  <div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-sans font-bold mb-1">Benefits</div>
+                  {isEditingJdTemplate ? (
+                    <textarea
+                      value={parsedJdTemplate.benefits.join('\n')}
+                      onChange={(event) => {
+                        const value = event.target.value
+                          .split('\n')
+                          .map((item) => item.trim())
+                          .filter(Boolean);
+                        updateCurrentJobJdTemplate((template) => ({
+                          ...template,
+                          benefits: value.length > 0 ? value : ['Not specified'],
+                        }));
+                      }}
+                      className="w-full min-h-[90px] rounded-[10px] border border-[#dbe4ef] px-3 py-2 text-[13px] text-[#334155] font-sans focus:outline-none focus:ring-1 focus:ring-[#0f172a]"
+                    />
+                  ) : (
+                    <div className="text-[14px] text-[#334155] whitespace-pre-wrap">{parsedJdTemplate.benefits.join('\n')}</div>
+                  )}
+                </div>
+
+                <div>
+                  <div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-sans font-bold mb-1">Hiring Signals</div>
+                  {isEditingJdTemplate ? (
+                    <textarea
+                      value={parsedJdTemplate.hiringSignals.join('\n')}
+                      onChange={(event) => {
+                        const value = event.target.value
+                          .split('\n')
+                          .map((item) => item.trim())
+                          .filter(Boolean);
+                        updateCurrentJobJdTemplate((template) => ({
+                          ...template,
+                          hiringSignals: value.length > 0 ? value : ['Not specified'],
+                        }));
+                      }}
+                      className="w-full min-h-[90px] rounded-[10px] border border-[#dbe4ef] px-3 py-2 text-[13px] text-[#334155] font-sans focus:outline-none focus:ring-1 focus:ring-[#0f172a]"
+                    />
+                  ) : (
+                    <div className="text-[14px] text-[#334155] whitespace-pre-wrap">{parsedJdTemplate.hiringSignals.join('\n')}</div>
+                  )}
+                </div>
               </div>
             </CardContent>
           </Card>
-          <Card className="rounded-[16px] border border-[#e2e8f0] shadow-sm">
+
+          <Card className="rounded-[16px] border border-[#e2e8f0] shadow-sm h-[328px]">
             <CardContent className="p-5">
-              <div className="text-[13px] font-sans font-semibold text-[#1e293b] mb-3">Interview This Week</div>
-              <div className="space-y-2 text-[12px] font-sans text-[#64748b]">
-                <div className="rounded-[10px] border border-[#e2e8f0] p-2.5">Mon 3:30 PM · Marco Lin</div>
-                <div className="rounded-[10px] border border-[#e2e8f0] p-2.5">Tue 11:00 AM · Riya Patel</div>
-                <div className="rounded-[10px] border border-[#e2e8f0] p-2.5">Thu 2:00 PM · Ibrahim Noor</div>
+              <div className="flex flex-col gap-3">
+                <div className="px-1">
+                  <div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-heading">Top candidate</div>
+                  <button
+                    type="button"
+                    onClick={() => router.push(`/candidates?job=${currentJob.slug}`)}
+                    className="mt-1 text-left text-[14px] text-[#1e293b] font-medium hover:text-[#0f172a] underline-offset-2 hover:underline"
+                  >
+                    {topCandidate}
+                  </button>
+                </div>
+
+                <Button variant="outline" className="h-8 rounded-full border-[#cbd5e1] text-[12px]" onClick={() => router.push(`/candidates?job=${currentJob.slug}`)}>View All Filtered Candidates</Button>
+
+                <div className="h-px bg-[#e2e8f0]" />
+
+                <Button variant="outline" className="h-8 rounded-full border-[#fecaca] text-[#b91c1c] hover:bg-[#fef2f2] text-[12px]">Delete Role</Button>
+                <Button variant="outline" className="h-8 rounded-full border-[#fcd34d] text-[#92400e] hover:bg-[#fffbeb] text-[12px]">Pause Hiring</Button>
+                <Button variant="outline" className="h-8 rounded-full border-[#bbf7d0] text-[#166534] hover:bg-[#f0fdf4] text-[12px]">Mark as Done</Button>
               </div>
             </CardContent>
           </Card>
         </div>
+
+        <Card className="rounded-[16px] border border-[#e2e8f0] shadow-sm">
+          <CardContent className="p-5">
+            <div className="flex items-center justify-between mb-4 border-b border-[#e2e8f0] pb-4">
+              <div className="text-[14px] font-sans font-semibold text-[#1e293b]">Offer Letter Configuration</div>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 text-[11px] rounded-full border-[#cbd5e1]"
+                onClick={() => setIsEditingOfferTemplate((prev) => !prev)}
+              >
+                {isEditingOfferTemplate ? 'Done' : 'Edit Template'}
+              </Button>
+            </div>
+            
+            <div className="bg-[#f8fafc] border border-[#e2e8f0] rounded-[12px] p-6 font-serif">
+              <div className="text-[18px] font-semibold text-[#0f172a] mb-2">{currentJob.title} Offer Agreement</div>
+              <div className="text-[12px] text-[#64748b] font-sans mb-6">Generated by Dispatch Agent</div>
+              
+              <div className="w-full h-px bg-[#e2e8f0] my-4" />
+              
+              <div className="mb-4">
+                <div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-sans font-bold mb-1">Compensation</div>
+                {isEditingOfferTemplate ? (
+                  <textarea
+                    value={currentJob.offerTemplate.compensation}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      setJobs((prev) =>
+                        prev.map((job) =>
+                          job.slug === currentJob.slug
+                            ? { ...job, offerTemplate: { ...job.offerTemplate, compensation: value } }
+                            : job,
+                        ),
+                      );
+                    }}
+                    className="w-full min-h-[76px] rounded-[10px] border border-[#dbe4ef] px-3 py-2 text-[13px] text-[#334155] font-sans focus:outline-none focus:ring-1 focus:ring-[#0f172a]"
+                  />
+                ) : (
+                  <div className="text-[14px] text-[#334155] whitespace-pre-wrap">{currentJob.offerTemplate.compensation}</div>
+                )}
+              </div>
+
+              <div className="mb-4">
+                <div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-sans font-bold mb-1">Requirements</div>
+                {isEditingOfferTemplate ? (
+                  <textarea
+                    value={currentJob.offerTemplate.requirements}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      setJobs((prev) =>
+                        prev.map((job) =>
+                          job.slug === currentJob.slug
+                            ? { ...job, offerTemplate: { ...job.offerTemplate, requirements: value } }
+                            : job,
+                        ),
+                      );
+                    }}
+                    className="w-full min-h-[76px] rounded-[10px] border border-[#dbe4ef] px-3 py-2 text-[13px] text-[#334155] font-sans focus:outline-none focus:ring-1 focus:ring-[#0f172a]"
+                  />
+                ) : (
+                  <div className="text-[14px] text-[#334155] whitespace-pre-wrap">{currentJob.offerTemplate.requirements}</div>
+                )}
+              </div>
+
+              <div className="w-full h-px bg-[#e2e8f0] my-4" />
+
+              <div className="mb-4">
+                <div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-sans font-bold mb-1">Location</div>
+                {isEditingOfferTemplate ? (
+                  <textarea
+                    value={currentJob.offerTemplate.location}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      setJobs((prev) =>
+                        prev.map((job) =>
+                          job.slug === currentJob.slug
+                            ? { ...job, offerTemplate: { ...job.offerTemplate, location: value } }
+                            : job,
+                        ),
+                      );
+                    }}
+                    className="w-full min-h-[60px] rounded-[10px] border border-[#dbe4ef] px-3 py-2 text-[13px] text-[#334155] font-sans focus:outline-none focus:ring-1 focus:ring-[#0f172a]"
+                  />
+                ) : (
+                  <div className="text-[14px] text-[#334155] whitespace-pre-wrap">{currentJob.offerTemplate.location}</div>
+                )}
+              </div>
+
+              <div className="mb-4">
+                <div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-sans font-bold mb-1">Start Date</div>
+                {isEditingOfferTemplate ? (
+                  <textarea
+                    value={currentJob.offerTemplate.startDate}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      setJobs((prev) =>
+                        prev.map((job) =>
+                          job.slug === currentJob.slug
+                            ? { ...job, offerTemplate: { ...job.offerTemplate, startDate: value } }
+                            : job,
+                        ),
+                      );
+                    }}
+                    className="w-full min-h-[54px] rounded-[10px] border border-[#dbe4ef] px-3 py-2 text-[13px] text-[#334155] font-sans focus:outline-none focus:ring-1 focus:ring-[#0f172a]"
+                  />
+                ) : (
+                  <div className="text-[14px] text-[#334155] whitespace-pre-wrap">{currentJob.offerTemplate.startDate}</div>
+                )}
+              </div>
+
+              <div>
+                <div className="text-[11px] uppercase tracking-wider text-[#94a3b8] font-sans font-bold mb-1">Additional Terms</div>
+                {isEditingOfferTemplate ? (
+                  <textarea
+                    value={currentJob.offerTemplate.additionalTerms}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      setJobs((prev) =>
+                        prev.map((job) =>
+                          job.slug === currentJob.slug
+                            ? { ...job, offerTemplate: { ...job.offerTemplate, additionalTerms: value } }
+                            : job,
+                        ),
+                      );
+                    }}
+                    className="w-full min-h-[72px] rounded-[10px] border border-[#dbe4ef] px-3 py-2 text-[13px] text-[#334155] font-sans focus:outline-none focus:ring-1 focus:ring-[#0f172a]"
+                  />
+                ) : (
+                  <div className="text-[14px] text-[#334155] whitespace-pre-wrap">{currentJob.offerTemplate.additionalTerms}</div>
+                )}
+              </div>
+            </div>
+          </CardContent>
+        </Card>
       </div>
     );
   }
@@ -3013,7 +3691,7 @@ function JobsScreen() {
         </div>
         <div className="flex items-center gap-2">
           <Button variant="outline" className="h-8 rounded-full border-[#cbd5e1] text-[12px]" onClick={() => router.push('/pipeline')}>Open Pipeline</Button>
-          <Button className="h-8 rounded-full bg-[#e18131] hover:bg-[#c76922] text-white text-[12px]" onClick={() => router.push('/jobs/new')}>
+          <Button className="h-8 rounded-full bg-[#e18131] hover:bg-[#c76922] text-white text-[12px]" onClick={() => setShowNewJobModal(true)}>
             <Plus size={13} className="mr-1.5" /> New Job
           </Button>
         </div>
@@ -3071,7 +3749,7 @@ function JobsScreen() {
                 </div>
                 <div className="flex items-center gap-2">
                   <Badge className={cn('text-[10px] uppercase border shadow-none', job.statusClass)}>{job.status}</Badge>
-                  <Button size="sm" variant="outline" className="h-7 rounded-full border-[#cbd5e1] text-[11px]" onClick={() => router.push(`/jobs/${job.slug}/candidates`)}>Candidates</Button>
+                  <Button size="sm" variant="outline" className="h-7 rounded-full border-[#cbd5e1] text-[11px]" onClick={() => router.push(`/candidates?job=${job.slug}`)}>Candidates</Button>
                   <Button size="sm" variant="outline" className="h-7 rounded-full border-[#cbd5e1] text-[11px]" onClick={() => router.push(`/jobs/${job.slug}`)}>Open</Button>
                 </div>
               </div>
@@ -3096,15 +3774,308 @@ function JobsScreen() {
           </div>
         </CardContent>
       </Card>
+
+      <Dialog open={showNewJobModal} onOpenChange={setShowNewJobModal}>
+        <DialogContent className="max-w-[760px] w-[94vw] p-0 rounded-[28px] max-h-[92vh] overflow-hidden border-[#e2e8f0] font-sans bg-white shadow-[0_24px_70px_-20px_rgba(15,23,42,0.22)] outline-none focus:outline-none">
+          <VisuallyHidden><DialogTitle>New Job Configuration</DialogTitle></VisuallyHidden>
+          <div className="flex flex-col">
+            <div className="bg-[#fafafa] p-7 sm:p-8 rounded-[28px] shadow-none relative overflow-y-auto max-h-[92vh]">
+              <div className="absolute inset-x-0 top-0 h-[180px] pointer-events-none bg-[radial-gradient(circle_at_top_left,rgba(225,129,49,0.08),transparent_58%)]" />
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="application/pdf"
+                className="hidden"
+                onChange={handleFileInputChange}
+              />
+
+              <div className="relative z-10 mb-5">
+                <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-white border border-[#e2e8f0] text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading mb-3">Role setup</div>
+                <div className="text-[26px] font-heading font-medium text-[#1e293b] leading-tight">Open a requisition</div>
+                <div className="text-[14px] font-sans text-[#64748b] mt-1">Use the same onboarding flow: define the role, synthesize a JD, then create the job. Offer letter can be configured from the job sub-page.</div>
+              </div>
+
+              <div className="relative z-10 rounded-[24px] border border-[#e2e8f0] bg-white p-5 sm:p-6 space-y-5 shadow-[0_8px_24px_rgba(15,23,42,0.04)]">
+              <div className="relative">
+                <label className="block text-[12px] font-sans font-medium text-[#64748b] mb-2 px-1">Job Title</label>
+                <Input 
+                  value={jobTitle}
+                  onChange={e => { setJobTitle(e.target.value); setShowTitleOptions(true); }}
+                  onFocus={() => setShowTitleOptions(true)}
+                  onBlur={() => setTimeout(() => setShowTitleOptions(false), 200)}
+                  placeholder="e.g. Senior Product Designer"
+                  className="h-[56px] rounded-[16px] text-[16px] border-[#e2e8f0] focus-visible:ring-[#0f172a]"
+                />
+                {showTitleOptions && jobTitle.length > 0 && !JOB_TITLES.includes(jobTitle) && (
+                  <div className="absolute top-[82px] left-0 w-full bg-white border border-[#e2e8f0] rounded-[14px] shadow-lg overflow-hidden z-20">
+                    {JOB_TITLES.filter(t => t.toLowerCase().includes(jobTitle.toLowerCase())).map(t => (
+                      <div key={t} className="px-4 py-3 text-[14px] hover:bg-[#f8fafc] cursor-pointer" onClick={() => setJobTitle(t)}>
+                        {t}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="relative">
+                <label className="block text-[12px] font-sans font-medium text-[#64748b] mb-2 px-1">Department</label>
+                <Input 
+                  value={jobDept}
+                  onChange={e => { setJobDept(e.target.value); setShowDeptOptions(true); }}
+                  onFocus={() => setShowDeptOptions(true)}
+                  onBlur={() => setTimeout(() => setShowDeptOptions(false), 200)}
+                  placeholder="e.g. Platform Engineering"
+                  className="h-[56px] rounded-[16px] text-[16px] border-[#e2e8f0] focus-visible:ring-[#0f172a]"
+                />
+                {showDeptOptions && (
+                  <div className="absolute top-[82px] left-0 w-full bg-white border border-[#e2e8f0] rounded-[14px] shadow-lg overflow-hidden z-20">
+                    {DEPTS.filter(d => d.toLowerCase().includes(jobDept.toLowerCase())).map(d => (
+                      <div key={d} className="px-4 py-3 text-[14px] hover:bg-[#f8fafc] cursor-pointer" onClick={() => setJobDept(d)}>
+                        {d}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <label className="block text-[12px] font-sans font-medium text-[#64748b] mb-2 px-1">Job Description (Optional)</label>
+                <textarea
+                  value={jobDescription}
+                  onChange={(event) => setJobDescription(event.target.value)}
+                  placeholder="Describe scope, mission, and what success looks like."
+                  className="w-full min-h-[120px] rounded-[16px] border border-[#e2e8f0] text-[14px] px-4 py-3 text-[#334155] focus:outline-none focus:ring-1 focus:ring-[#0f172a]"
+                />
+              </div>
+
+              <div 
+                className={cn(
+                  "border-2 border-dashed rounded-[20px] transition-all duration-300 flex flex-col items-center justify-center text-center px-4 group relative overflow-hidden",
+                  isDragging ? "bg-[#f8fafc] border-[#e18131] h-[160px]" : "border-[#e2e8f0] hover:border-[#cbd5e1] hover:bg-[#fcfdfe] h-[140px]"
+                )}
+                onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+                onDragLeave={() => setIsDragging(false)}
+                onDrop={handleDrop}
+              >
+                  {isParsing ? (
+                    <div className="flex flex-col items-center animate-pulse gap-3">
+                      <div className="w-12 h-12 rounded-full bg-white flex items-center justify-center shadow-sm">
+                        <HugeIcon icon={SparklesIcon} size={28} className="text-[#e18131] animate-spin-slow" />
+                      </div>
+                      <div className="text-[14px] font-medium text-[#0f172a]">Analyst is parsing document...</div>
+                    </div>
+                  ) : (
+                    <div className="flex flex-col items-center gap-3 relative z-10 transition-transform duration-300 group-hover:scale-[1.02]">
+                      <div className="w-12 h-12 rounded-full bg-white border border-[#f1f5f9] flex items-center justify-center text-[#94a3b8] shadow-sm transition-all duration-300 group-hover:border-[#e18131] group-hover:text-[#e18131]">
+                        <HugeIcon icon={FileUploadIcon} size={22} />
+                      </div>
+                      <div>
+                        <span className="text-[14px] font-semibold text-[#1e293b]">Drop a Job Description PDF</span>
+                        <p className="text-[11px] text-[#94a3b8] mt-0.5">Automagically map titles and duties</p>
+                      </div>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        onClick={handleUploadClick}
+                        className="h-8 rounded-full border border-[#dbe4ef] px-4 text-[11px] font-medium bg-white hover:bg-[#f8fafc] transition-colors"
+                      >
+                        Upload JD PDF
+                      </Button>
+                    </div>
+                  )}
+              </div>
+
+              {isParsed && jdSynthesis && (
+                <div className="px-4 py-3 bg-[#f0fdf4] border border-[#bbf7d0] rounded-[16px] flex items-center gap-3 animate-in zoom-in duration-300">
+                  <div className="w-8 h-8 rounded-full bg-white flex items-center justify-center text-[#10b981] shadow-sm"><HugeIcon icon={File01Icon} size={16} /></div>
+                  <div className="flex-1">
+                    <div className="text-[13px] font-medium text-[#166534]">JD synthesized</div>
+                    <div className="text-[12px] text-[#166534]/80">{uploadedFileName || 'Generated from draft inputs'}</div>
+                  </div>
+                </div>
+              )}
+
+              <div className="flex items-center gap-4 pt-2">
+                <div className="h-px bg-[#f1f5f9] flex-1"></div>
+                <div className="text-[12px] font-medium text-[#94a3b8]">OR</div>
+                <div className="h-px bg-[#f1f5f9] flex-1"></div>
+              </div>
+
+              <div className="flex justify-center">
+                <Button 
+                  variant="ghost"
+                  onClick={() => {
+                    setShowDraftBuilder(true);
+                    setIsStep3ModalOpen(true);
+                  }}
+                  className="gap-2 text-[#64748b] hover:text-[#0f172a] hover:bg-[#f8fafc] rounded-full h-9 px-4 text-[12px] border border-[#e2e8f0] transition-all w-full"
+                >
+                  <HugeIcon icon={SparklesIcon} size={14} className="text-[#e18131]" />
+                  Draft JD with AI
+                </Button>
+              </div>
+
+              <div className="flex flex-col sm:flex-row justify-center gap-2">
+                {jdSynthesis && (
+                  <Button
+                    variant="ghost"
+                    onClick={() => {
+                      setShowDraftBuilder(false);
+                      setIsStep3ModalOpen(true);
+                    }}
+                    disabled={isParsing}
+                    className="rounded-full h-9 px-4 text-[12px] border border-[#e2e8f0]"
+                  >
+                    View synthesized JD
+                  </Button>
+                )}
+              </div>
+
+              </div>
+
+              <Dialog open={isStep3ModalOpen} onOpenChange={setIsStep3ModalOpen}>
+                <DialogContent className="max-w-[880px] w-[95vw] max-h-[90vh] overflow-hidden rounded-[28px] border border-[#e2e8f0] bg-white p-0 shadow-[0_32px_80px_-12px_rgba(15,23,42,0.15)]">
+                  <div className="px-8 py-6 border-b border-[#f1f5f9] bg-[#fafafa]/50 relative">
+                    <div className="absolute top-0 left-0 w-full h-full overflow-hidden pointer-events-none rounded-t-[28px]">
+                      <div className="absolute top-[-50%] left-[-10%] w-[50%] h-[200%] bg-gradient-to-br from-[#e18131]/[0.03] to-transparent rotate-12" />
+                    </div>
+                    <DialogTitle className="text-[20px] font-heading font-semibold text-[#0f172a] leading-tight relative z-10">
+                      {showDraftBuilder ? 'Draft Job Description with AI' : 'Traditional JD Template'}
+                    </DialogTitle>
+                    <div className="text-[14px] text-[#64748b] mt-1.5 font-sans relative z-10">
+                      {showDraftBuilder
+                        ? 'Answer these basics and Kimi K2 will generate a traditional JD template.'
+                        : 'Generated by Kimi K2 from your inputs.'}
+                    </div>
+                  </div>
+
+                  <div className="max-h-[calc(90vh-100px)] overflow-y-auto px-8 py-7 space-y-6">
+                    {showDraftBuilder ? (
+                      <>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
+                          <Input value={draftForm.companyStage} onChange={(e) => handleDraftFieldChange('companyStage', e.target.value)} placeholder="Company stage" className="h-[48px] rounded-[16px] border-[#e2e8f0]" />
+                          <Input value={draftForm.employmentType} onChange={(e) => handleDraftFieldChange('employmentType', e.target.value)} placeholder="Employment type" className="h-[48px] rounded-[16px] border-[#e2e8f0]" />
+                          <Input value={draftForm.locationPolicy} onChange={(e) => handleDraftFieldChange('locationPolicy', e.target.value)} placeholder="Location policy" className="h-[48px] rounded-[16px] border-[#e2e8f0]" />
+                          <Input value={draftForm.compensationRange} onChange={(e) => handleDraftFieldChange('compensationRange', e.target.value)} placeholder="Compensation range" className="h-[48px] rounded-[16px] border-[#e2e8f0]" />
+                        </div>
+
+                        <textarea value={draftForm.mustHaveRequirements} onChange={(e) => handleDraftFieldChange('mustHaveRequirements', e.target.value)} placeholder="Must-have requirements (comma separated)" className="w-full min-h-[84px] rounded-[12px] border border-[#dbe4ef] bg-white px-3 py-2 text-[13px] text-[#334155] focus:outline-none focus:ring-1 focus:ring-[#0f172a]" />
+                        <textarea value={draftForm.preferredRequirements} onChange={(e) => handleDraftFieldChange('preferredRequirements', e.target.value)} placeholder="Preferred requirements (comma separated)" className="w-full min-h-[84px] rounded-[12px] border border-[#dbe4ef] bg-white px-3 py-2 text-[13px] text-[#334155] focus:outline-none focus:ring-1 focus:ring-[#0f172a]" />
+                        <textarea value={draftForm.coreResponsibilities} onChange={(e) => handleDraftFieldChange('coreResponsibilities', e.target.value)} placeholder="Core responsibilities" className="w-full min-h-[84px] rounded-[12px] border border-[#dbe4ef] bg-white px-3 py-2 text-[13px] text-[#334155] focus:outline-none focus:ring-1 focus:ring-[#0f172a]" />
+                        <textarea value={draftForm.niceToHave} onChange={(e) => handleDraftFieldChange('niceToHave', e.target.value)} placeholder="Nice-to-have skills" className="w-full min-h-[84px] rounded-[12px] border border-[#dbe4ef] bg-white px-3 py-2 text-[13px] text-[#334155] focus:outline-none focus:ring-1 focus:ring-[#0f172a]" />
+                        <textarea value={draftForm.benefits} onChange={(e) => handleDraftFieldChange('benefits', e.target.value)} placeholder="Benefits and perks" className="w-full min-h-[84px] rounded-[12px] border border-[#dbe4ef] bg-white px-3 py-2 text-[13px] text-[#334155] focus:outline-none focus:ring-1 focus:ring-[#0f172a]" />
+
+                        <div className="flex items-center gap-3 pt-1">
+                          <Button onClick={() => void synthesizeDraftWithAi()} disabled={isParsing} className="h-10 rounded-full px-5 bg-[#0f172a] hover:bg-[#1e293b] text-white text-[12px]">
+                            {isParsing ? 'Synthesizing...' : 'Generate with Kimi K2'}
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            onClick={() => {
+                              setShowDraftBuilder(false);
+                              if (!jdSynthesis) {
+                                setIsStep3ModalOpen(false);
+                              }
+                            }}
+                            disabled={isParsing}
+                            className="h-10 rounded-full px-4 text-[12px] border border-[#dbe4ef]"
+                          >
+                            Back to upload
+                          </Button>
+                        </div>
+                      </>
+                    ) : jdSynthesis ? (
+                      <>
+                        <div className="rounded-[12px] border border-[#bbf7d0] bg-[#f0fdf4] p-3 flex items-center justify-between gap-3">
+                          <div>
+                            <div className="text-[12px] font-medium text-[#166534]">synthesizing done!</div>
+                            {uploadedFileName && (
+                              <div className="text-[11px] text-[#166534]/80">{uploadedFileName}</div>
+                            )}
+                          </div>
+                          <div className="text-[11px] px-2 py-1 rounded-full border border-[#bbf7d0] bg-white text-[#166534]">Ready</div>
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-[12px]">
+                          <div className="rounded-[12px] border border-[#f1f5f9] p-3"><div className="text-[#94a3b8] mb-1">Role</div><div className="text-[#0f172a] font-medium">{jdSynthesis.title}</div></div>
+                          <div className="rounded-[12px] border border-[#f1f5f9] p-3"><div className="text-[#94a3b8] mb-1">Department</div><div className="text-[#0f172a] font-medium">{jdSynthesis.department}</div></div>
+                          <div className="rounded-[12px] border border-[#f1f5f9] p-3"><div className="text-[#94a3b8] mb-1">Compensation</div><div className="text-[#334155]">{jdSynthesis.compensation}</div></div>
+                          <div className="rounded-[12px] border border-[#f1f5f9] p-3"><div className="text-[#94a3b8] mb-1">Location</div><div className="text-[#334155]">{jdSynthesis.location}</div></div>
+                          <div className="rounded-[12px] border border-[#f1f5f9] p-3 sm:col-span-2"><div className="text-[#94a3b8] mb-1">Employment Type</div><div className="text-[#334155]">{jdSynthesis.employmentType}</div></div>
+                        </div>
+
+                        <div className="rounded-[12px] border border-[#f1f5f9] p-3"><div className="text-[12px] text-[#94a3b8] mb-1">Role Summary</div><p className="text-[13px] text-[#334155] leading-relaxed">{jdSynthesis.roleSummary}</p></div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-[13px] text-[#334155]">
+                          <div className="rounded-[12px] border border-[#f1f5f9] p-3"><div className="text-[12px] text-[#94a3b8] mb-2">Responsibilities</div><ul className="list-disc pl-4 space-y-1">{jdSynthesis.responsibilities.map((item, index) => (<li key={`resp-${index}`}>{item}</li>))}</ul></div>
+                          <div className="rounded-[12px] border border-[#f1f5f9] p-3"><div className="text-[12px] text-[#94a3b8] mb-2">Requirements</div><ul className="list-disc pl-4 space-y-1">{jdSynthesis.requirements.map((item, index) => (<li key={`req-${index}`}>{item}</li>))}</ul></div>
+                          <div className="rounded-[12px] border border-[#f1f5f9] p-3"><div className="text-[12px] text-[#94a3b8] mb-2">Preferred Qualifications</div><ul className="list-disc pl-4 space-y-1">{jdSynthesis.preferredQualifications.map((item, index) => (<li key={`pref-${index}`}>{item}</li>))}</ul></div>
+                          <div className="rounded-[12px] border border-[#f1f5f9] p-3"><div className="text-[12px] text-[#94a3b8] mb-2">Benefits</div><ul className="list-disc pl-4 space-y-1">{jdSynthesis.benefits.map((item, index) => (<li key={`benefit-${index}`}>{item}</li>))}</ul></div>
+                        </div>
+
+                        <div className="rounded-[12px] border border-[#f1f5f9] p-3 text-[13px] text-[#334155]">
+                          <div className="text-[12px] text-[#94a3b8] mb-2">Hiring Signals</div>
+                          <ul className="list-disc pl-4 space-y-1">
+                            {jdSynthesis.hiringSignals.map((item, index) => (
+                              <li key={`signal-${index}`}>{item}</li>
+                            ))}
+                          </ul>
+                        </div>
+
+                        <div className="flex items-center gap-3 pt-1">
+                          <Button
+                            onClick={() => {
+                              setIsStep3ModalOpen(false);
+                              setShowDraftBuilder(false);
+                            }}
+                            className="h-10 rounded-full px-5 bg-[#0f172a] hover:bg-[#1e293b] text-white text-[12px]"
+                          >
+                            Continue
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            onClick={() => setShowDraftBuilder(true)}
+                            className="h-10 rounded-full px-4 text-[12px] border border-[#dbe4ef]"
+                          >
+                            Edit draft inputs
+                          </Button>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="rounded-[12px] border border-[#f1f5f9] p-5 text-[13px] text-[#64748b]">No synthesized JD yet. Upload a PDF or generate with AI first.</div>
+                    )}
+                  </div>
+                </DialogContent>
+              </Dialog>
+              
+              <div className="relative z-10 flex pt-5">
+                <Button
+                  onClick={handleCreateJob}
+                  disabled={!jobTitle.trim() || isParsing}
+                  className="h-12 w-full rounded-full bg-[#e18131] hover:bg-[#c76922] text-white px-7 shadow-[0_8px_20px_rgba(225,129,49,0.35)] text-[14px] font-medium transition-all"
+                >
+                  Create Job
+                </Button>
+              </div>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
 
 function CandidatesScreen() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const pathname = usePathname();
+  const initialJobQuery = (searchParams.get('job') || '').trim().toLowerCase();
   const [activeFilters, setActiveFilters] = useState<string[]>([]);
-  const [searchQuery, setSearchQuery] = useState('');
+  const [searchQuery, setSearchQuery] = useState(initialJobQuery || '');
+
+  useEffect(() => {
+    setSearchQuery(initialJobQuery || '');
+  }, [initialJobQuery]);
 
   const filterOptions: FilterOption[] = [
     { id: 'role-design', label: 'Product Designer', category: 'Role' },
@@ -3264,6 +4235,18 @@ function CandidatesScreen() {
         <div>
           <div className="text-[22px] font-heading font-medium text-[#1e293b]">Candidates</div>
           <div className="text-[13px] font-sans text-[#64748b]">Cross-job candidate view with confidence strips and quick actions.</div>
+          {initialJobQuery ? (
+            <div className="mt-2 inline-flex items-center gap-2 rounded-full border border-[#cbd5e1] bg-[#f8fafc] px-3 py-1 text-[11px] text-[#475569]">
+              Applied job filter: {initialJobQuery}
+              <button
+                type="button"
+                className="text-[#0f172a] underline"
+                onClick={() => router.push('/candidates')}
+              >
+                Clear
+              </button>
+            </div>
+          ) : null}
         </div>
         <div className="flex items-center gap-3">
           <UnifiedFilter 
@@ -3275,7 +4258,7 @@ function CandidatesScreen() {
           <div className="relative">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-[#94a3b8]" size={16} />
             <Input 
-              placeholder="Search by name, role, source..." 
+              placeholder="Search by name, role, source, or job match..." 
               className="pl-9 h-9 w-[260px] border-[#cbd5e1] rounded-full" 
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
@@ -3294,9 +4277,14 @@ function CandidatesScreen() {
           <div className="col-span-2 text-left">Owner</div>
         </div>
         {candidates.filter(candidate => {
+          if (initialJobQuery && candidate.jobId.toLowerCase() !== initialJobQuery) {
+            return false;
+          }
+
           // Search query check
           if (searchQuery && !candidate.name.toLowerCase().includes(searchQuery.toLowerCase()) && 
               !candidate.role.toLowerCase().includes(searchQuery.toLowerCase()) && 
+              !candidate.jobId.toLowerCase().includes(searchQuery.toLowerCase()) &&
               !candidate.source.toLowerCase().includes(searchQuery.toLowerCase())) {
             return false;
           }
@@ -3322,7 +4310,11 @@ function CandidatesScreen() {
           });
 
           const scoreFilters = activeFilters.filter(f => f.startsWith('score-'));
-          const matchesScore = scoreFilters.length === 0 || (activeFilters.includes('score-90') && candidate.score >= 90) || (activeFilters.includes('score-80') && candidate.score >= 80);
+          const matchesScore = scoreFilters.length === 0 || scoreFilters.some(f => {
+            if (f === 'score-90') return candidate.score >= 90;
+            if (f === 'score-80') return candidate.score >= 80;
+            return false;
+          });
 
           const ownerFilters = activeFilters.filter(f => f.startsWith('owner-'));
           const matchesOwner = ownerFilters.length === 0 || ownerFilters.some(f => {
@@ -3334,45 +4326,37 @@ function CandidatesScreen() {
           });
 
           return matchesRole && matchesStage && matchesScore && matchesOwner;
-        }).map((candidate) => (
-          <div
-            key={candidate.id}
-            onClick={() => router.push(`/candidates/${candidate.id}`)}
-            className="group grid grid-cols-12 gap-3 px-5 py-3 border-b border-[#f1f5f9] items-center hover:bg-[#fdfdfd] cursor-pointer"
-          >
-            <div className="col-span-3 min-w-0">
-              <div className="text-[13px] font-sans font-medium text-[#1e293b] truncate">{candidate.name}</div>
+        }).map(candidate => (
+          (() => {
+            const totalSegments = candidate.confidence.length;
+            const filledSegments = candidate.confidence.filter((value) => value === 1).length;
+
+            return (
+          <div key={candidate.id} className="grid grid-cols-12 gap-3 px-5 py-4 border-b border-[#f1f5f9] items-center hover:bg-[#fdfdfd] cursor-pointer" onClick={() => router.push(`/candidates/${candidate.id}`)}>
+            <div className="col-span-3">
+              <div className="text-[13px] font-sans font-medium text-[#1e293b]">{candidate.name}</div>
               <div className="text-[11px] font-sans text-[#94a3b8] truncate">{candidate.source}</div>
             </div>
-            <div className="col-span-2 text-[12px] text-[#64748b] truncate">{candidate.role}</div>
-            <div className="col-span-2 flex items-center pr-4">
-              <div className="h-2 w-full bg-[#f1f5f9] rounded-full overflow-hidden border border-[#e2e8f0]">
-                <div 
-                   className="h-full bg-[#22c55e] transition-all" 
-                   style={{ width: `${Math.round((candidate.confidence.filter(Boolean).length / candidate.confidence.length) * 100)}%` }} 
+            <div className="col-span-2 text-[12px] font-sans text-[#475569]">{candidate.role}</div>
+            <div className="col-span-2 flex gap-0.5">
+              {Array.from({ length: totalSegments }).map((_, i) => (
+                <div
+                  key={i}
+                  className={cn("w-1.5 h-4 rounded-sm", i < filledSegments ? "bg-[#10b981]" : "bg-[#f1f5f9]")}
                 />
+              ))}
+            </div>
+            <div className="col-span-1 text-left text-[14px] font-sans font-medium text-[#0f172a]">{candidate.score}</div>
+            <div className="col-span-2 text-[12px] font-sans text-[#64748b]"><Badge className="bg-[#f8fafc] text-[#475569] text-[10px] shadow-none border-[#e2e8f0] font-medium">{candidate.stage.replace('_', ' ')}</Badge></div>
+            <div className="col-span-2 text-left">
+              <div className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-[#f8fafc] border border-[#e2e8f0]">
+                <img src={HEADIE_AGENT_VISUALS[resolveHeadieAgentKey(candidate.owner)].coloredSrc} className="w-3.5 h-3.5 object-contain" alt="" />
+                <span className="text-[11px] font-bold text-[#64748b] tracking-wide uppercase">{candidate.owner}</span>
               </div>
             </div>
-            <div className="col-span-1 text-left text-[13px] text-[#0f172a] font-medium">{candidate.score}</div>
-            <div className="col-span-2 text-[12px] text-[#64748b] capitalize">{candidate.stage.replace('_', ' ')}</div>
-            <div className="col-span-2 flex items-center justify-start gap-2">
-              <span className="flex items-center gap-1.5 text-[12px] text-[#64748b]">
-                {(() => {
-                  const agentKey = resolveHeadieAgentKey(candidate.owner);
-                  const agentVisual = HEADIE_AGENT_VISUALS[agentKey];
-                  return (
-                    <img 
-                      src={agentVisual.coloredSrc} 
-                      alt={candidate.owner} 
-                      className={getHeadieAvatarClass(agentKey, 'w-4 h-4')} 
-                    />
-                  );
-                })()}
-                {candidate.owner}
-              </span>
-              <ArrowRight size={15} className="text-[#94a3b8] opacity-0 group-hover:opacity-100 transition-opacity" />
-            </div>
           </div>
+            );
+          })()
         ))}
       </Card>
     </div>

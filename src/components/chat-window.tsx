@@ -89,7 +89,7 @@ const OPERATOR_COMMAND_TEMPLATES: Array<{ label: string; value: string }> = [
   {
     label: '/analyze-consensus',
     value:
-      '/analyze-consensus candidate <candidate_id> job <job_id> turns 3 requirements "TypeScript,Next.js,System design" externalContext "GitHub profile + portfolio notes"',
+      '/analyze-consensus candidate <candidate_id> job <job_id> turns 3 requirements "TypeScript,Next.js,System design" externalContext "portfolio notes + reference call highlights"',
   },
   {
     label: '/schedule candidate',
@@ -1001,21 +1001,37 @@ export function ChatWindow(props: {
   const [activeAuthorizationStep, setActiveAuthorizationStep] = useState<string | null>(null);
   
   const lastProcessedQueryIdRef = useRef<number | null>(null);
+  const autoSubmitPendingRef = useRef(false);
 
+  // Capture the initial query: set the input text and flag for auto-submit
+  if (
+    props.initialQuery &&
+    props.initialQuery.id !== lastProcessedQueryIdRef.current
+  ) {
+    lastProcessedQueryIdRef.current = props.initialQuery.id;
+    autoSubmitPendingRef.current = true;
+  }
+
+  // Auto-submit: fires when input is populated, chat is ready, and flag is set
   useEffect(() => {
-    if (
-      props.initialQuery &&
-      props.initialQuery.id !== lastProcessedQueryIdRef.current
-    ) {
-      lastProcessedQueryIdRef.current = props.initialQuery.id;
-      const queryText = props.initialQuery.text;
-      // Defer to let useChat fully hydrate before programmatic submit
-      const timer = setTimeout(() => {
-        sendMessage({ text: queryText });
-      }, 250);
-      return () => clearTimeout(timer);
-    }
-  }, [props.initialQuery, sendMessage]);
+    if (!autoSubmitPendingRef.current) return;
+    if (status !== 'ready') return;
+    if (!props.initialQuery?.text) return;
+
+    autoSubmitPendingRef.current = false;
+    const text = props.initialQuery.text;
+
+    // Micro-task to let React finish its commit cycle
+    Promise.resolve().then(async () => {
+      try {
+        await sendMessage({ text });
+      } catch (err) {
+        console.error('[ChatWindow] auto-submit failed:', err);
+        // Fallback: put the text in the input so user can manually send
+        setInput(text);
+      }
+    });
+  }, [status, sendMessage, props.initialQuery, setInput]);
   const [isCopyingLogs, setIsCopyingLogs] = useState(false);
   const [dismissedFallbackInterruptKey, setDismissedFallbackInterruptKey] = useState<string | null>(null);
   const [toolTimingByKey, setToolTimingByKey] = useState<ToolTimingByKey>({});
