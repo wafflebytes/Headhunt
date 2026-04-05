@@ -2916,7 +2916,9 @@ export default function App() {
             )}
 
             {activeScreen === 'candidates' && (
-              <CandidatesScreen />
+              <React.Suspense fallback={<div className="w-full h-full min-h-[240px]" />}>
+                <CandidatesScreen />
+              </React.Suspense>
             )}
 
             {activeScreen === 'workflows' && (
