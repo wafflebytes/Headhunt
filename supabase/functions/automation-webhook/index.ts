@@ -1,5 +1,6 @@
 // @ts-nocheck
 import {
+  asNumber,
   asRecord,
   asString,
   buildIdempotencyKey,
@@ -7,8 +8,23 @@ import {
   enqueueRun,
   isAuthorized,
   jsonResponse,
+  processQueue,
   readJsonObject,
 } from '../_shared/automation-runtime.ts';
+
+function asBoolean(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true') return true;
+    if (normalized === 'false') return false;
+  }
+
+  return undefined;
+}
 
 type SupabaseDbEvent = {
   type: 'INSERT' | 'UPDATE' | 'DELETE';
@@ -39,7 +55,7 @@ function parseEvent(input: Record<string, unknown>): SupabaseDbEvent | null {
   };
 }
 
-async function enqueueFromEvent(event: SupabaseDbEvent) {
+async function enqueueFromEvent(event: SupabaseDbEvent, actorUserId?: string) {
   const client = createAdminClient();
   const record = event.record ?? {};
 
@@ -63,11 +79,14 @@ async function enqueueFromEvent(event: SupabaseDbEvent) {
         asString(record.source_email_message_id),
       ]),
       payload: {
+        agentName: 'analyst',
         candidateId,
         jobId,
         organizationId,
-        turns: 3,
-        maxEvidenceChars: 9000,
+        actorUserId,
+        turns: 1,
+        maxEvidenceChars: 2500,
+        automationMode: true,
       },
       maxAttempts: 6,
     });
@@ -98,9 +117,11 @@ async function enqueueFromEvent(event: SupabaseDbEvent) {
         asString(record.ciba_auth_req_id),
       ]),
       payload: {
+        agentName: 'dispatch',
         offerId,
         organizationId: asString(record.organization_id),
         authReqId: asString(record.ciba_auth_req_id),
+        actorUserId,
       },
       maxAttempts: 8,
     });
@@ -139,7 +160,26 @@ Deno.serve(async (request) => {
   }
 
   try {
-    const enqueued = await enqueueFromEvent(event);
+    const actorUserId =
+      asString(payload.actorUserId) ??
+      asString(Deno.env.get('HEADHUNT_FOUNDER_USER_ID')) ??
+      asString(Deno.env.get('AUTH0_FOUNDER_USER_ID'));
+
+    const enqueued = await enqueueFromEvent(event, actorUserId);
+    const processNow = asBoolean(payload.processNow) ?? false;
+    const processLimit = Math.max(1, Math.min(10, asNumber(payload.processLimit) ?? 1));
+    const executeCookie =
+      request.headers.get('x-automation-execute-cookie')?.trim() ||
+      request.headers.get('cookie')?.trim() ||
+      asString(payload.executeCookie);
+
+    let processed: Record<string, unknown> | undefined;
+    if (processNow && enqueued.handled) {
+      const client = createAdminClient();
+      processed = await processQueue(client, processLimit, {
+        executeCookie,
+      });
+    }
 
     return jsonResponse({
       check: 'automation_webhook',
@@ -149,6 +189,8 @@ Deno.serve(async (request) => {
         type: event.type,
       },
       enqueued,
+      processNow,
+      processed,
     });
   } catch (error) {
     return jsonResponse(

@@ -31,6 +31,8 @@ const AGENT_WEIGHTS = {
 } as const;
 
 const AGENTS: ConsensusAgent[] = ['technical', 'social', 'ats_objective'];
+const AUTOMATION_FAST_TURNS = 1;
+const AUTOMATION_FAST_MAX_EVIDENCE_CHARS = 2500;
 
 const evaluatorAssessmentSchema = z.object({
   score: z.number().int().min(0).max(100),
@@ -61,8 +63,9 @@ const multiAgentScoreInputSchema = z.object({
   resumeText: z.string().optional(),
   externalContext: z.string().optional(),
   requirements: z.array(z.string().min(1)).optional(),
-  turns: z.number().int().min(2).max(3).default(3),
+  turns: z.number().int().min(1).max(3).default(3),
   maxEvidenceChars: z.number().int().min(2000).max(24000).default(9000),
+  automationMode: z.boolean().default(false),
 });
 
 type EvaluatorAssessment = z.infer<typeof evaluatorAssessmentSchema>;
@@ -177,6 +180,24 @@ function buildFallbackAgentAssessment(params: {
       jobTitle: params.jobTitle,
       evidenceText: params.evidenceText,
     }),
+  };
+}
+
+function toTurnSnapshot(params: {
+  agent: ConsensusAgent;
+  turn: number;
+  assessment: EvaluatorAssessment;
+}): ConsensusTurnSnapshot {
+  return {
+    agent: params.agent,
+    turn: params.turn,
+    score: params.assessment.score,
+    confidence: params.assessment.confidence,
+    rationale: compact(params.assessment.rationale, 320),
+    keyEvidence: params.assessment.evidencePoints.slice(0, 4).map((item) => compact(item, 220)),
+    adjustmentNote: params.assessment.adjustmentNote
+      ? compact(params.assessment.adjustmentNote, 220)
+      : undefined,
   };
 }
 
@@ -324,10 +345,15 @@ async function runConsensus(params: {
 
 export const runMultiAgentCandidateScoreTool = tool({
   description:
-    'Run a 3-evaluator candidate scoring pass (technical, social tone/eagerness, ATS objective) over 2-3 turns, compute consensus, and persist candidate score outputs.',
+    'Run a 3-evaluator candidate scoring pass (technical, social tone/eagerness, ATS objective), compute consensus, and persist candidate score outputs. Supports low-latency automation mode.',
   inputSchema: multiAgentScoreInputSchema,
   execute: async (input) => {
     const actorUserId = input.actorUserId ?? (await auth0.getSession())?.user?.sub ?? null;
+    const resolvedAutomationMode = input.automationMode === true;
+    const resolvedTurns = resolvedAutomationMode ? AUTOMATION_FAST_TURNS : input.turns;
+    const resolvedMaxEvidenceChars = resolvedAutomationMode
+      ? Math.min(input.maxEvidenceChars, AUTOMATION_FAST_MAX_EVIDENCE_CHARS)
+      : input.maxEvidenceChars;
 
     if (!actorUserId) {
       return {
@@ -411,9 +437,9 @@ export const runMultiAgentCandidateScoreTool = tool({
       candidateEmail: candidate.contactEmail,
       jobTitle: job.title,
       requirements,
-      emailText: truncateForModel(input.emailText ?? '', input.maxEvidenceChars),
-      resumeText: truncateForModel(input.resumeText ?? '', input.maxEvidenceChars),
-      additionalEvidence: truncateForModel(rawEvidence, input.maxEvidenceChars),
+      emailText: truncateForModel(input.emailText ?? '', resolvedMaxEvidenceChars),
+      resumeText: truncateForModel(input.resumeText ?? '', resolvedMaxEvidenceChars),
+      additionalEvidence: truncateForModel(rawEvidence, resolvedMaxEvidenceChars),
     };
 
     const baselineScore = candidate.score ?? 68;
@@ -421,41 +447,67 @@ export const runMultiAgentCandidateScoreTool = tool({
     let latestAtsRequirementChecks: Array<z.infer<typeof candidateQualificationCheckSchema>> | null = null;
     let fallbackUsed = false;
 
-    for (let turn = 1; turn <= input.turns; turn += 1) {
+    if (resolvedAutomationMode) {
+      fallbackUsed = true;
+      const automationEvidence = `${context.emailText}\n${context.resumeText}\n${context.additionalEvidence}`.trim();
+
       for (const agent of AGENTS) {
-        const turnResult = await runEvaluatorTurn({
+        const assessment = buildFallbackAgentAssessment({
           agent,
-          turn,
-          maxTurns: input.turns,
-          context,
-          snapshots,
+          turn: resolvedTurns,
           baselineScore,
+          evidenceText: automationEvidence,
+          requirements,
+          jobTitle: job.title,
         });
 
-        if (turnResult.fallbackUsed) {
-          fallbackUsed = true;
-        }
-
-        snapshots.push({
+        snapshots.push(toTurnSnapshot({
           agent,
-          turn,
-          score: turnResult.assessment.score,
-          confidence: turnResult.assessment.confidence,
-          rationale: compact(turnResult.assessment.rationale, 320),
-          keyEvidence: turnResult.assessment.evidencePoints.slice(0, 4).map((item) => compact(item, 220)),
-          adjustmentNote: turnResult.assessment.adjustmentNote
-            ? compact(turnResult.assessment.adjustmentNote, 220)
-            : undefined,
-        });
+          turn: resolvedTurns,
+          assessment,
+        }));
 
         if (agent === 'ats_objective') {
           latestAtsRequirementChecks =
-            turnResult.assessment.requirementChecks ??
+            assessment.requirementChecks ??
             buildFallbackRequirementChecks({
               requirements,
               jobTitle: job.title,
               evidenceText: `${context.emailText}\n${context.resumeText}`,
             });
+        }
+      }
+    } else {
+      for (let turn = 1; turn <= resolvedTurns; turn += 1) {
+        for (const agent of AGENTS) {
+          const turnResult = await runEvaluatorTurn({
+            agent,
+            turn,
+            maxTurns: resolvedTurns,
+            context,
+            snapshots,
+            baselineScore,
+          });
+
+          if (turnResult.fallbackUsed) {
+            fallbackUsed = true;
+          }
+
+          snapshots.push(toTurnSnapshot({
+            agent,
+            turn,
+            assessment: turnResult.assessment,
+          }));
+
+          if (agent === 'ats_objective') {
+            latestAtsRequirementChecks =
+              turnResult.assessment.requirementChecks ??
+              buildFallbackRequirementChecks({
+                requirements,
+                jobTitle: job.title,
+                evidenceText: `${context.emailText}\n${context.resumeText}`,
+              });
+          }
         }
       }
     }
@@ -470,12 +522,54 @@ export const runMultiAgentCandidateScoreTool = tool({
         atsFinal.score * AGENT_WEIGHTS.atsObjective,
     );
 
-    const consensusResult = await runConsensus({
-      context,
-      turns: input.turns,
-      weightedBaselineScore,
-      finalSnapshots: [technicalFinal, socialFinal, atsFinal],
-    });
+    let consensusResult: { consensus: ConsensusOutput; fallbackUsed: boolean };
+
+    if (resolvedAutomationMode) {
+      const automationScore = weightedBaselineScore;
+      const automationConfidence = Math.max(
+        0,
+        Math.min(100, Math.round((technicalFinal.confidence + socialFinal.confidence + atsFinal.confidence) / 3)),
+      );
+      const automationStrengths = dedupeNonEmpty([
+        technicalFinal.keyEvidence[0] ?? 'Technical evidence was reviewed.',
+        socialFinal.keyEvidence[0] ?? 'Communication signal was reviewed.',
+        atsFinal.keyEvidence[0] ?? 'Requirement alignment was reviewed.',
+      ]).slice(0, 6);
+
+      consensusResult = {
+        consensus: {
+          finalScore: automationScore,
+          confidence: automationConfidence,
+          recommendation: recommendationFromScore(automationScore),
+          rationale:
+            'Automation fast-path score generated with a single-pass heuristic profile to keep queue latency under control.',
+          strengths: automationStrengths.length >= 2
+            ? automationStrengths
+            : [
+                'Candidate evidence was reviewed for role alignment.',
+                'Multi-agent dimensions were still represented in scoring.',
+              ],
+          risks: [
+            'Automation fast-path skips multi-turn model deliberation.',
+            'Run full multi-agent scoring before final offer decisions.',
+          ],
+          nextSteps: [
+            'Validate top requirements in a structured interview.',
+            'Pressure-test technical depth with practical scenarios.',
+            'Run full multi-agent scoring in interactive mode before finalizing decisions.',
+          ],
+          disagreements: ['Automation fast-path omitted iterative cross-evaluator debate.'],
+        },
+        fallbackUsed: true,
+      };
+    } else {
+      consensusResult = await runConsensus({
+        context,
+        turns: resolvedTurns,
+        weightedBaselineScore,
+        finalSnapshots: [technicalFinal, socialFinal, atsFinal],
+      });
+    }
 
     if (consensusResult.fallbackUsed) {
       fallbackUsed = true;
@@ -569,7 +663,9 @@ export const runMultiAgentCandidateScoreTool = tool({
           actorUserId,
           candidateId: candidate.id,
           jobId: job.id,
-          turns: input.turns,
+          turns: resolvedTurns,
+          automationMode: resolvedAutomationMode,
+          maxEvidenceChars: resolvedMaxEvidenceChars,
           weights: AGENT_WEIGHTS,
           weightedBaselineScore,
           finalScore: consensusScore,
@@ -599,7 +695,9 @@ export const runMultiAgentCandidateScoreTool = tool({
       candidateId: candidate.id,
       jobId: job.id,
       stage: candidateStage,
-      turns: input.turns,
+      turns: resolvedTurns,
+      automationMode: resolvedAutomationMode,
+      maxEvidenceChars: resolvedMaxEvidenceChars,
       weightedBaselineScore,
       fallbackUsed,
       weights: {

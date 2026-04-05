@@ -22,6 +22,7 @@
     "smoke:chat-log": "tsx scripts/smoke-chat-log.ts",
     "smoke:chat-prompts": "tsx scripts/smoke-chat-prompts.ts",
     "smoke:ingest-endpoint": "tsx scripts/smoke-ingest-endpoint.ts",
+    "smoke:edge-e2e": "tsx scripts/smoke-edge-e2e.ts",
     "smoke:mcp-acceptance": "tsx scripts/smoke-mcp-acceptance.ts",
     "seed:demo": "tsx scripts/seed-demo-headhunt.ts"
   },

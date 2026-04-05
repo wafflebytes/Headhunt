@@ -101,6 +101,7 @@ const runFinalScheduleFlowInputSchema = z.object({
   organizationId: z.string().optional(),
   actorUserId: z.string().min(1).optional(),
   action: z.enum(['auto', 'request_candidate_windows', 'book_from_reply']).default('auto'),
+  forceRequestResend: z.boolean().optional().default(false),
   sendMode: z.enum(['draft', 'send']).default('send'),
   timezone: z.string().default('America/Los_Angeles'),
   durationMinutes: z.number().int().min(15).max(180).default(30),
@@ -120,6 +121,8 @@ const runFinalScheduleFlowInputSchema = z.object({
   windowEndISO: z.string().min(1).optional(),
   customMessage: z.string().min(1).max(2000).optional(),
 });
+
+type SendInterviewConfirmationInput = z.infer<typeof sendInterviewConfirmationInputSchema>;
 
 type ProposalSlotOption = {
   option: number;
@@ -997,7 +1000,8 @@ const DEFAULT_CAL_EVENT_TYPE_SLUG = process.env.CAL_INTERVIEW_EVENT_TYPE_SLUG?.t
 const DEFAULT_CAL_USERNAME = process.env.CAL_PUBLIC_USERNAME?.trim() || null;
 const DEFAULT_CAL_TEAM_SLUG = process.env.CAL_PUBLIC_TEAM_SLUG?.trim() || null;
 const DEFAULT_CAL_ORGANIZATION_SLUG = process.env.CAL_PUBLIC_ORGANIZATION_SLUG?.trim() || null;
-const DEFAULT_CAL_MEETING_INTEGRATION = process.env.CAL_BOOKING_MEETING_INTEGRATION?.trim() || 'google-meet';
+const DEFAULT_CAL_MEETING_INTEGRATION = 'cal-video';
+const REQUEST_RESEND_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
 function toIso(value: unknown): string | null {
   if (typeof value !== 'string' || !value.trim()) {
@@ -2205,10 +2209,274 @@ export const analyzeCandidateSchedulingReplyTool = withGmailRead(
   }),
 );
 
+async function executeSendInterviewConfirmation(input: SendInterviewConfirmationInput, actorUserId: string) {
+  const [candidate] = await db
+    .select({
+      id: candidates.id,
+      name: candidates.name,
+      contactEmail: candidates.contactEmail,
+      organizationId: candidates.organizationId,
+    })
+    .from(candidates)
+    .where(eq(candidates.id, input.candidateId))
+    .limit(1);
+
+  if (!candidate) {
+    return {
+      check: 'send_interview_confirmation',
+      status: 'error',
+      message: `Candidate ${input.candidateId} not found.`,
+    };
+  }
+
+  const canView = await canViewCandidate(actorUserId, candidate.id);
+  if (!canView) {
+    return {
+      check: 'send_interview_confirmation',
+      status: 'error',
+      message: `Forbidden: no candidate visibility access for ${input.candidateId}.`,
+    };
+  }
+
+  const [job] = await db.select({ id: jobs.id, title: jobs.title }).from(jobs).where(eq(jobs.id, input.jobId)).limit(1);
+  if (!job) {
+    return {
+      check: 'send_interview_confirmation',
+      status: 'error',
+      message: `Job ${input.jobId} not found.`,
+    };
+  }
+
+  const [interviewRow] = await db
+    .select({
+      id: interviews.id,
+      scheduledAt: interviews.scheduledAt,
+      durationMinutes: interviews.durationMinutes,
+      googleMeetLink: interviews.googleMeetLink,
+      googleCalendarEventId: interviews.googleCalendarEventId,
+      status: interviews.status,
+    })
+    .from(interviews)
+    .where(
+      and(
+        eq(interviews.candidateId, input.candidateId),
+        eq(interviews.jobId, input.jobId),
+        input.interviewId ? eq(interviews.id, input.interviewId) : eq(interviews.status, 'scheduled'),
+      ),
+    )
+    .orderBy(desc(interviews.scheduledAt))
+    .limit(1);
+
+  if (!interviewRow) {
+    return {
+      check: 'send_interview_confirmation',
+      status: 'error',
+      message:
+        input.interviewId
+          ? `Interview ${input.interviewId} not found for the given candidate/job.`
+          : 'No scheduled interview found for this candidate/job.',
+    };
+  }
+
+  const scheduledStart = interviewRow.scheduledAt;
+  const scheduledEnd = addMinutes(scheduledStart, interviewRow.durationMinutes);
+  const slotLabel = makeLabel(scheduledStart, scheduledEnd, input.timezone);
+  const subject = input.subject?.trim() || `Interview Confirmation: ${job.title}`;
+  const isCalManagedBooking =
+    typeof interviewRow.googleCalendarEventId === 'string' &&
+    interviewRow.googleCalendarEventId.startsWith('cal:');
+
+  if (isCalManagedBooking) {
+    await db.insert(auditLogs).values({
+      organizationId: input.organizationId ?? candidate.organizationId ?? null,
+      actorType: 'agent',
+      actorId: 'send_interview_confirmation',
+      actorDisplayName: 'Liaison Agent',
+      action: 'interview.confirmation.skipped',
+      resourceType: 'candidate',
+      resourceId: input.candidateId,
+      metadata: {
+        actorUserId,
+        jobId: input.jobId,
+        interviewId: interviewRow.id,
+        reason: 'cal_managed_booking',
+        to: candidate.contactEmail,
+        subject,
+        scheduledAt: scheduledStart.toISOString(),
+      },
+      result: 'success',
+    });
+
+    return {
+      check: 'send_interview_confirmation',
+      status: 'success',
+      mode: 'skipped',
+      reason: 'cal_managed_booking',
+      message:
+        'Skipped founder confirmation email because this interview is Cal-managed and Cal already sends booking emails.',
+      candidateId: input.candidateId,
+      jobId: input.jobId,
+      interviewId: interviewRow.id,
+      stage: 'interview_scheduled',
+      confirmation: {
+        providerId: null,
+        providerThreadId: null,
+        to: candidate.contactEmail,
+        subject,
+        slotLabel,
+        meetLink: interviewRow.googleMeetLink,
+      },
+    };
+  }
+
+  try {
+    const accessToken = await getGoogleAccessToken();
+    const auth = new google.auth.OAuth2();
+    auth.setCredentials({ access_token: accessToken });
+
+    const gmail = google.gmail('v1');
+    const rawMessage = buildInterviewConfirmationMessage({
+      to: candidate.contactEmail,
+      subject,
+      candidateName: candidate.name,
+      jobTitle: job.title,
+      slotLabel,
+      meetLink: interviewRow.googleMeetLink,
+      calendarLink: interviewRow.googleCalendarEventId
+        ? `https://calendar.google.com/calendar/u/0/r/eventedit/${interviewRow.googleCalendarEventId}`
+        : null,
+      customMessage: input.customMessage,
+    });
+    const raw = toBase64Url(rawMessage);
+
+    const mode = input.sendMode;
+    let providerId: string | null = null;
+    let providerThreadId: string | null = null;
+
+    if (mode === 'send') {
+      const sent = await gmail.users.messages.send({
+        auth,
+        userId: 'me',
+        requestBody: { raw },
+      });
+      providerId = sent.data.id ?? null;
+      providerThreadId = sent.data.threadId ?? null;
+    } else {
+      const draft = await gmail.users.drafts.create({
+        auth,
+        userId: 'me',
+        requestBody: { message: { raw } },
+      });
+      providerId = draft.data.id ?? draft.data.message?.id ?? null;
+      providerThreadId = draft.data.message?.threadId ?? null;
+    }
+
+    const updatedAt = new Date();
+
+    await db.transaction(async (tx: typeof db) => {
+      await tx
+        .update(candidates)
+        .set({
+          stage: 'interview_scheduled',
+          updatedAt,
+        })
+        .where(eq(candidates.id, input.candidateId));
+
+      await tx
+        .update(applications)
+        .set({
+          stage: 'interview_scheduled',
+          updatedAt,
+        })
+        .where(and(eq(applications.candidateId, input.candidateId), eq(applications.jobId, input.jobId)));
+
+      await tx.insert(auditLogs).values({
+        organizationId: input.organizationId ?? candidate.organizationId ?? null,
+        actorType: 'agent',
+        actorId: 'send_interview_confirmation',
+        actorDisplayName: 'Liaison Agent',
+        action: mode === 'send' ? 'interview.confirmation.sent' : 'interview.confirmation.drafted',
+        resourceType: 'candidate',
+        resourceId: input.candidateId,
+        metadata: {
+          actorUserId,
+          jobId: input.jobId,
+          interviewId: interviewRow.id,
+          mode,
+          providerId,
+          providerThreadId,
+          to: candidate.contactEmail,
+          subject,
+          scheduledAt: scheduledStart.toISOString(),
+        },
+        result: 'success',
+      });
+    });
+
+    return {
+      check: 'send_interview_confirmation',
+      status: 'success',
+      mode,
+      candidateId: input.candidateId,
+      jobId: input.jobId,
+      interviewId: interviewRow.id,
+      stage: 'interview_scheduled',
+      confirmation: {
+        providerId,
+        providerThreadId,
+        to: candidate.contactEmail,
+        subject,
+        slotLabel,
+        meetLink: interviewRow.googleMeetLink,
+      },
+    };
+  } catch (error) {
+    if (isGoogleIdentityMismatchError(error) || isGoogleVerificationError(error)) {
+      return {
+        check: 'send_interview_confirmation',
+        status: 'error',
+        message: error.message,
+      };
+    }
+
+    if (isMissingRefreshTokenError(error)) {
+      return {
+        check: 'send_interview_confirmation',
+        status: 'error',
+        message:
+          'Google connection is missing a refresh token/offline access. Reconnect Google and grant offline access, then rerun interview confirmation.',
+      };
+    }
+
+    if (isInsufficientScopeError(error)) {
+      return {
+        check: 'send_interview_confirmation',
+        status: 'error',
+        message:
+          'Google Gmail scope is missing or not granted. Run run_connection_diagnostics, then authorize_connections_step:google and ensure gmail.compose + userinfo.email are granted.',
+      };
+    }
+
+    if (error instanceof TokenVaultError) {
+      throw error;
+    }
+
+    if (isAuthorizationError(error)) {
+      throw new TokenVaultError('Authorization required to access Gmail interview confirmation operations.');
+    }
+
+    return {
+      check: 'send_interview_confirmation',
+      status: 'error',
+      message: error instanceof Error ? error.message : 'Unknown error while sending interview confirmation.',
+    };
+  }
+}
+
 export const sendInterviewConfirmationTool = withGmailWrite(
   tool({
     description:
-      'Send or draft a candidate interview confirmation email using the scheduled interview details and update stage/audit state. For Cal-managed bookings, this tool skips sending because Cal already sends invite emails.',
+      'Send or draft a candidate interview confirmation email using the scheduled interview details and update stage/audit state. By default it skips Cal-managed bookings, but can be forced to send when needed.',
     inputSchema: sendInterviewConfirmationInputSchema,
     execute: async (input) => {
       const actorUserId = input.actorUserId ?? (await auth0.getSession())?.user?.sub ?? null;
@@ -2221,267 +2489,7 @@ export const sendInterviewConfirmationTool = withGmailWrite(
         };
       }
 
-      const [candidate] = await db
-        .select({
-          id: candidates.id,
-          name: candidates.name,
-          contactEmail: candidates.contactEmail,
-          organizationId: candidates.organizationId,
-        })
-        .from(candidates)
-        .where(eq(candidates.id, input.candidateId))
-        .limit(1);
-
-      if (!candidate) {
-        return {
-          check: 'send_interview_confirmation',
-          status: 'error',
-          message: `Candidate ${input.candidateId} not found.`,
-        };
-      }
-
-      const canView = await canViewCandidate(actorUserId, candidate.id);
-      if (!canView) {
-        return {
-          check: 'send_interview_confirmation',
-          status: 'error',
-          message: `Forbidden: no candidate visibility access for ${input.candidateId}.`,
-        };
-      }
-
-      const [job] = await db.select({ id: jobs.id, title: jobs.title }).from(jobs).where(eq(jobs.id, input.jobId)).limit(1);
-      if (!job) {
-        return {
-          check: 'send_interview_confirmation',
-          status: 'error',
-          message: `Job ${input.jobId} not found.`,
-        };
-      }
-
-      const [interviewRow] = await db
-        .select({
-          id: interviews.id,
-          scheduledAt: interviews.scheduledAt,
-          durationMinutes: interviews.durationMinutes,
-          googleMeetLink: interviews.googleMeetLink,
-          googleCalendarEventId: interviews.googleCalendarEventId,
-          status: interviews.status,
-        })
-        .from(interviews)
-        .where(
-          and(
-            eq(interviews.candidateId, input.candidateId),
-            eq(interviews.jobId, input.jobId),
-            input.interviewId ? eq(interviews.id, input.interviewId) : eq(interviews.status, 'scheduled'),
-          ),
-        )
-        .orderBy(desc(interviews.scheduledAt))
-        .limit(1);
-
-      if (!interviewRow) {
-        return {
-          check: 'send_interview_confirmation',
-          status: 'error',
-          message:
-            input.interviewId
-              ? `Interview ${input.interviewId} not found for the given candidate/job.`
-              : 'No scheduled interview found for this candidate/job.',
-        };
-      }
-
-      const scheduledStart = interviewRow.scheduledAt;
-      const scheduledEnd = addMinutes(scheduledStart, interviewRow.durationMinutes);
-      const slotLabel = makeLabel(scheduledStart, scheduledEnd, input.timezone);
-      const subject = input.subject?.trim() || `Interview Confirmation: ${job.title}`;
-      const isCalManagedBooking =
-        typeof interviewRow.googleCalendarEventId === 'string' &&
-        interviewRow.googleCalendarEventId.startsWith('cal:');
-
-      if (isCalManagedBooking) {
-        await db.insert(auditLogs).values({
-          organizationId: input.organizationId ?? candidate.organizationId ?? null,
-          actorType: 'agent',
-          actorId: 'send_interview_confirmation',
-          actorDisplayName: 'Liaison Agent',
-          action: 'interview.confirmation.skipped',
-          resourceType: 'candidate',
-          resourceId: input.candidateId,
-          metadata: {
-            actorUserId,
-            jobId: input.jobId,
-            interviewId: interviewRow.id,
-            reason: 'cal_managed_booking',
-            to: candidate.contactEmail,
-            subject,
-            scheduledAt: scheduledStart.toISOString(),
-          },
-          result: 'success',
-        });
-
-        return {
-          check: 'send_interview_confirmation',
-          status: 'success',
-          mode: 'skipped',
-          reason: 'cal_managed_booking',
-          message:
-            'Skipped founder confirmation email because this interview is Cal-managed and Cal already sends booking emails.',
-          candidateId: input.candidateId,
-          jobId: input.jobId,
-          interviewId: interviewRow.id,
-          stage: 'interview_scheduled',
-          confirmation: {
-            providerId: null,
-            providerThreadId: null,
-            to: candidate.contactEmail,
-            subject,
-            slotLabel,
-            meetLink: interviewRow.googleMeetLink,
-          },
-        };
-      }
-
-      try {
-        const accessToken = await getGoogleAccessToken();
-        const auth = new google.auth.OAuth2();
-        auth.setCredentials({ access_token: accessToken });
-
-        const gmail = google.gmail('v1');
-        const rawMessage = buildInterviewConfirmationMessage({
-          to: candidate.contactEmail,
-          subject,
-          candidateName: candidate.name,
-          jobTitle: job.title,
-          slotLabel,
-          meetLink: interviewRow.googleMeetLink,
-          calendarLink: interviewRow.googleCalendarEventId
-            ? `https://calendar.google.com/calendar/u/0/r/eventedit/${interviewRow.googleCalendarEventId}`
-            : null,
-          customMessage: input.customMessage,
-        });
-        const raw = toBase64Url(rawMessage);
-
-        const mode = input.sendMode;
-        let providerId: string | null = null;
-        let providerThreadId: string | null = null;
-
-        if (mode === 'send') {
-          const sent = await gmail.users.messages.send({
-            auth,
-            userId: 'me',
-            requestBody: { raw },
-          });
-          providerId = sent.data.id ?? null;
-          providerThreadId = sent.data.threadId ?? null;
-        } else {
-          const draft = await gmail.users.drafts.create({
-            auth,
-            userId: 'me',
-            requestBody: { message: { raw } },
-          });
-          providerId = draft.data.id ?? draft.data.message?.id ?? null;
-          providerThreadId = draft.data.message?.threadId ?? null;
-        }
-
-        const updatedAt = new Date();
-
-        await db.transaction(async (tx: typeof db) => {
-          await tx
-            .update(candidates)
-            .set({
-              stage: 'interview_scheduled',
-              updatedAt,
-            })
-            .where(eq(candidates.id, input.candidateId));
-
-          await tx
-            .update(applications)
-            .set({
-              stage: 'interview_scheduled',
-              updatedAt,
-            })
-            .where(and(eq(applications.candidateId, input.candidateId), eq(applications.jobId, input.jobId)));
-
-          await tx.insert(auditLogs).values({
-            organizationId: input.organizationId ?? candidate.organizationId ?? null,
-            actorType: 'agent',
-            actorId: 'send_interview_confirmation',
-            actorDisplayName: 'Liaison Agent',
-            action: mode === 'send' ? 'interview.confirmation.sent' : 'interview.confirmation.drafted',
-            resourceType: 'candidate',
-            resourceId: input.candidateId,
-            metadata: {
-              actorUserId,
-              jobId: input.jobId,
-              interviewId: interviewRow.id,
-              mode,
-              providerId,
-              providerThreadId,
-              to: candidate.contactEmail,
-              subject,
-              scheduledAt: scheduledStart.toISOString(),
-            },
-            result: 'success',
-          });
-        });
-
-        return {
-          check: 'send_interview_confirmation',
-          status: 'success',
-          mode,
-          candidateId: input.candidateId,
-          jobId: input.jobId,
-          interviewId: interviewRow.id,
-          stage: 'interview_scheduled',
-          confirmation: {
-            providerId,
-            providerThreadId,
-            to: candidate.contactEmail,
-            subject,
-            slotLabel,
-            meetLink: interviewRow.googleMeetLink,
-          },
-        };
-      } catch (error) {
-        if (isGoogleIdentityMismatchError(error) || isGoogleVerificationError(error)) {
-          return {
-            check: 'send_interview_confirmation',
-            status: 'error',
-            message: error.message,
-          };
-        }
-
-        if (isMissingRefreshTokenError(error)) {
-          return {
-            check: 'send_interview_confirmation',
-            status: 'error',
-            message:
-              'Google connection is missing a refresh token/offline access. Reconnect Google and grant offline access, then rerun interview confirmation.',
-          };
-        }
-
-        if (isInsufficientScopeError(error)) {
-          return {
-            check: 'send_interview_confirmation',
-            status: 'error',
-            message:
-              'Google Gmail scope is missing or not granted. Run run_connection_diagnostics, then authorize_connections_step:google and ensure gmail.compose + userinfo.email are granted.',
-          };
-        }
-
-        if (error instanceof TokenVaultError) {
-          throw error;
-        }
-
-        if (isAuthorizationError(error)) {
-          throw new TokenVaultError('Authorization required to access Gmail interview confirmation operations.');
-        }
-
-        return {
-          check: 'send_interview_confirmation',
-          status: 'error',
-          message: error instanceof Error ? error.message : 'Unknown error while sending interview confirmation.',
-        };
-      }
+      return executeSendInterviewConfirmation(input, actorUserId);
     },
   }),
 );
@@ -2493,6 +2501,9 @@ export const runFinalScheduleFlowTool = withGmailWrite(
     inputSchema: runFinalScheduleFlowInputSchema,
     execute: async (input) => {
       const actorUserId = input.actorUserId ?? (await auth0.getSession())?.user?.sub ?? null;
+      const resolvedAction = input.action ?? 'auto';
+      const resolvedForceRequestResend = input.forceRequestResend === true;
+      const resolvedSendMode = input.sendMode ?? 'send';
 
       if (!actorUserId) {
         return {
@@ -2509,6 +2520,7 @@ export const runFinalScheduleFlowTool = withGmailWrite(
           contactEmail: candidates.contactEmail,
           organizationId: candidates.organizationId,
           jobId: candidates.jobId,
+          stage: candidates.stage,
           sourceEmailThreadId: candidates.sourceEmailThreadId,
         })
         .from(candidates)
@@ -2549,6 +2561,21 @@ export const runFinalScheduleFlowTool = withGmailWrite(
         };
       }
 
+      if (
+        (resolvedAction === 'auto' || resolvedAction === 'book_from_reply') &&
+        ['interview_scheduled', 'interviewed', 'offer_sent', 'hired'].includes(candidate.stage)
+      ) {
+        return {
+          check: 'run_final_schedule_flow',
+          status: 'success',
+          mode: 'already_scheduled',
+          candidateId: input.candidateId,
+          jobId: input.jobId,
+          stage: candidate.stage,
+          message: 'Candidate is already in or beyond interview_scheduled stage; skipping duplicate scheduling.',
+        };
+      }
+
       const organizationId = input.organizationId ?? candidate.organizationId ?? null;
       const requestContext = await loadLatestAvailabilityRequestContext(input.candidateId);
       const applicationThreadId =
@@ -2571,13 +2598,20 @@ export const runFinalScheduleFlowTool = withGmailWrite(
         };
       }
 
+      if (resolvedAction === 'book_from_reply' && !requestContext) {
+        return {
+          check: 'run_final_schedule_flow',
+          status: 'error',
+          message:
+            'No prior availability request context was found for this candidate. Send availability options first, then book from a newer candidate reply.',
+        };
+      }
+
       const requestWindow = resolveRequestWindowBounds({
         windowStartISO: input.windowStartISO,
         windowEndISO: input.windowEndISO,
       });
 
-      const resolvedAction = input.action ?? 'auto';
-      const resolvedSendMode = input.sendMode ?? 'send';
       const resolvedTimezone = input.timezone ?? 'America/Los_Angeles';
       const resolvedDurationMinutes = Number.isInteger(input.durationMinutes) ? input.durationMinutes : 30;
       const resolvedTargetDayCount = Number.isInteger(input.targetDayCount)
@@ -2588,6 +2622,9 @@ export const runFinalScheduleFlowTool = withGmailWrite(
       const resolvedMaxSlotsToEmail = 3;
       const resolvedLookbackDays = Number.isInteger(input.lookbackDays) ? input.lookbackDays : 14;
       const resolvedMaxResults = Number.isInteger(input.maxResults) ? input.maxResults : 10;
+      const requestTimestampMs = requestContext?.timestampISO ? new Date(requestContext.timestampISO).getTime() : Number.NaN;
+      const hasRecentRequestContext =
+        Number.isFinite(requestTimestampMs) && Date.now() - requestTimestampMs < REQUEST_RESEND_COOLDOWN_MS;
 
       if (
         Number.isNaN(requestWindow.start.getTime()) ||
@@ -2756,6 +2793,26 @@ export const runFinalScheduleFlowTool = withGmailWrite(
       const shouldTryBooking = resolvedAction === 'book_from_reply' || resolvedAction === 'auto';
 
       if (!shouldTryBooking) {
+        if (requestContext && hasRecentRequestContext && !resolvedForceRequestResend) {
+          return {
+            check: 'run_final_schedule_flow',
+            status: 'success',
+            mode: 'waiting_for_candidate_reply',
+            candidateId: input.candidateId,
+            jobId: input.jobId,
+            candidateEmail: candidate.contactEmail,
+            threadId: applicationThreadId,
+            request: {
+              providerId: requestContext.providerId,
+              providerThreadId: requestContext.providerThreadId,
+              subject: requestContext.subject,
+              slotOptions: requestContext.slotOptions,
+            },
+            nextStep:
+              'Availability request was already sent recently. Wait for the candidate reply, or rerun with forceRequestResend=true to send again.',
+          };
+        }
+
         const requestResult = await sendAvailabilityRequest();
         if (requestResult.status === 'error') {
           return {
@@ -2784,6 +2841,38 @@ export const runFinalScheduleFlowTool = withGmailWrite(
           },
           nextStep:
             'Ask the candidate to reply with option number(s) that work, then rerun run_final_schedule_flow with action auto or book_from_reply.',
+        };
+      }
+
+      if (resolvedAction === 'auto' && !requestContext) {
+        const requestResult = await sendAvailabilityRequest();
+        if (requestResult.status === 'error') {
+          return {
+            check: 'run_final_schedule_flow',
+            status: 'error',
+            message: requestResult.message,
+          };
+        }
+
+        return {
+          check: 'run_final_schedule_flow',
+          status: 'success',
+          mode: resolvedSendMode === 'send' ? 'request_sent' : 'request_drafted',
+          candidateId: input.candidateId,
+          jobId: input.jobId,
+          candidateEmail: candidate.contactEmail,
+          threadId: requestResult.threadId,
+          request: {
+            providerId: requestResult.providerId,
+            providerThreadId: requestResult.providerThreadId,
+            subject: requestResult.subject,
+            sendMode: resolvedSendMode,
+            slotOptions: requestResult.slotOptions,
+            windowStartISO: requestResult.windowStartISO,
+            windowEndISO: requestResult.windowEndISO,
+          },
+          nextStep:
+            'Candidate slot options were sent. Wait for a newer candidate reply with selected option(s), then rerun run_final_schedule_flow with action auto or book_from_reply.',
         };
       }
 
@@ -2864,12 +2953,21 @@ export const runFinalScheduleFlowTool = withGmailWrite(
         };
       }
 
-      if (resolvedAction === 'auto' && requestContext?.timestampISO && reply.receivedAt) {
+      if (requestContext?.timestampISO && reply.receivedAt) {
         const requestMs = new Date(requestContext.timestampISO).getTime();
         const replyMs = new Date(reply.receivedAt).getTime();
         const hasNewerReply = Number.isFinite(requestMs) && Number.isFinite(replyMs) && replyMs > requestMs;
 
         if (!hasNewerReply) {
+          if (resolvedAction === 'book_from_reply') {
+            return {
+              check: 'run_final_schedule_flow',
+              status: 'error',
+              message:
+                'No newer candidate reply was found after the latest availability request. Ask the candidate to reply on-thread, then rerun book_from_reply.',
+            };
+          }
+
           return {
             check: 'run_final_schedule_flow',
             status: 'success',

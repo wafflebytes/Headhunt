@@ -114,20 +114,29 @@ function normalizeCookieHeader(rawCookie: string): string {
     return rawCookie;
   }
 
-  if (/\b__session__0=|\b__session__1=/i.test(collapsed)) {
+  if (/\b__session__0=|\b__session__1=|\b__session=/i.test(collapsed)) {
     return collapsed;
   }
 
   const session0 = collapsed.match(/\bsession\s*0\s*:\s*([^\s;]+)/i)?.[1];
   const session1 = collapsed.match(/\bsession\s*1\s*:\s*([^\s;]+)/i)?.[1];
+  const singleSession = collapsed.match(/\b(?:__session|session)\b\s*[:=]\s*([^\s;]+)/i)?.[1];
 
-  if (!session0 && !session1) {
+  if (!session0 && !session1 && !singleSession) {
+    if (collapsed.startsWith('eyJ')) {
+      return `__session=${collapsed}`;
+    }
+
     return rawCookie.trim();
   }
 
   const normalizedParts: string[] = [];
   if (session0) normalizedParts.push(`__session__0=${session0}`);
   if (session1) normalizedParts.push(`__session__1=${session1}`);
+
+  if (normalizedParts.length === 0 && singleSession) {
+    normalizedParts.push(`__session=${singleSession}`);
+  }
 
   return normalizedParts.join('; ');
 }
@@ -140,12 +149,17 @@ function parseCookieFromText(rawText: string): string | null {
 
   const session0 = normalized.match(/\bsession\s*0\s*:\s*([^\s;]+)/i)?.[1];
   const session1 = normalized.match(/\bsession\s*1\s*:\s*([^\s;]+)/i)?.[1];
+  const singleSession = normalized.match(/\b(?:__session|session)\b\s*[:=]\s*([^\s;]+)/i)?.[1];
 
   if (session0 || session1) {
     const segments: string[] = [];
     if (session0) segments.push(`__session__0=${session0}`);
     if (session1) segments.push(`__session__1=${session1}`);
     return segments.join('; ');
+  }
+
+  if (singleSession) {
+    return `__session=${singleSession}`;
   }
 
   const firstNonCommentLine = normalized
@@ -227,7 +241,7 @@ Options:
 
 Auth cookie source:
 - Use --cookie OR set HEADHUNT_SMOKE_COOKIE.
-- Or point to a cookie file via --cookie-file / HEADHUNT_SMOKE_COOKIE_FILE (supports "session 0 : ..." + "session 1 : ...").
+- Or point to a cookie file via --cookie-file / HEADHUNT_SMOKE_COOKIE_FILE (supports "session 0 : ..." + "session 1 : ..." OR "__session=...").
 - Copy the full Cookie header from an authenticated /api/chat request in your browser devtools.`);
 }
 

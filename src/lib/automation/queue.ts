@@ -5,10 +5,11 @@ import { automationRuns } from '@/lib/db/schema/automation-runs';
 import { auditLogs } from '@/lib/db/schema/audit-logs';
 import { interviews } from '@/lib/db/schema/interviews';
 import { offers } from '@/lib/db/schema/offers';
+import { runIntakeE2ETool } from '@/lib/tools/intake-e2e';
 import { runFinalScheduleFlowTool } from '@/lib/tools/scheduling';
 import { summarizeCalBookingTranscriptTool } from '@/lib/tools/interview-transcripts';
 import { runMultiAgentCandidateScoreTool } from '@/lib/tools/multi-agent-candidate-score';
-import { pollOfferClearanceTool } from '@/lib/tools/offers';
+import { draftOfferLetterTool, pollOfferClearanceTool, submitOfferForClearanceTool } from '@/lib/tools/offers';
 
 type RunStatus = 'pending' | 'running' | 'retrying' | 'completed' | 'dead_letter' | 'cancelled';
 
@@ -117,6 +118,15 @@ function asNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
+function asBoolean(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+function defaultOfferStartDate(daysFromNow = 14) {
+  const date = new Date(Date.now() + daysFromNow * 24 * 60 * 60 * 1000);
+  return date.toISOString().slice(0, 10);
+}
+
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -162,6 +172,68 @@ export async function executeAutomationHandler(run: {
   handlerType: string;
   payload: AutomationPayload;
 }) {
+  if (run.handlerType === 'scheduling.request.send') {
+    if (typeof runFinalScheduleFlowTool.execute !== 'function') {
+      return {
+        check: 'run_final_schedule_flow',
+        status: 'error',
+        message: 'Final scheduling tool is unavailable in automation runtime.',
+      };
+    }
+
+    const actorUserId =
+      asString(run.payload.actorUserId) ??
+      process.env.HEADHUNT_FOUNDER_USER_ID?.trim() ??
+      process.env.AUTH0_FOUNDER_USER_ID?.trim();
+
+    return runFinalScheduleFlowTool.execute({
+      candidateId: asString(run.payload.candidateId) ?? '',
+      jobId: asString(run.payload.jobId) ?? '',
+      organizationId: asString(run.payload.organizationId),
+      actorUserId,
+      action: 'request_candidate_windows',
+      forceRequestResend: asBoolean(run.payload.forceRequestResend) ?? false,
+      sendMode: asString(run.payload.sendMode) === 'draft' ? 'draft' : 'send',
+      timezone: asString(run.payload.timezone) ?? 'America/Los_Angeles',
+      lookbackDays: asNumber(run.payload.lookbackDays) ?? 14,
+      maxResults: asNumber(run.payload.maxResults) ?? 10,
+      durationMinutes: asNumber(run.payload.durationMinutes) ?? 30,
+      targetDayCount: asNumber(run.payload.targetDayCount) ?? 3,
+      slotsPerDay: asNumber(run.payload.slotsPerDay) ?? 1,
+      maxSlotsToEmail: asNumber(run.payload.maxSlotsToEmail) ?? 3,
+      eventTypeSlug: asString(run.payload.eventTypeSlug),
+      username: asString(run.payload.username),
+      teamSlug: asString(run.payload.teamSlug),
+      organizationSlug: asString(run.payload.organizationSlug),
+      customMessage: asString(run.payload.customMessage),
+    }, {} as any);
+  }
+
+  if (run.handlerType === 'intake.scan') {
+    if (typeof runIntakeE2ETool.execute !== 'function') {
+      return {
+        check: 'run_intake_e2e',
+        status: 'error',
+        message: 'Intake scan tool is unavailable in automation runtime.',
+      };
+    }
+
+    return runIntakeE2ETool.execute({
+      organizationId: asString(run.payload.organizationId),
+      jobId: asString(run.payload.jobId),
+      query: asString(run.payload.query) ??
+        'in:inbox newer_than:14d -category:promotions -category:social -subject:newsletter -subject:digest -subject:unsubscribe',
+      maxResults: Math.max(1, Math.min(25, asNumber(run.payload.maxResults) ?? 20)),
+      processLimit: Math.max(1, Math.min(10, asNumber(run.payload.processLimit) ?? 8)),
+      candidateLikeOnly: typeof run.payload.candidateLikeOnly === 'boolean' ? run.payload.candidateLikeOnly : true,
+      includeBody: typeof run.payload.includeBody === 'boolean' ? run.payload.includeBody : true,
+      generateIntel: typeof run.payload.generateIntel === 'boolean' ? run.payload.generateIntel : true,
+      requirements: Array.isArray(run.payload.requirements)
+        ? run.payload.requirements.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+        : undefined,
+    }, {} as any);
+  }
+
   if (run.handlerType === 'candidate.score') {
     if (typeof runMultiAgentCandidateScoreTool.execute !== 'function') {
       return {
@@ -170,6 +242,8 @@ export async function executeAutomationHandler(run: {
         message: 'Candidate score tool is unavailable in automation runtime.',
       };
     }
+
+    const automationMode = asBoolean(run.payload.automationMode) ?? true;
 
     return runMultiAgentCandidateScoreTool.execute({
       candidateId: asString(run.payload.candidateId) ?? '',
@@ -182,8 +256,9 @@ export async function executeAutomationHandler(run: {
       requirements: Array.isArray(run.payload.requirements)
         ? run.payload.requirements.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
         : undefined,
-      turns: asNumber(run.payload.turns) ?? 3,
-      maxEvidenceChars: asNumber(run.payload.maxEvidenceChars) ?? 9000,
+      turns: asNumber(run.payload.turns) ?? (automationMode ? 1 : 3),
+      maxEvidenceChars: asNumber(run.payload.maxEvidenceChars) ?? (automationMode ? 2500 : 9000),
+      automationMode,
     }, {} as any);
   }
 
@@ -226,8 +301,9 @@ export async function executeAutomationHandler(run: {
       jobId: asString(run.payload.jobId) ?? '',
       organizationId: asString(run.payload.organizationId),
       actorUserId: asString(run.payload.actorUserId),
-      action: 'book_from_reply',
-      sendMode: asString(run.payload.sendMode) === 'send' ? 'send' : 'draft',
+      action: 'auto',
+      forceRequestResend: false,
+      sendMode: asString(run.payload.sendMode) === 'draft' ? 'draft' : 'send',
       timezone: asString(run.payload.timezone) ?? 'America/Los_Angeles',
       targetDayCount: asNumber(run.payload.targetDayCount) ?? 3,
       slotsPerDay: asNumber(run.payload.slotsPerDay) ?? 1,
@@ -241,6 +317,75 @@ export async function executeAutomationHandler(run: {
       teamSlug: asString(run.payload.teamSlug),
       organizationSlug: asString(run.payload.organizationSlug),
       durationMinutes: asNumber(run.payload.durationMinutes) ?? 30,
+    }, {} as any);
+  }
+
+  if (run.handlerType === 'offer.draft.create') {
+    if (typeof draftOfferLetterTool.execute !== 'function') {
+      return {
+        check: 'draft_offer_letter',
+        status: 'error',
+        message: 'Offer draft tool is unavailable in automation runtime.',
+      };
+    }
+
+    const actorUserId =
+      asString(run.payload.actorUserId) ??
+      process.env.HEADHUNT_FOUNDER_USER_ID?.trim() ??
+      process.env.AUTH0_FOUNDER_USER_ID?.trim();
+
+    const terms = asRecord(run.payload.terms) ?? {};
+    const baseSalary = asNumber(terms.baseSalary) ?? 180_000;
+    const currency = asString(terms.currency) ?? 'USD';
+    const startDate = asString(terms.startDate) ?? defaultOfferStartDate();
+    const equityPercent = asNumber(terms.equityPercent);
+    const bonusTargetPercent = asNumber(terms.bonusTargetPercent);
+    const signOnBonus = asNumber(terms.signOnBonus);
+    const notes = asString(terms.notes);
+
+    return draftOfferLetterTool.execute({
+      candidateId: asString(run.payload.candidateId) ?? '',
+      jobId: asString(run.payload.jobId) ?? '',
+      organizationId: asString(run.payload.organizationId),
+      actorUserId,
+      templateId: asString(run.payload.templateId),
+      terms: {
+        baseSalary,
+        currency,
+        startDate,
+        ...(typeof equityPercent === 'number' ? { equityPercent } : {}),
+        ...(typeof bonusTargetPercent === 'number' ? { bonusTargetPercent } : {}),
+        ...(typeof signOnBonus === 'number' ? { signOnBonus } : {}),
+        ...(notes ? { notes } : {}),
+      },
+    }, {} as any);
+  }
+
+  if (run.handlerType === 'offer.submit.clearance') {
+    if (typeof submitOfferForClearanceTool.execute !== 'function') {
+      return {
+        check: 'submit_offer_for_clearance',
+        status: 'error',
+        message: 'Offer submit tool is unavailable in automation runtime.',
+      };
+    }
+
+    const actorUserId = await resolveOfferClearanceActor(run.payload);
+    const founderUserId =
+      asString(run.payload.founderUserId) ??
+      process.env.HEADHUNT_FOUNDER_USER_ID?.trim() ??
+      process.env.AUTH0_FOUNDER_USER_ID?.trim();
+
+    return submitOfferForClearanceTool.execute({
+      offerId: asString(run.payload.offerId),
+      candidateId: asString(run.payload.candidateId),
+      jobId: asString(run.payload.jobId),
+      organizationId: asString(run.payload.organizationId),
+      actorUserId,
+      founderUserId,
+      requestedExpirySeconds: asNumber(run.payload.requestedExpirySeconds),
+      forceReissue: asBoolean(run.payload.forceReissue) ?? false,
+      allowSystemBypass: asBoolean(run.payload.allowSystemBypass) ?? true,
     }, {} as any);
   }
 

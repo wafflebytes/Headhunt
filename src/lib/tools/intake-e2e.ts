@@ -1,5 +1,5 @@
 import { tool } from 'ai';
-import { eq } from 'drizzle-orm';
+import { and, desc, eq, inArray } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { CandidateIngestAccessError, ingestCandidateFromEmail } from '@/lib/actions/candidates-ingest';
@@ -206,6 +206,64 @@ function buildEmailText(message: { subject: string | null; body: string; snippet
   return compact([`Subject: ${message.subject ?? '(no subject)'}`, '', message.body || message.snippet].join('\n'));
 }
 
+function asRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+
+  return value as Record<string, unknown>;
+}
+
+function asString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function isIsoAfter(left: string | null, right: string | null) {
+  if (!left || !right) {
+    return false;
+  }
+
+  const leftMs = new Date(left).getTime();
+  const rightMs = new Date(right).getTime();
+
+  if (!Number.isFinite(leftMs) || !Number.isFinite(rightMs)) {
+    return false;
+  }
+
+  return leftMs > rightMs;
+}
+
+async function loadLatestAvailabilityRequestContext(candidateId: string) {
+  const [latestLog] = await db
+    .select({
+      metadata: auditLogs.metadata,
+      timestamp: auditLogs.timestamp,
+    })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.resourceType, 'candidate'),
+        eq(auditLogs.resourceId, candidateId),
+        inArray(auditLogs.action, ['interview.availability.request.sent', 'interview.availability.request.drafted']),
+      ),
+    )
+    .orderBy(desc(auditLogs.timestamp))
+    .limit(1);
+
+  if (!latestLog) {
+    return null;
+  }
+
+  const metadata = asRecord(latestLog.metadata);
+
+  return {
+    timestampISO: latestLog.timestamp?.toISOString() ?? null,
+    providerId: asString(metadata.providerId),
+    providerThreadId: asString(metadata.providerThreadId),
+    threadId: asString(metadata.threadId),
+  };
+}
+
 async function loadActiveJobs(organizationId?: string) {
   const rows: Array<{ id: string; title: string; organizationId: string | null }> = await db
     .select({ id: jobs.id, title: jobs.title, organizationId: jobs.organizationId })
@@ -339,7 +397,7 @@ export const runIntakeE2ETool = withGmailRead(
             }
 
             const [matchedCandidate] = await db
-              .select({ id: candidates.id, jobId: candidates.jobId })
+              .select({ id: candidates.id, jobId: candidates.jobId, stage: candidates.stage })
               .from(candidates)
               .where(eq(candidates.contactEmail, candidateIdentity.email))
               .limit(1);
@@ -357,23 +415,89 @@ export const runIntakeE2ETool = withGmailRead(
               continue;
             }
 
+            if (['interview_scheduled', 'interviewed', 'offer_sent', 'hired'].includes(matchedCandidate.stage)) {
+              messageResults.push({
+                messageId: message.messageId,
+                threadId: message.threadId,
+                from: message.from,
+                subject: message.subject,
+                status: 'skipped',
+                reason: `Candidate ${matchedCandidate.id} is already at stage ${matchedCandidate.stage}; skipping additional scheduling booking.`,
+                triage,
+              });
+              continue;
+            }
+
+            const requestContext = await loadLatestAvailabilityRequestContext(matchedCandidate.id);
+            if (!requestContext) {
+              messageResults.push({
+                messageId: message.messageId,
+                threadId: message.threadId,
+                from: message.from,
+                subject: message.subject,
+                status: 'skipped',
+                reason:
+                  'Scheduling reply detected but no prior availability request context exists; waiting for liaison request step first.',
+                triage,
+              });
+              continue;
+            }
+
+            const requestThreadId = requestContext.providerThreadId ?? requestContext.threadId;
+            if (requestThreadId && message.threadId && requestThreadId !== message.threadId) {
+              messageResults.push({
+                messageId: message.messageId,
+                threadId: message.threadId,
+                from: message.from,
+                subject: message.subject,
+                status: 'skipped',
+                reason: 'Scheduling reply is on a different thread than the latest availability request; skipping.',
+                triage,
+              });
+              continue;
+            }
+
+            if (!isIsoAfter(message.receivedAt, requestContext.timestampISO)) {
+              messageResults.push({
+                messageId: message.messageId,
+                threadId: message.threadId,
+                from: message.from,
+                subject: message.subject,
+                status: 'skipped',
+                reason: 'Scheduling reply is not newer than the latest availability request; waiting for a fresh candidate reply.',
+                triage,
+              });
+              continue;
+            }
+
+            const schedulingRequestFingerprint =
+              requestContext.providerId ?? requestContext.timestampISO ?? message.messageId;
+
             const schedulingRun = await enqueueAutomationRun({
               handlerType: 'scheduling.reply.parse_book',
               resourceType: 'candidate',
               resourceId: matchedCandidate.id,
-              idempotencyKey: buildIdempotencyKey(['scheduling-reply', matchedCandidate.id, message.messageId]),
+              idempotencyKey: buildIdempotencyKey([
+                'scheduling-reply',
+                matchedCandidate.id,
+                schedulingRequestFingerprint,
+              ]),
               payload: {
+                agentName: 'liaison',
                 candidateId: matchedCandidate.id,
                 jobId: schedulingJobId,
                 organizationId: resolvedOrganizationId,
                 actorUserId: actorId,
-                sendMode: 'draft',
+                sendMode: 'send',
                 timezone: 'America/Los_Angeles',
-                threadId: message.threadId ?? undefined,
+                threadId: message.threadId ?? requestThreadId ?? undefined,
                 query: `rfc822msgid:${message.messageId}`,
                 lookbackDays: 14,
                 maxResults: 10,
                 durationMinutes: 30,
+                username: process.env.CAL_PUBLIC_USERNAME?.trim() || undefined,
+                teamSlug: process.env.CAL_PUBLIC_TEAM_SLUG?.trim() || undefined,
+                organizationSlug: process.env.CAL_PUBLIC_ORGANIZATION_SLUG?.trim() || undefined,
               },
               maxAttempts: 6,
             });
@@ -485,14 +609,16 @@ export const runIntakeE2ETool = withGmailRead(
             resourceId: ingest.candidate.id,
             idempotencyKey: buildIdempotencyKey(['candidate-score', ingest.candidate.id, message.messageId]),
             payload: {
+              agentName: 'analyst',
               candidateId: ingest.candidate.id,
               jobId: resolvedJobId,
               organizationId: resolvedOrganizationId,
               actorUserId: actorId,
               emailText: rawEmailText,
               requirements: input.requirements ?? [],
-              turns: 3,
-              maxEvidenceChars: 9000,
+              turns: 1,
+              maxEvidenceChars: 2500,
+              automationMode: true,
             },
             maxAttempts: 6,
           });

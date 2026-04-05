@@ -75,16 +75,29 @@ export async function proxyToSupabaseAutomationFunction(params: {
   }
 
   const payload = await parseRequestBody(params.request);
-  const body = Object.keys(payload).length > 0 ? payload : params.fallbackBody ?? {};
+  const body = {
+    ...(params.fallbackBody ?? {}),
+    ...payload,
+  };
+  const executeCookie =
+    params.request.headers.get('x-automation-execute-cookie')?.trim() ||
+    params.request.headers.get('cookie')?.trim() ||
+    '';
+
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    authorization: `Bearer ${functionSecret}`,
+    'x-automation-secret': functionSecret,
+  };
+
+  if (executeCookie) {
+    headers['x-automation-execute-cookie'] = executeCookie;
+  }
 
   try {
     const response = await fetch(`${functionsBaseUrl}/${params.functionName}`, {
       method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${functionSecret}`,
-        'x-automation-secret': functionSecret,
-      },
+      headers,
       body: JSON.stringify(body),
     });
 

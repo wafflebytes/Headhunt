@@ -52,7 +52,7 @@ Options:
   --audience <audience>       Audience for /auth/access-token request
   --scope <scope>             Scope for /auth/access-token request
   --cookie <cookieHeader>     Full Cookie header value
-  --cookie-file <path>        Cookie file path (default: product/cookie.md)
+  --cookie-file <path>        Cookie file path (default: product/cookie.md, supports __session or session 0/session 1)
   --organization-id <id>      Optional org filter for MCP tool calls
   --job-id <id>               Optional job filter for MCP tool calls
   --candidate-id <id>         Candidate id for get_candidate_detail
@@ -97,20 +97,29 @@ function normalizeCookieHeader(rawCookie: string): string {
     return rawCookie;
   }
 
-  if (/\b__session__0=|\b__session__1=/i.test(collapsed)) {
+  if (/\b__session__0=|\b__session__1=|\b__session=/i.test(collapsed)) {
     return collapsed;
   }
 
   const session0 = collapsed.match(/\bsession\s*0\s*:\s*([^\s;]+)/i)?.[1];
   const session1 = collapsed.match(/\bsession\s*1\s*:\s*([^\s;]+)/i)?.[1];
+  const singleSession = collapsed.match(/\b(?:__session|session)\b\s*[:=]\s*([^\s;]+)/i)?.[1];
 
-  if (!session0 && !session1) {
+  if (!session0 && !session1 && !singleSession) {
+    if (collapsed.startsWith('eyJ')) {
+      return `__session=${collapsed}`;
+    }
+
     return rawCookie.trim();
   }
 
   const normalizedParts: string[] = [];
   if (session0) normalizedParts.push(`__session__0=${session0}`);
   if (session1) normalizedParts.push(`__session__1=${session1}`);
+
+  if (normalizedParts.length === 0 && singleSession) {
+    normalizedParts.push(`__session=${singleSession}`);
+  }
 
   return normalizedParts.join('; ');
 }
@@ -123,12 +132,17 @@ function parseCookieFromText(rawText: string): string | null {
 
   const session0 = normalized.match(/\bsession\s*0\s*:\s*([^\s;]+)/i)?.[1];
   const session1 = normalized.match(/\bsession\s*1\s*:\s*([^\s;]+)/i)?.[1];
+  const singleSession = normalized.match(/\b(?:__session|session)\b\s*[:=]\s*([^\s;]+)/i)?.[1];
 
   if (session0 || session1) {
     const segments: string[] = [];
     if (session0) segments.push(`__session__0=${session0}`);
     if (session1) segments.push(`__session__1=${session1}`);
     return segments.join('; ');
+  }
+
+  if (singleSession) {
+    return `__session=${singleSession}`;
   }
 
   const firstNonCommentLine = normalized
