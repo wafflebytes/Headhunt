@@ -6,6 +6,14 @@ import { TokenVaultConsentPopup } from '@/components/auth0-ai/TokenVault/popup';
 
 type PossibleInterrupt = Auth0InterruptionUI | Record<string, unknown>;
 
+type TokenVaultInterruptLike = {
+  connection: string;
+  requiredScopes: string[];
+  authorizationParams?: Record<string, string>;
+  resume?: () => void;
+  message?: string;
+};
+
 interface TokenVaultInterruptHandlerProps {
   interrupt: PossibleInterrupt | undefined | null;
   onFinish?: () => void;
@@ -28,22 +36,48 @@ function normalizeTokenVaultInterruptMessage(message: string, connection?: strin
   return message;
 }
 
+function isTokenVaultInterruptLike(interrupt: PossibleInterrupt): interrupt is TokenVaultInterruptLike {
+  if (TokenVaultInterrupt.isInterrupt(interrupt)) {
+    return true;
+  }
+
+  if (!interrupt || typeof interrupt !== 'object') {
+    return false;
+  }
+
+  const candidate = interrupt as Partial<TokenVaultInterruptLike>;
+  if (typeof candidate.connection !== 'string' || candidate.connection.trim().length === 0) {
+    return false;
+  }
+
+  if (!Array.isArray(candidate.requiredScopes)) {
+    return false;
+  }
+
+  return candidate.requiredScopes.every((scope) => typeof scope === 'string');
+}
+
 export function TokenVaultInterruptHandler({ interrupt, onFinish }: TokenVaultInterruptHandlerProps) {
   const id = useId();
-  if (!interrupt || !TokenVaultInterrupt.isInterrupt(interrupt)) {
+  if (!interrupt || !isTokenVaultInterruptLike(interrupt)) {
     return null;
   }
 
+  const tokenVaultInterrupt = interrupt as TokenVaultInterruptLike;
+
   const connection =
-    typeof (interrupt as { connection?: unknown }).connection === 'string'
-      ? ((interrupt as { connection?: string }).connection ?? undefined)
+    typeof tokenVaultInterrupt.connection === 'string'
+      ? tokenVaultInterrupt.connection
       : undefined;
-  const description = normalizeTokenVaultInterruptMessage(interrupt.message, connection);
+  const message = typeof tokenVaultInterrupt.message === 'string'
+    ? tokenVaultInterrupt.message
+    : `Authorization required to access the Token Vault: ${connection ?? 'this connection'}`;
+  const description = normalizeTokenVaultInterruptMessage(message, connection);
 
   return (
     <div key={id} className="whitespace-pre-wrap">
       <TokenVaultConsentPopup
-        interrupt={interrupt}
+        interrupt={tokenVaultInterrupt}
         connectWidget={{
           title: 'Authorization Required.',
           description,

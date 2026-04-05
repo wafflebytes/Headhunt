@@ -63,6 +63,7 @@ const summarizeCalBookingTranscriptInputSchema = z.object({
   jobId: z.string().min(1).optional(),
   organizationId: z.string().optional(),
   actorUserId: z.string().min(1).optional(),
+  jobRequirements: z.array(z.string().min(1)).optional(),
   maxTranscriptChars: z.number().int().min(2000).max(120000).default(22000),
 });
 
@@ -76,6 +77,7 @@ const summarizeDriveTranscriptPdfInputSchema = z
     jobId: z.string().min(1).optional(),
     organizationId: z.string().optional(),
     actorUserId: z.string().min(1).optional(),
+    jobRequirements: z.array(z.string().min(1)).optional(),
     maxTranscriptChars: z.number().int().min(2000).max(120000).default(22000),
   });
 
@@ -433,14 +435,24 @@ async function generateTranscriptSummary(params: {
   maxChars: number;
   candidateName?: string | null;
   jobTitle?: string | null;
+  jobRequirements?: string[];
 }): Promise<z.infer<typeof transcriptSummarySchema>> {
   const transcript = truncateForModel(params.sourceText, params.maxChars);
+  const jobRequirements = Array.isArray(params.jobRequirements)
+    ? params.jobRequirements
+      .map((requirement) => requirement.trim())
+      .filter((requirement) => requirement.length > 0)
+    : [];
   const roleContext = [
     params.candidateName ? `Candidate: ${params.candidateName}` : null,
     params.jobTitle ? `Role: ${params.jobTitle}` : null,
   ]
     .filter((line): line is string => Boolean(line))
     .join('\n');
+  const requirementsContext =
+    jobRequirements.length > 0
+      ? `JD requirements:\n${jobRequirements.map((requirement, index) => `${index + 1}. ${requirement}`).join('\n')}`
+      : 'No explicit JD requirements provided. Infer objective role expectations from role title and transcript evidence.';
 
   const prompt = [
     'You are a senior recruiting operations lead.',
@@ -453,6 +465,7 @@ async function generateTranscriptSummary(params: {
     '- quotedEvidence must include direct short quotes or close paraphrases from transcript text.',
     '- actionableFollowUps and interviewerActionItems should be specific and executable.',
     roleContext || 'Candidate and role context may be unknown.',
+    requirementsContext,
     `Transcript:\n${transcript}`,
   ].join('\n\n');
 
@@ -607,6 +620,7 @@ export const summarizeCalBookingTranscriptTool = withCal(
           maxChars: input.maxTranscriptChars,
           candidateName: context.candidate?.name ?? null,
           jobTitle: context.job?.title ?? null,
+          jobRequirements: input.jobRequirements,
         });
 
         await persistTranscriptSummary({
@@ -784,6 +798,7 @@ export const summarizeDriveTranscriptPdfTool = withDrive(
           maxChars: input.maxTranscriptChars,
           candidateName: context.candidate?.name ?? null,
           jobTitle: context.job?.title ?? null,
+          jobRequirements: input.jobRequirements,
         });
 
         await persistTranscriptSummary({

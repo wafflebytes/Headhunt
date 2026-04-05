@@ -92,6 +92,13 @@
       "when": 1775333000000,
       "tag": "0012_automation_service_role_table_grants",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1775340000000,
+      "tag": "0013_candidate_identity_keys",
+      "breakpoints": true
     }
   ]
 }

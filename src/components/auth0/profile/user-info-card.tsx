@@ -1,5 +1,6 @@
-import { User, Mail, Globe, Shield } from 'lucide-react';
+import { Globe02Icon, Mail01Icon, Shield01Icon, User03Icon } from '@hugeicons/core-free-icons';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
+import { HugeIcon } from '@/components/ui/huge-icon';
 
 interface KeyValueMap {
   [key: string]: any;
@@ -39,11 +40,11 @@ export default function UserInfoCard({ user }: { user: KeyValueMap }) {
           <h2 className="text-2xl font-semibold text-white">{user.name || user.nickname || 'User'}</h2>
           {user.email && (
             <p className="text-white/70 flex items-center gap-2 justify-center">
-              <Mail className="h-4 w-4" />
+              <HugeIcon icon={Mail01Icon} size={16} strokeWidth={2.2} className="h-4 w-4" />
               {user.email}
               {user.email_verified && (
                 <span title="Verified">
-                  <Shield className="h-4 w-4 text-green-400" />
+                  <HugeIcon icon={Shield01Icon} size={16} strokeWidth={2.2} className="h-4 w-4 text-green-400" />
                 </span>
               )}
             </p>
@@ -59,7 +60,7 @@ export default function UserInfoCard({ user }: { user: KeyValueMap }) {
           <div className="space-y-3 text-sm">
             {user.sub && (
               <div className="flex items-center gap-2">
-                <User className="h-4 w-4 text-white/60" />
+                <HugeIcon icon={User03Icon} size={16} strokeWidth={2.2} className="h-4 w-4 text-white/60" />
                 <span className="text-white/80">User ID:</span>
                 <span className="text-white">{user.sub}</span>
               </div>
@@ -67,7 +68,7 @@ export default function UserInfoCard({ user }: { user: KeyValueMap }) {
 
             {user.given_name && (
               <div className="flex items-center gap-2">
-                <User className="h-4 w-4 text-white/60" />
+                <HugeIcon icon={User03Icon} size={16} strokeWidth={2.2} className="h-4 w-4 text-white/60" />
                 <span className="text-white/80">First Name:</span>
                 <span className="text-white">{user.given_name}</span>
               </div>
@@ -75,7 +76,7 @@ export default function UserInfoCard({ user }: { user: KeyValueMap }) {
 
             {user.family_name && (
               <div className="flex items-center gap-2">
-                <User className="h-4 w-4 text-white/60" />
+                <HugeIcon icon={User03Icon} size={16} strokeWidth={2.2} className="h-4 w-4 text-white/60" />
                 <span className="text-white/80">Last Name:</span>
                 <span className="text-white">{user.family_name}</span>
               </div>
@@ -83,7 +84,7 @@ export default function UserInfoCard({ user }: { user: KeyValueMap }) {
 
             {user.nickname && (
               <div className="flex items-center gap-2">
-                <Globe className="h-4 w-4 text-white/60" />
+                <HugeIcon icon={Globe02Icon} size={16} strokeWidth={2.2} className="h-4 w-4 text-white/60" />
                 <span className="text-white/80">Nickname:</span>
                 <span className="text-white">{user.nickname}</span>
               </div>
@@ -91,7 +92,7 @@ export default function UserInfoCard({ user }: { user: KeyValueMap }) {
 
             {user.org_id && (
               <div className="flex items-center gap-2">
-                <Globe className="h-4 w-4 text-white/60" />
+                <HugeIcon icon={Globe02Icon} size={16} strokeWidth={2.2} className="h-4 w-4 text-white/60" />
                 <span className="text-white/80">Organization ID:</span>
                 <span className="text-white">{user.org_id}</span>
               </div>

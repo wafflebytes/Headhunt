@@ -17,6 +17,7 @@ import { gmailDraftTool, gmailSearchTool } from '@/lib/tools/gmail';
 import { getCalendarEventsTool } from '@/lib/tools/google-calender';
 import { getTasksTool, createTasksTool } from '@/lib/tools/google-tasks';
 import { shopOnlineTool } from '@/lib/tools/shop-online';
+import { sendSlackMessageTool } from '@/lib/tools/slack';
 import { getContextDocumentsTool } from '@/lib/tools/context-docs';
 import { listRepositories } from '@/lib/tools/list-gh-repos';
 import { listGitHubEvents } from '@/lib/tools/list-gh-events';
@@ -63,6 +64,8 @@ Use the tools as needed to answer the user's question. Render the email body as 
 Never output raw serialized tool payloads such as "functions.tool_name:1{}" or "[{'type': 'text', 'text': '...'}]". Always return plain-language text.
 Never output tool marker tokens like "<|tool_call_end|>" or "<|tool_calls_section_end|>".
 When you plan to call a tool, do not send short placeholder text like "I'll" or "Let me" by itself. Call the tool first, then provide a complete summary.
+For side-effecting actions (sending messages/emails, scheduling bookings, offer clearance, transcript debrief posting), never guess missing identifiers. If required ids are absent or ambiguous, ask for clarification before calling the tool.
+If any tool output indicates low confidence, manual review, or automation boundary uncertainty, explicitly surface that uncertainty and recommend the safest next step instead of pretending success.
 The current date and time is ${date}.`;
 
 const DIAGNOSTICS_INSTRUCTIONS = `
@@ -85,6 +88,7 @@ When the user asks for a "true end-to-end intake run", call run_intake_e2e.
 When calling run_intake_e2e from a direct command, do not invent organizationId or jobId. Only use ids explicitly provided by the user.
 When asked to pull candidate-like recruiting emails from Gmail intake, call run_intercept.
 When asked to classify hiring/recruiting emails, call run_triage.
+When run_triage returns automationSafe=false or a boundaryReason, do not auto-chain side-effect tools; summarize the boundary and ask for explicit user confirmation/context.
 When asked to generate a candidate intel card, call generate_intel_card.
 When asked to run three-evaluator consensus candidate scoring (technical + social + ATS objective), call run_multi_agent_candidate_score.
 When asked to parse candidate availability text into structured windows, call parse_candidate_availability.
@@ -128,6 +132,13 @@ When summarizing run_multi_agent_candidate_score output:
 When generating intel, persist outputs and move candidate/application stage to reviewed.
 `;
 
+const SLACK_INSTRUCTIONS = `
+When the user asks to send, post, or reply with a general Slack message, call send_slack_message.
+If the channel is not explicit, ask a short follow-up for the target Slack channel instead of guessing.
+If the user asks to inspect available channels first, call listSlackChannels.
+For public channels, use chat:write and channels:history; channels:read is needed for channel lookup.
+`;
+
 function extractErrorMessage(error: unknown): string {
   if (typeof error === 'string' && error.trim()) {
     return error;
@@ -163,6 +174,11 @@ function extractErrorMessage(error: unknown): string {
   }
 
   return 'Unknown error';
+}
+
+function isTokenVaultAuthorizationRequiredMessage(error: unknown): boolean {
+  const message = extractErrorMessage(error).toLowerCase();
+  return message.includes('authorization required to access the token vault');
 }
 
 function uiMessageToText(message: UIMessage): string {
@@ -944,13 +960,29 @@ function applyForcedArgsToTools(
   tools: Record<string, any>,
   decision: ForcedToolDecision,
 ): Record<string, any> {
-  if (!decision.forcedToolName || !decision.forcedToolArgs) {
+  if (!decision.forcedToolName) {
     return tools;
   }
 
   const targetTool = tools[decision.forcedToolName];
   if (!targetTool || typeof targetTool.execute !== 'function') {
     return tools;
+  }
+
+  if (!decision.forcedToolArgs) {
+    return {
+      ...tools,
+      [decision.forcedToolName]: {
+        ...targetTool,
+        execute: async () => ({
+          check: 'forced_command_validation',
+          status: 'error',
+          message:
+            `Missing or ambiguous required arguments for ${decision.forcedToolName}. ` +
+            'Provide explicit ids/fields in the command and retry.',
+        }),
+      },
+    };
   }
 
   return {
@@ -989,6 +1021,7 @@ export async function POST(req: NextRequest) {
     listRepositories,
     listGitHubEvents,
     listSlackChannels,
+    send_slack_message: sendSlackMessageTool,
     run_connection_diagnostics: runConnectionDiagnosticsTool,
     verify_google_connection: verifyGoogleConnectionTool,
     verify_gmail_read_connection: verifyGmailReadConnectionTool,
@@ -1025,7 +1058,7 @@ export async function POST(req: NextRequest) {
       async ({ writer }) => {
         const result = streamText({
           model: nim.chatModel(nimChatModelId),
-          system: `${AGENT_SYSTEM_TEMPLATE}\n${DIAGNOSTICS_INSTRUCTIONS}\n${TRIAGE_INTEL_INSTRUCTIONS}${forcedToolDecision.forcedArgsInstruction ?? ''}`,
+          system: `${AGENT_SYSTEM_TEMPLATE}\n${DIAGNOSTICS_INSTRUCTIONS}\n${TRIAGE_INTEL_INSTRUCTIONS}\n${SLACK_INSTRUCTIONS}${forcedToolDecision.forcedArgsInstruction ?? ''}`,
           messages: modelMessages,
           temperature: 0.6,
           topP: 0.9,
@@ -1037,6 +1070,14 @@ export async function POST(req: NextRequest) {
               const lastMessage = output.content[output.content.length - 1];
               if (lastMessage?.type === 'tool-error') {
                 const { toolName, toolCallId, error, input } = lastMessage;
+
+                // Allow Token Vault authorization-required tool errors to flow
+                // through interruption handling instead of converting them into
+                // a hard stream failure.
+                if (isTokenVaultAuthorizationRequiredMessage(error)) {
+                  return;
+                }
+
                 const serializableError = {
                   message: extractErrorMessage(error),
                   cause: error,

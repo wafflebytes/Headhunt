@@ -1,9 +1,17 @@
 'use client';
 
 import { FormEvent, useEffect, useMemo, useState } from 'react';
-import { CalendarCheck, LoaderCircle, Plus, Save, Send, Trash2 } from 'lucide-react';
+import {
+  Add01Icon,
+  CalendarCheckIn01Icon,
+  Delete02Icon,
+  Loading03Icon,
+  SaveEnergyIcon,
+  SentIcon,
+} from '@hugeicons/core-free-icons';
 import { toast } from 'sonner';
 
+import { HugeIcon } from '@/components/ui/huge-icon';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
@@ -310,14 +318,14 @@ export function FounderSlotSelectionPanel(props: {
                 onClick={() => removeRange(range.id)}
                 className="h-9"
               >
-                <Trash2 className="h-4 w-4" />
+                <HugeIcon icon={Delete02Icon} size={16} strokeWidth={2.2} className="h-4 w-4" />
               </Button>
             </div>
           ))}
         </div>
 
         <Button type="button" variant="outline" size="sm" onClick={addRange} disabled={isDisabled}>
-          <Plus className="h-4 w-4 mr-1" />
+          <HugeIcon icon={Add01Icon} size={16} strokeWidth={2.2} className="h-4 w-4 mr-1" />
           Add Discontinuous Range
         </Button>
 
@@ -332,9 +340,9 @@ export function FounderSlotSelectionPanel(props: {
         <div className="flex flex-wrap gap-2">
           <Button type="submit" variant="outline" size="sm" disabled={isDisabled}>
             {pendingAction === 'save' ? (
-              <LoaderCircle className="h-4 w-4 mr-1 animate-spin" />
+              <HugeIcon icon={Loading03Icon} size={16} strokeWidth={2.2} className="h-4 w-4 mr-1 animate-spin" />
             ) : (
-              <Save className="h-4 w-4 mr-1" />
+              <HugeIcon icon={SaveEnergyIcon} size={16} strokeWidth={2.2} className="h-4 w-4 mr-1" />
             )}
             Save Ranges Only
           </Button>
@@ -346,9 +354,9 @@ export function FounderSlotSelectionPanel(props: {
             onClick={() => void submitSelection('save_and_send')}
           >
             {pendingAction === 'save_and_send' ? (
-              <LoaderCircle className="h-4 w-4 mr-1 animate-spin" />
+              <HugeIcon icon={Loading03Icon} size={16} strokeWidth={2.2} className="h-4 w-4 mr-1 animate-spin" />
             ) : (
-              <Send className="h-4 w-4 mr-1" />
+              <HugeIcon icon={SentIcon} size={16} strokeWidth={2.2} className="h-4 w-4 mr-1" />
             )}
             Save + {sendMode === 'send' ? 'Send' : 'Draft'} Cal Link
           </Button>
@@ -358,7 +366,7 @@ export function FounderSlotSelectionPanel(props: {
       {latestResult?.selection ? (
         <div className="mt-3 rounded-md border border-input bg-muted/40 p-3 text-xs space-y-1">
           <div className="flex items-center gap-1 font-medium">
-            <CalendarCheck className="h-4 w-4" />
+            <HugeIcon icon={CalendarCheckIn01Icon} size={16} strokeWidth={2.2} className="h-4 w-4" />
             Latest Selection Saved
           </div>
           <p>Selection ID: {latestResult.selection.id}</p>

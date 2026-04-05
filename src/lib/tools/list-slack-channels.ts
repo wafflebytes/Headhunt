@@ -44,6 +44,12 @@ export const listSlackChannels = withSlack(
           }
         }
 
+        if (error instanceof Error && /authorization required to access the token vault/i.test(error.message)) {
+          throw new TokenVaultError(
+            `Authorization required to access the Token Vault: ${SLACK_TOKEN_VAULT_CONNECTION}. Required scopes: ${SLACK_SCOPES.join(', ')}`,
+          );
+        }
+
         throw error;
       }
     },

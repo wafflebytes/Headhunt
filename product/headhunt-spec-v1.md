@@ -4,6 +4,7 @@
 
 > **Stack:** Next.js 15 · Vercel AI SDK · Supabase · Auth0 (Token Vault · FGA · CIBA · MCP)
 > **Status:** Demo Phase (operator-assisted) · Deadline Apr 6 2026
+> **Reality Sync:** Validated against flow_context on 2026-04-05 (Cal-first scheduling + CIBA-gated offer release)
 
 ---
 
@@ -25,8 +26,8 @@ Most entries show an AI agent doing things. Headhunt shows one **stopping** — 
 | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Security Model**      | CIBA gates on 3 high-stakes moments; Token Vault holds every OAuth token; no agent ever sees a raw credential; RAR scopes each token to a single job context   |
 | **User Control**        | Founders see exactly what each agent is authorized to touch; FGA tuples surface as a human-readable Clearance Panel; every action logged in Field Log          |
-| **Technical Execution** | Token Vault + FGA + CIBA deployed non-trivially; real Gmail Pub/Sub pipeline; six-agent crew on Vercel AI SDK                                                  |
-| **Design**              | Zero chat UI: Ops Board kanban, AI-rendered calendar slot picker, Field Log timeline — decisions surface as cards, not conversations                           |
+| **Technical Execution** | Token Vault + FGA + CIBA deployed non-trivially; live Gmail polling + edge automation queue chain; six-agent crew on Vercel AI SDK                              |
+| **Design**              | Operator-first now, no-chat board target: tool-calling control plane today, with pipeline cards and Field Log shaping the future Ops Board                      |
 | **Insight Value**       | A novel Auth0 pattern: CIBA as a delegation escalation gate — a hiring manager can draft, only a founder can fire. No existing documented example of this flow |
 
 ### Demo-Phase Scope Override (Apr 2026)
@@ -45,6 +46,19 @@ This spec is intentionally written for current demo operation, not full autonomo
   - Cal transcripts via `/v2/bookings/{bookingUid}/transcripts`,
   - fallback to Google Drive PDF transcript parsing when Cal transcript text is unavailable.
 - Final hiring decision after transcript summary is human-in-the-loop (advance, hold, reject, or draft offer).
+
+### Current Demo State Machine (Validated)
+
+1. `scheduling.request.send`: sends candidate slot options from live Cal availability (`sendMode=send`).
+2. `scheduling.reply.parse_book`: parses candidate reply, rechecks overlap, books in Cal, moves candidate to `interview_scheduled`.
+3. `offer.draft.create`: auto-triggered after successful booking when `autoSubmitOffer=true`.
+4. `offer.submit.clearance` -> `offer.clearance.poll`: initiates CIBA clearance, waits for approval, then sends offer after clearance.
+
+Operational guardrails:
+
+- Queue processing drains in multiple claim rounds in one invocation.
+- Booking mode defaults to higher process-now limits so scheduling -> draft -> submit can complete in one cycle.
+- Terminal "offer not found" clearance errors are dead-lettered, not retried forever.
 
 ---
 
@@ -125,7 +139,7 @@ Headhunt runs a **one commander, five specialist agents** model. Each agent has 
     │ INTERCEPT │ │  TRIAGE   │ │  ANALYST  │ │  LIAISON  │ │ DISPATCH  │
     │           │ │           │ │           │ │           │ │           │
     │ Gmail     │ │ Routes    │ │ Parses +  │ │ Calendar· │ │ Letter gen│
-    │ Pub/Sub   │ │ emails to │ │ scores vs │ │ Meet·Slack│ │ CIBA hold │
+    │ Inbox scan│ │ emails to │ │ scores vs │ │ Cal·Slack │ │ CIBA hold │
     │ watch     │ │ search    │ │ JD        │ │ ·Gmail    │ │           │
     └───────────┘ └───────────┘ └───────────┘ └───────────┘ └───────────┘
 ```
@@ -134,14 +148,14 @@ Headhunt runs a **one commander, five specialist agents** model. Each agent has 
 
 #### Commander — `Control`
 
-- **Trigger:** Gmail Pub/Sub webhook (new email) OR user action on platform (click Interview / click Hire)
+- **Trigger:** Polling/automation intake detects new email OR user action on platform (click Interview / click Hire)
 - **Responsibility:** Decides which agent to deploy based on context. Maintains pipeline state transitions. Checks FGA before any write action.
 - **Token Vault access:** Requests tokens on behalf of field agents with minimum scopes needed.
 - **Memory:** Reads job context and candidate context from Supabase before planning.
 
 #### Field Agent 1 — `Intercept`
 
-- **Trigger:** Gmail Pub/Sub webhook fires when a new email arrives in the connected inbox.
+- **Trigger:** Intake scan picks up a new email thread in the connected inbox.
 - **Capability:** Fetches the full email thread using a Gmail API token from Token Vault. Hands the email off to `Triage`.
 - **Scope:** Gmail read-only token, scoped to the specific message ID received from the webhook.
 
@@ -429,16 +443,17 @@ export const validateMcpToken = auth({
 
 ## 6. Auth0 Integration Map
 
-### Social Connections (via Token Vault)
+### External Integrations + Auth Surface
 
-| Service         | Connection Name | Scopes Required                                | Token Vault Purpose                  |
-| --------------- | --------------- | ---------------------------------------------- | ------------------------------------ |
-| Gmail           | `google-oauth2` | `gmail.readonly`, `gmail.send`, `gmail.modify` | Email Monitor reads + sends emails   |
-| Google Calendar | `google-oauth2` | `calendar.events`, `calendar.readonly`         | Interview Coordinator creates events |
-| Slack           | `slack`         | `chat:write`, `channels:read`                  | Post interview summaries             |
-| Tumblr          | `tumblr`        | `write`                                        | Auto-post job listings               |
+| Service                 | Auth Path                         | Scopes / Credentials                                               | Purpose                                                                |
+| ----------------------- | --------------------------------- | ------------------------------------------------------------------ | ---------------------------------------------------------------------- |
+| Gmail                   | `google-oauth2` via Token Vault   | `gmail.readonly`, `gmail.send`, `gmail.modify`, `userinfo.email`  | Inbound monitoring and thread-aware candidate outreach                 |
+| Google Drive (fallback) | `google-oauth2` via Token Vault   | `drive.readonly`                                                   | Transcript PDF fallback when Cal transcript text is unavailable        |
+| Slack                   | `slack` via Token Vault           | `chat:write`, `channels:read`                                      | Post interview summaries                                               |
+| Tumblr                  | `tumblr` via Token Vault          | `write`                                                            | Auto-post job listings                                                 |
+| Cal.com                 | Server-side `CAL_API_KEY`         | API key (non-Token-Vault path in current demo)                    | Slot discovery and booking creation                                    |
 
-> **Note:** Google Calendar and Gmail share the same `google-oauth2` connection in Auth0 but request separate scopes. Token Vault stores them under the same connection with the union of scopes. When an agent requests a token via Token Vault, it specifies the minimum scopes it needs for that operation.
+> **Note:** Gmail and Drive share `google-oauth2` and can require incremental consent. Tools must request the minimum scopes they need at execution time. Cal scheduling is currently API-key based and does not use Token Vault.
 
 ### Token Vault Request Pattern
 
@@ -649,118 +664,85 @@ export async function checkFGA(
 
 ## 8. Connector Strategy
 
-### Gmail — Email Monitoring via Pub/Sub
+### Gmail — Email Monitoring (Current: Polling, Future: Pub/Sub)
 
-Gmail does not support traditional webhooks. Headhunt uses the Google Cloud Pub/Sub approach:
+Current validated demo path:
 
-1. Create a Pub/Sub topic: `headhunt-gmail-watch`
-2. Grant Gmail service account `pubsub.publisher` on the topic
-3. Call `gmail.users.watch` with the topic ARN — Gmail pushes a notification whenever a new message arrives in the watched inbox
-4. Pub/Sub delivers to `POST /api/webhooks/gmail`
-5. Webhook validates the Pub/Sub message, extracts `historyId`, fetches the actual message via Gmail API using Token Vault token
+1. Supabase Cron (or manual trigger) runs intake polling every ~2 minutes.
+2. Intake fetches new Gmail history with Token Vault (`gmail.readonly`).
+3. New candidate threads route through Intercept -> Triage -> Analyst.
 
-**Rate limit handling:** Gmail API allows 1B quota units/day. Each message fetch is ~5 units. For a hackathon demo, no throttling needed. In production, use exponential backoff on 429 responses and a BullMQ queue for message processing.
+Pub/Sub remains a roadmap upgrade, not the default demo execution path.
 
-**Demo alternative (simpler for hackathon):** Polling endpoint at `GET /api/agents/email-monitor` called every 2 minutes via Supabase Cron. Checks for emails since last `historyId` stored in Supabase.
+**Rate limit handling:** Gmail API allows high daily quota, but production should still apply backoff on 429s plus queue-based retries.
 
 ```typescript
-// app/api/webhooks/gmail/route.ts
-import { NextRequest, NextResponse } from "next/server";
+// app/api/agents/email-monitor/route.ts
+import { NextResponse } from "next/server";
 import { getVaultToken } from "@/lib/token-vault";
-import { orchestrator } from "@/lib/agents/orchestrator";
+import { runInboxScan } from "@/lib/agents/intercept-scan";
 
-export async function POST(req: NextRequest) {
-  const body = await req.json();
-  const data = JSON.parse(Buffer.from(body.message.data, "base64").toString());
-
-  // data = { emailAddress: "founder@company.com", historyId: "12345" }
-  // Fetch new messages since last historyId
+export async function GET() {
   const token = await getVaultToken(FOUNDER_USER_ID, "google-oauth2", [
     "gmail.readonly",
   ]);
-  const gmail = createGmailClient(token);
 
-  const history = await gmail.users.history.list({
-    userId: "me",
-    startHistoryId: data.historyId,
-    historyTypes: ["messageAdded"],
+  const result = await runInboxScan({
+    token,
+    maxMessages: 25,
+    sinceCursor: await loadLastHistoryCursor(),
   });
 
-  for (const item of history.data.history ?? []) {
-    for (const msg of item.messagesAdded ?? []) {
-      await orchestrator.handleIncomingEmail(msg.message.id, data.emailAddress);
-    }
-  }
-
-  return NextResponse.json({ ok: true });
+  await saveLastHistoryCursor(result.lastHistoryId);
+  return NextResponse.json(result);
 }
 ```
 
-### Google Calendar — Free/Busy + Event Creation
+### Cal.com — Slot Discovery + Booking
 
 ```typescript
-// lib/connectors/calendar.ts
-export async function getAvailableSlots(
-  userId: string,
-  startDate: Date,
-  endDate: Date,
-  durationMinutes: number = 60,
-): Promise<TimeSlot[]> {
-  const token = await getVaultToken(userId, "google-oauth2", [
-    "calendar.readonly",
-  ]);
-  const calendar = createCalendarClient(token);
+// lib/connectors/cal.ts
+const CAL_BASE_URL = process.env.CAL_API_BASE_URL ?? "https://api.cal.com/v2";
 
-  const freeBusy = await calendar.freebusy.query({
-    requestBody: {
-      timeMin: startDate.toISOString(),
-      timeMax: endDate.toISOString(),
-      items: [{ id: "primary" }],
-    },
+export async function listCalSlots(params: {
+  username: string;
+  eventTypeSlug: string;
+  startISO: string;
+  endISO: string;
+}) {
+  const qs = new URLSearchParams({
+    username: params.username,
+    eventTypeSlug: params.eventTypeSlug,
+    start: params.startISO,
+    end: params.endISO,
   });
 
-  const busySlots = freeBusy.data.calendars?.primary?.busy ?? [];
-  return computeAvailableSlots(startDate, endDate, busySlots, durationMinutes);
+  const res = await fetch(`${CAL_BASE_URL}/slots?${qs}`, {
+    headers: { Authorization: `Bearer ${process.env.CAL_API_KEY}` },
+  });
+  return await res.json();
 }
 
-export async function createInterviewEvent(
-  userId: string,
-  candidateName: string,
-  candidateEmail: string,
-  startTime: Date,
-  durationMinutes: number,
-  jobTitle: string,
-): Promise<{ eventId: string; meetLink: string }> {
-  const token = await getVaultToken(userId, "google-oauth2", [
-    "calendar.events",
-  ]);
-  const calendar = createCalendarClient(token);
-
-  const event = await calendar.events.insert({
-    calendarId: "primary",
-    conferenceDataVersion: 1,
-    requestBody: {
-      summary: `Interview: ${candidateName} — ${jobTitle}`,
-      start: { dateTime: startTime.toISOString() },
-      end: {
-        dateTime: new Date(
-          startTime.getTime() + durationMinutes * 60000,
-        ).toISOString(),
-      },
-      attendees: [{ email: candidateEmail }],
-      conferenceData: {
-        createRequest: {
-          requestId: `headhunt-${Date.now()}`,
-          conferenceSolutionKey: { type: "hangoutsMeet" },
-        },
-      },
-      description: `Headhunt automated interview scheduling for ${jobTitle} role.`,
+export async function createCalBooking(input: {
+  startISO: string;
+  eventTypeSlug: string;
+  attendeeName: string;
+  attendeeEmail: string;
+}) {
+  const res = await fetch(`${CAL_BASE_URL}/bookings`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      Authorization: `Bearer ${process.env.CAL_API_KEY}`,
     },
+    body: JSON.stringify(input),
   });
 
+  const payload = await res.json();
   return {
-    eventId: event.data.id!,
-    meetLink: event.data.conferenceData?.entryPoints?.[0]?.uri ?? "",
+    bookingUid: payload.data.uid,
+    startISO: payload.data.start,
+    endISO: payload.data.end,
   };
 }
 ```
@@ -1086,9 +1068,9 @@ On the Candidate Detail screen, a vertical timeline shows every agent action and
 [09:46] 📧 Interview invitation sent to candidate@email.com
 [Mar 12] 📧 Candidate replied with availability
 [Mar 12] 🤖 Liaison detected scheduling reply
-[Mar 12] 📅 Calendar slot selected: Mar 15, 2pm IST
-[Mar 12] 📅 Google Meet event created: meet.google.com/abc-xyz
-[Mar 12] 📧 Confirmation email sent
+[Mar 12] 📅 Cal slot selected: Mar 15, 2pm IST
+[Mar 12] 📅 Cal booking confirmed: UID abkf3unMvNB2cJYNu84gDt
+[Mar 12] ✉️ Cal invite sent to candidate (platform confirmation skipped)
 [Mar 15] 🎤 Interview completed
 [Mar 15] 🤖 Liaison generated interview notes
 [Mar 15] 💬 Slack summary posted to #hiring
@@ -1103,11 +1085,11 @@ On the Candidate Detail screen, a vertical timeline shows every agent action and
 
 ## 13. UX Philosophy & Flows
 
-### Core Principle: No Chat Interface
+### Core Principle: Operator-Controlled Now, No-Chat Board Next
 
-Headhunt is not a chatbot. The agent interactions are invisible infrastructure. The UI surfaces results, not conversations.
+Headhunt is not aiming to be a forever chatbot. In demo phase, operator chat is the deterministic control plane for tool execution; the long-term product target is a no-chat Ops Board where repeat actions are card- and form-driven.
 
-**Non-chat patterns used:**
+**Current/target interaction patterns:**
 
 1. **Pipeline Kanban:** Candidate cards move through columns. Each card shows name, score badge, last action, and stage. Action buttons on each card trigger agent flows.
 
@@ -1390,8 +1372,9 @@ Cards for all pending approvals:
   "jobId": "job_senior_eng_001",
   "scheduledAt": "2026-04-05T08:30:00.000Z",
   "durationMinutes": 60,
-  "googleCalendarEventId": "evt_xyz789",
-  "googleMeetLink": "https://meet.google.com/abc-xyz-def",
+  "googleCalendarEventId": "cal:abkf3unMvNB2cJYNu84gDt",
+  "googleMeetLink": null,
+  "calBookingUid": "abkf3unMvNB2cJYNu84gDt",
   "status": "scheduled",
   "interviewerUserIds": ["auth0|manager_bob"],
   "summary": null,
@@ -1575,12 +1558,13 @@ curl -X POST https://localhost:3000/api/agents/analyst \
 | Candidate Intelligence Card                              | Full breakdown view                                                               |
 | Calendar slot picker (AI-rendered)                       | `generateObject` → visual grid UI                                                 |
 | Interview invitation email (draft + human send-approval) | Template-based                                                                    |
-| Confirmation email + Meet link creation                  | Auto-sent on slot selection                                                       |
+| Cal booking confirmation + invite policy                 | Cal sends invite; platform skips duplicate founder-sent confirmation              |
 | Slack interview summary                                  | Post-interview trigger                                                            |
 | Offer letter drafting                                    | Template + term form                                                              |
 | CIBA for offer approval (hiring manager → founder)       | Core demo moment                                                                  |
 | FGA with 3 roles (founder, hiring_manager, interviewer)  | Enforced on all API routes                                                        |
-| Token Vault for Gmail, Calendar, Slack, Tumblr           | All tokens via vault, none in env                                                 |
+| Token Vault for Gmail, Drive fallback, Slack, Tumblr     | All user-scoped tokens via vault, none in env                                    |
+| Cal booking integration                                  | Server-side API key path for slots + bookings                                     |
 | Audit log timeline per candidate                         | Display only, no export                                                           |
 | MCP server (4 tools)                                     | `list_jobs`, `get_candidate_detail`, `list_pipeline`, `summarize_pipeline_health` |
 
@@ -1589,7 +1573,7 @@ curl -X POST https://localhost:3000/api/agents/analyst \
 | Feature                                             | Reason Deferred                                       |
 | --------------------------------------------------- | ----------------------------------------------------- |
 | Gmail Pub/Sub (real-time instead of polling)        | GCP setup overhead; polling works for demo            |
-| Automatic interview summary from Meet transcript    | Meet transcript API requires specific Workspace setup |
+| Transcript quality scoring + multi-source enrichment | Keep baseline Cal/Drive summary first; add deeper analytics in v2 |
 | Bulk reject CIBA (step-up on self)                  | Third CIBA flow; cut for time                         |
 | AI-assisted candidate filtering inside platform     | v2 "AI filter" feature                                |
 | Additional job board publishing (LinkedIn, X, etc.) | Tumblr is the proof of concept                        |
@@ -1637,7 +1621,7 @@ headhunt/
 │   │       └── templates/page.tsx
 │   └── api/
 │       ├── agents/
-│       │   ├── email-monitor/route.ts    # Polling endpoint + Pub/Sub handler
+│       │   ├── email-monitor/route.ts    # Polling intake endpoint (Pub/Sub optional)
 │       │   ├── classify/route.ts
 │       │   ├── parse-candidate/route.ts
 │       │   ├── schedule/route.ts         # Slot computation + generateObject
@@ -1645,7 +1629,7 @@ headhunt/
 │       │   └── offer-letter/route.ts
 │       ├── mcp/route.ts                  # MCP server HTTP transport
 │       ├── webhooks/
-│       │   └── gmail/route.ts            # Pub/Sub push endpoint
+│       │   └── gmail/route.ts            # Optional Gmail Pub/Sub push endpoint
 │       ├── jobs/
 │       │   ├── route.ts                  # GET all, POST create
 │       │   └── [jobId]/route.ts
@@ -1753,10 +1737,15 @@ SUPABASE_SERVICE_ROLE_KEY=           # eyJ...
 # ── AI ────────────────────────────────────────────────────────────────────────
 OPENAI_API_KEY=                      # For Vercel AI SDK (gpt-4o-mini for agents)
 
-# ── Google (configured in Auth0 Social Connections, but needed for Pub/Sub) ──
-GOOGLE_CLOUD_PROJECT_ID=
-GOOGLE_PUBSUB_TOPIC=                 # projects/{id}/topics/headhunt-gmail-watch
+# ── Cal.com ───────────────────────────────────────────────────────────────────
+CAL_API_KEY=
+CAL_DEFAULT_USERNAME=                # headhunt
+CAL_DEFAULT_EVENT_TYPE_SLUG=         # 30min
+
+# ── Google (Token Vault + optional Pub/Sub upgrade) ──────────────────────────
 GMAIL_WATCHED_EMAIL=                 # hiring@yourdomain.com
+GOOGLE_CLOUD_PROJECT_ID=             # optional (only for Pub/Sub rollout)
+GOOGLE_PUBSUB_TOPIC=                 # optional: projects/{id}/topics/headhunt-gmail-watch
 
 # ── Slack ─────────────────────────────────────────────────────────────────────
 # (Token stored in Token Vault — only need default channel ID here)
@@ -1777,7 +1766,7 @@ CRON_SECRET=                         # Secret to validate Supabase Cron calls
 ### Q2 2026 — Stabilise
 
 - Replace polling with Gmail Pub/Sub (real-time email detection)
-- Add Meet transcript summary (Google Drive recording → transcript → summary)
+- Harden Cal transcript ingestion + richer scoring/rubric outputs
 - Bulk reject CIBA (step-up auth on self)
 - Audit log CSV export
 - Full email reply threading for scheduling back-and-forth
@@ -1887,9 +1876,9 @@ Run: `npx ts-node scripts/bootstrap-fga.ts`
                No black box."
 
 01:00 – 01:30  Click Interview. Calendar slot picker appears from Liaison.
-               "Liaison queried my Google Calendar. I pick a slot. It creates
-               the Meet event and sends the confirmation — automatically."
-               Show confirmation email rendered in the timeline.
+               "Liaison pulled live Cal availability. I pick a slot. It books
+               in Cal and Cal sends the invite — no duplicate platform email."
+               Show Cal booking UID and audit timeline entry.
 
 01:30 – 02:00  Open Clearance Queue. Dispatch holding an offer for Jane.
                "Bob, my hiring manager, drafted an offer. But FGA says only
@@ -1913,7 +1902,7 @@ Run: `npx ts-node scripts/bootstrap-fga.ts`
 
 1. **Create Application:** Single Page App → get Client ID and Secret
 2. **Create API:** Audience = `https://api.headhunt.app`; enable RBAC; add permissions (`read:candidates`, `write:offers`, etc.)
-3. **Enable Social Connections:** Google OAuth2 (request Gmail + Calendar scopes), Slack, Tumblr — all via Token Vault
+3. **Enable Social Connections:** Google OAuth2 (request Gmail + Drive fallback scopes), Slack, Tumblr — all via Token Vault
 4. **Create M2M Application:** For Management API access (Token Vault token fetching). Grant `read:user_idp_tokens` scope.
 5. **Enable CIBA:** In tenant settings → Advanced → Enable CIBA flow; configure Auth0 Guardian
 6. **Create FGA Store:** Via Auth0 Dashboard → FGA → New Store → import model from Appendix A

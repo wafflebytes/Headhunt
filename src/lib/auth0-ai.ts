@@ -145,7 +145,9 @@ export const DRIVE_READ_SCOPES = [
   'https://www.googleapis.com/auth/drive.readonly',
 ];
 export const GOOGLE_UNIFIED_SCOPES = uniqueScopes([...GMAIL_READ_SCOPES, ...GMAIL_WRITE_SCOPES, ...CALENDAR_SCOPES]);
-export const SLACK_SCOPES = uniqueScopes(parseScopes(process.env.AUTH0_SLACK_SCOPES, ['channels:read']));
+export const SLACK_SCOPES = uniqueScopes(
+  parseScopes(process.env.AUTH0_SLACK_SCOPES, ['channels:read', 'channels:history', 'chat:write']),
+);
 export const CAL_COM_SCOPES = uniqueScopes(parseScopes(process.env.AUTH0_CAL_SCOPES, [
   'PROFILE_READ',
   'SCHEDULE_READ',

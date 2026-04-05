@@ -28,7 +28,13 @@ type NormalizedTriageResult = {
   route: TriageRoute;
   reasoning: string;
   fallback: boolean;
+  automationSafe: boolean;
+  boundaryReason: string | null;
+  suggestedAction: 'route_analyst' | 'route_liaison' | 'manual_review' | 'ignore';
 };
+
+const MIN_APPLICATION_AUTOMATION_CONFIDENCE = 0.62;
+const MIN_SCHEDULING_AUTOMATION_CONFIDENCE = 0.7;
 
 const triageResultSchema = z.object({
   classification: z.string().min(1),
@@ -231,6 +237,75 @@ function buildFallbackTriage(input: RunTriageInput, knownJobs: Array<{ id: strin
   };
 }
 
+function evaluateAutomationBoundary(params: {
+  classification: TriageClassification;
+  confidence: number;
+  jobId: string | null;
+  knownJobCount: number;
+}): Pick<NormalizedTriageResult, 'automationSafe' | 'boundaryReason' | 'suggestedAction'> {
+  if (params.classification === 'irrelevant') {
+    return {
+      automationSafe: false,
+      boundaryReason: 'non_actionable_irrelevant',
+      suggestedAction: 'ignore',
+    };
+  }
+
+  if (params.classification === 'inquiry') {
+    return {
+      automationSafe: false,
+      boundaryReason: 'non_actionable_inquiry',
+      suggestedAction: 'manual_review',
+    };
+  }
+
+  if (params.classification === 'application') {
+    if (params.confidence < MIN_APPLICATION_AUTOMATION_CONFIDENCE) {
+      return {
+        automationSafe: false,
+        boundaryReason: 'low_confidence_application',
+        suggestedAction: 'manual_review',
+      };
+    }
+
+    if (!params.jobId) {
+      return {
+        automationSafe: false,
+        boundaryReason: 'missing_job_match',
+        suggestedAction: 'manual_review',
+      };
+    }
+
+    return {
+      automationSafe: true,
+      boundaryReason: null,
+      suggestedAction: 'route_analyst',
+    };
+  }
+
+  if (params.confidence < MIN_SCHEDULING_AUTOMATION_CONFIDENCE) {
+    return {
+      automationSafe: false,
+      boundaryReason: 'low_confidence_scheduling_reply',
+      suggestedAction: 'manual_review',
+    };
+  }
+
+  if (!params.jobId && params.knownJobCount > 1) {
+    return {
+      automationSafe: false,
+      boundaryReason: 'ambiguous_job_match',
+      suggestedAction: 'manual_review',
+    };
+  }
+
+  return {
+    automationSafe: true,
+    boundaryReason: null,
+    suggestedAction: 'route_liaison',
+  };
+}
+
 export type RunTriageInput = z.infer<typeof triageInputSchema>;
 export type GenerateIntelCardInput = z.infer<typeof intelCardInputSchema>;
 
@@ -264,6 +339,13 @@ export async function runTriage(input: RunTriageInput) {
       ? modelJobId
       : pickJobIdByTextMatch({ subject: input.subject, body: input.body }, knownJobs);
 
+    const boundary = evaluateAutomationBoundary({
+      classification,
+      confidence: normalizeConfidence(object.confidence),
+      jobId: matchedJobId,
+      knownJobCount: knownJobs.length,
+    });
+
     triage = {
       classification,
       jobId: matchedJobId,
@@ -271,9 +353,25 @@ export async function runTriage(input: RunTriageInput) {
       route,
       reasoning: object.reasoning ?? 'Structured triage generation succeeded.',
       fallback: false,
+      automationSafe: boundary.automationSafe,
+      boundaryReason: boundary.boundaryReason,
+      suggestedAction: boundary.suggestedAction,
     };
   } catch {
-    triage = buildFallbackTriage(input, knownJobs);
+    const fallback = buildFallbackTriage(input, knownJobs);
+    const boundary = evaluateAutomationBoundary({
+      classification: fallback.classification,
+      confidence: fallback.confidence,
+      jobId: fallback.jobId,
+      knownJobCount: knownJobs.length,
+    });
+
+    triage = {
+      ...fallback,
+      automationSafe: boundary.automationSafe,
+      boundaryReason: boundary.boundaryReason,
+      suggestedAction: boundary.suggestedAction,
+    };
   }
 
   await db.insert(auditLogs).values({
@@ -292,6 +390,9 @@ export async function runTriage(input: RunTriageInput) {
       route: triage.route,
       reasoning: triage.reasoning,
       fallback: triage.fallback,
+      automationSafe: triage.automationSafe,
+      boundaryReason: triage.boundaryReason,
+      suggestedAction: triage.suggestedAction,
     },
     result: 'success',
   });

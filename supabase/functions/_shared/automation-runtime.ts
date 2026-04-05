@@ -324,6 +324,15 @@ function shouldDeadLetterWithoutRetry(run: AutomationRunRow, result: JsonObject)
 
   const message = (asString(result.message) ?? '').toLowerCase();
 
+  // Token Vault consent/scope errors require user re-authorization, so retries will not self-heal.
+  if (message.includes('authorization required to access the token vault')) {
+    return true;
+  }
+
+  if (message.includes('missing scopes:')) {
+    return true;
+  }
+
   if (run.handler_type === 'offer.submit.clearance' && message.includes('offer not found')) {
     return true;
   }
@@ -342,6 +351,42 @@ function shouldDeadLetterWithoutRetry(run: AutomationRunRow, result: JsonObject)
     }
 
     if (message.includes('service not found')) {
+      return true;
+    }
+  }
+
+  if (run.handler_type === 'interview.transcript.debrief.slack') {
+    if (message.includes('channel_not_found')) {
+      return true;
+    }
+
+    if (message.includes('not_in_channel')) {
+      return true;
+    }
+
+    if (message.includes('not in the #')) {
+      return true;
+    }
+
+    if (message.includes('bot is not in')) {
+      return true;
+    }
+  }
+
+  if (run.handler_type === 'interview.transcript.fetch') {
+    if (message.includes('candidate ') && message.includes(' not found')) {
+      return true;
+    }
+
+    if (message.includes('job ') && message.includes(' not found')) {
+      return true;
+    }
+
+    if (message.includes('no candidate visibility access')) {
+      return true;
+    }
+
+    if (message.includes('insufficient_scope: this endpoint is not available for third-party oauth tokens')) {
       return true;
     }
   }
@@ -576,6 +621,68 @@ async function enqueuePostSuccessFollowUps(
         handlerType: 'offer.clearance.poll',
         resourceType: 'offer',
         resourceId: offerId,
+        idempotencyKey,
+        inserted: enqueueResult.inserted,
+        runId: enqueueResult.runId,
+      });
+    }
+  }
+
+  if (run.handler_type === 'interview.transcript.fetch' && asString(result.status) === 'success') {
+    const candidateId = asString(result.candidateId) ?? asString(payload.candidateId);
+    const jobId = asString(result.jobId) ?? asString(payload.jobId);
+    const summary = asRecord(result.summary);
+
+    if (candidateId && summary) {
+      const organizationId = asString(result.organizationId) ?? asString(payload.organizationId);
+      const actorUserId = asString(payload.actorUserId) ?? resolveDefaultActorUserId();
+      const bookingUid = asString(result.bookingUid) ?? asString(payload.bookingUid);
+      const interviewId = asString(result.interviewId) ?? asString(payload.interviewId);
+      const idempotencyKey = buildIdempotencyKey([
+        'chain',
+        'interview-transcript',
+        'slack-digest',
+        candidateId,
+        jobId,
+        bookingUid,
+        interviewId,
+      ]);
+
+      const digestPayload = compactObject({
+        candidateId,
+        jobId,
+        organizationId,
+        actorUserId,
+        bookingUid,
+        interviewId,
+        source: asString(result.source),
+        summary,
+        transcriptResult: result,
+        transcriptStats: asRecord(result.transcriptStats),
+        driveFile: asRecord(result.driveFile),
+        slackChannel:
+          asString(payload.slackChannel) ??
+          Deno.env.get('HEADHUNT_TRANSCRIPT_SLACK_CHANNEL')?.trim() ??
+          'new-channel',
+        jobRequirements: Array.isArray(payload.jobRequirements)
+          ? payload.jobRequirements.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+          : undefined,
+      });
+
+      const enqueueResult = await enqueueRun(client, {
+        handlerType: 'interview.transcript.debrief.slack',
+        resourceType: 'candidate',
+        resourceId: candidateId,
+        idempotencyKey,
+        payload: digestPayload,
+        maxAttempts: 6,
+      });
+
+      followUps.push({
+        sourceHandler: run.handler_type,
+        handlerType: 'interview.transcript.debrief.slack',
+        resourceType: 'candidate',
+        resourceId: candidateId,
         idempotencyKey,
         inserted: enqueueResult.inserted,
         runId: enqueueResult.runId,
@@ -847,6 +954,26 @@ export async function processQueue(
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Unknown automation error.';
         const nextAttemptCount = run.attempt_count + 1;
+        const terminalAuthError = shouldDeadLetterWithoutRetry(run, {
+          status: 'error',
+          message,
+        });
+
+        if (terminalAuthError) {
+          await updateRun(client, run.id, {
+            status: 'dead_letter',
+            attempt_count: nextAttemptCount,
+            finished_at: nowIso,
+            updated_at: nowIso,
+            last_error: message,
+            last_error_at: nowIso,
+          });
+
+          deadLettered += 1;
+          bumpAgentMetric(agentName, 'deadLettered');
+          continue;
+        }
+
         const reachedMax = nextAttemptCount >= run.max_attempts;
 
         if (reachedMax) {

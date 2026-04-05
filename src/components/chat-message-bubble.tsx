@@ -1,6 +1,7 @@
 import { type UIMessage } from 'ai';
-import { Loader2, CheckCircle, AlertCircle } from 'lucide-react';
+import { Alert02Icon, CheckmarkCircle02Icon, Loading03Icon } from '@hugeicons/core-free-icons';
 
+import { HugeIcon } from '@/components/ui/huge-icon';
 import { MemoizedMarkdown } from './memoized-markdown';
 import { cn } from '@/utils/cn';
 
@@ -23,6 +24,94 @@ type ToolCallView = {
   resultMode?: string | null;
   elapsedMs?: number;
 };
+
+const MANUAL_REVIEW_REASON_LABELS: Record<string, string> = {
+  missing_sender_email: 'Sender email is missing or unparsable',
+  low_identity_confidence: 'Identity extraction confidence is too low',
+  missing_job_context: 'No active job context was resolved',
+  low_confidence_application: 'Triage confidence is too low for auto-routing',
+  ambiguous_job_match: 'Message maps to multiple jobs',
+  ambiguous_candidate_email_match: 'Multiple candidates match the same job/email',
+  candidate_not_found_for_scheduling_reply: 'No candidate matched scheduling reply context',
+  candidate_stage_already_advanced: 'Candidate has already advanced beyond scheduling stage',
+  missing_prior_availability_request: 'No prior availability request context was found',
+  reply_thread_mismatch: 'Reply arrived on a different thread than the request',
+  reply_not_newer_than_request: 'Reply timestamp is not newer than latest request',
+  uncertain_input: 'Input remains uncertain for safe automation',
+  non_actionable_irrelevant: 'Message is irrelevant to recruiting workflow',
+};
+
+function asNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+
+  return null;
+}
+
+function prettifyReasonCode(reasonCode: string): string {
+  const mapped = MANUAL_REVIEW_REASON_LABELS[reasonCode];
+  if (mapped) {
+    return mapped;
+  }
+
+  return reasonCode.replace(/_/g, ' ').trim();
+}
+
+function isManualReviewResult(result: unknown): boolean {
+  const record = asRecord(result);
+  if (!record) {
+    return false;
+  }
+
+  if (record.manualReviewRequired === true) {
+    return true;
+  }
+
+  return asNonEmptyString(record.boundary) === 'manual_review_required';
+}
+
+function getToolOutputTone(result: unknown, status: ToolCallStatus): 'success' | 'warning' | 'error' | 'neutral' {
+  if (status === 'error') {
+    return 'error';
+  }
+
+  const record = asRecord(result);
+  if (!record) {
+    return status === 'complete' ? 'success' : 'neutral';
+  }
+
+  const normalizedStatus = asNonEmptyString(record.status)?.toLowerCase();
+  if (normalizedStatus === 'error' || normalizedStatus === 'failed' || normalizedStatus === 'denied') {
+    return 'error';
+  }
+
+  if (isManualReviewResult(result)) {
+    return 'warning';
+  }
+
+  if (normalizedStatus === 'success' || normalizedStatus === 'healthy' || normalizedStatus === 'completed') {
+    return 'success';
+  }
+
+  return status === 'complete' ? 'success' : 'neutral';
+}
+
+function toolOutputPanelClass(tone: 'success' | 'warning' | 'error' | 'neutral'): string {
+  if (tone === 'error') {
+    return 'bg-red-50 dark:bg-red-900/20 border-red-200 dark:border-red-800 text-red-900 dark:text-red-100';
+  }
+
+  if (tone === 'warning') {
+    return 'bg-amber-50 dark:bg-amber-900/20 border-amber-200 dark:border-amber-800 text-amber-900 dark:text-amber-100';
+  }
+
+  if (tone === 'success') {
+    return 'bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-800 text-green-900 dark:text-green-100';
+  }
+
+  return 'bg-slate-50 dark:bg-slate-900/20 border-slate-200 dark:border-slate-800 text-slate-900 dark:text-slate-100';
+}
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (value && typeof value === 'object' && !Array.isArray(value)) {
@@ -264,6 +353,95 @@ function summarizeToolResult(result: unknown): string | null {
   }
 
   const maybeMessage = (result as { message?: unknown }).message;
+  if (typeof maybeMessage === 'string' && /authorization required to access the token vault/i.test(maybeMessage)) {
+    return 'Authorization is required for this integration. Use the Authorize popup (or Authorize Integrations), then rerun the same command.';
+  }
+
+  const maybeCheck = asNonEmptyString((result as { check?: unknown }).check);
+  const maybeStatus = asNonEmptyString((result as { status?: unknown }).status);
+
+  if (maybeCheck === 'automation_context' && asNonEmptyString((result as { boundary?: unknown }).boundary) === 'manual_review_required') {
+    const contextMessage = asNonEmptyString(maybeMessage) ?? 'Required context is missing for safe automation.';
+    return `Manual review required: ${contextMessage}`;
+  }
+
+  if (maybeCheck === 'run_intake_e2e' && maybeStatus === 'success') {
+    const processedCount = asNumber((result as { processedCount?: unknown }).processedCount) ?? 0;
+    const ingestedCreated = asNumber((result as { ingestedCreated?: unknown }).ingestedCreated) ?? 0;
+    const ingestedIdempotent = asNumber((result as { ingestedIdempotent?: unknown }).ingestedIdempotent) ?? 0;
+    const uncertainManualReviewCount =
+      asNumber((result as { uncertainManualReviewCount?: unknown }).uncertainManualReviewCount) ?? 0;
+    const ambiguousIdentityCount =
+      asNumber((result as { ambiguousIdentityCount?: unknown }).ambiguousIdentityCount) ?? 0;
+
+    const lines = [
+      `Intake run processed ${processedCount} message${processedCount === 1 ? '' : 's'}.`,
+      `Created candidates: ${ingestedCreated}. Idempotent matches: ${ingestedIdempotent}.`,
+    ];
+
+    if (uncertainManualReviewCount > 0) {
+      lines.push(`Manual review required for ${uncertainManualReviewCount} message${uncertainManualReviewCount === 1 ? '' : 's'}.`);
+
+      const messages = Array.isArray((result as { messages?: unknown }).messages)
+        ? ((result as { messages?: unknown }).messages as unknown[])
+        : [];
+      const reasonCounts = new Map<string, number>();
+
+      messages.forEach((entry) => {
+        const row = asRecord(entry);
+        if (!row) {
+          return;
+        }
+
+        const reasonCode = asNonEmptyString(row.reasonCode);
+        if (!reasonCode) {
+          return;
+        }
+
+        reasonCounts.set(reasonCode, (reasonCounts.get(reasonCode) ?? 0) + 1);
+      });
+
+      const topReasons = Array.from(reasonCounts.entries())
+        .sort((left, right) => right[1] - left[1])
+        .slice(0, 3)
+        .map(([reasonCode, count]) => `${prettifyReasonCode(reasonCode)} (${count})`);
+
+      if (topReasons.length > 0) {
+        lines.push(`Top boundary reasons: ${topReasons.join('; ')}.`);
+      }
+    }
+
+    if (ambiguousIdentityCount > 0) {
+      lines.push(`Ambiguous identity matches: ${ambiguousIdentityCount}.`);
+    }
+
+    return lines.join('\n');
+  }
+
+  if (isManualReviewResult(result)) {
+    const manualReviewReason =
+      asNonEmptyString((result as { manualReviewReason?: unknown }).manualReviewReason) ??
+      asNonEmptyString((result as { reason?: unknown }).reason) ??
+      asNonEmptyString(maybeMessage);
+    const boundaryReason =
+      asNonEmptyString((result as { reasonCode?: unknown }).reasonCode) ??
+      asNonEmptyString((result as { boundaryReason?: unknown }).boundaryReason);
+    const suggestedAction = asNonEmptyString((result as { suggestedAction?: unknown }).suggestedAction);
+
+    const lines = ['Manual review required before continuing automation.'];
+    if (manualReviewReason) {
+      lines.push(`Reason: ${manualReviewReason}`);
+    }
+    if (boundaryReason) {
+      lines.push(`Boundary: ${prettifyReasonCode(boundaryReason)}`);
+    }
+    if (suggestedAction) {
+      lines.push(`Suggested next step: ${suggestedAction.replace(/_/g, ' ')}`);
+    }
+
+    return lines.join('\n');
+  }
+
   if (typeof maybeMessage === 'string' && maybeMessage.trim()) {
     return maybeMessage.trim();
   }
@@ -748,14 +926,15 @@ function ToolCallDisplay({ toolCall }: { toolCall: ToolCallView }) {
   const outputSummary = summarizeToolOutput(toolCall);
   const hasRawObjectOutput = result !== undefined && typeof result === 'object' && result !== null;
   const normalizedResultStatus = resultStatus ? normalizeStatusLabel(resultStatus) : null;
+  const outputTone = getToolOutputTone(result, status);
 
   return (
     <div className="border border-gray-200 rounded-lg p-3 mb-2 bg-gray-50 dark:bg-gray-800 dark:border-gray-600">
       <div className="flex items-start justify-between gap-2 mb-2">
         <div className="flex items-center flex-wrap gap-2">
-          {status === 'pending' && <Loader2 className="w-4 h-4 animate-spin text-blue-500" />}
-          {status === 'complete' && <CheckCircle className="w-4 h-4 text-green-500" />}
-          {status === 'error' && <AlertCircle className="w-4 h-4 text-red-500" />}
+          {status === 'pending' && <HugeIcon icon={Loading03Icon} size={16} strokeWidth={2.2} className="w-4 h-4 animate-spin text-blue-500" />}
+          {status === 'complete' && <HugeIcon icon={CheckmarkCircle02Icon} size={16} strokeWidth={2.2} className="w-4 h-4 text-green-500" />}
+          {status === 'error' && <HugeIcon icon={Alert02Icon} size={16} strokeWidth={2.2} className="w-4 h-4 text-red-500" />}
 
           <span className="font-medium text-sm text-gray-900 dark:text-gray-100">{toolName}</span>
 
@@ -806,7 +985,7 @@ function ToolCallDisplay({ toolCall }: { toolCall: ToolCallView }) {
       {result !== undefined && (
         <div>
           <div className="text-xs text-gray-600 dark:text-gray-400 mb-1 font-medium">Output:</div>
-          <div className="bg-green-50 dark:bg-green-900/20 rounded px-3 py-2 text-xs border border-green-200 dark:border-green-800 whitespace-pre-wrap text-green-900 dark:text-green-100">
+          <div className={cn('rounded px-3 py-2 text-xs border whitespace-pre-wrap', toolOutputPanelClass(outputTone))}>
             {outputSummary || '(no output details)'}
           </div>
 
