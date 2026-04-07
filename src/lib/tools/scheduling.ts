@@ -1584,6 +1584,7 @@ export const scheduleInterviewSlotsTool = withCalendar(
         const event = await calendar.events.insert({
           auth,
           calendarId: 'primary',
+          sendUpdates: 'all',
           conferenceDataVersion: 1,
           requestBody: {
             summary: `Interview: ${candidate.name} - ${job.title}`,
@@ -1604,7 +1605,7 @@ export const scheduleInterviewSlotsTool = withCalendar(
         const meetLink = event.data.hangoutLink ?? event.data.conferenceData?.entryPoints?.[0]?.uri ?? null;
         const updatedAt = new Date();
 
-        const [interviewRow] = await db.transaction(async (tx: typeof db) => {
+        const [interviewRow] = await db.transaction(async (tx) => {
           const [createdInterview] = await tx
             .insert(interviews)
             .values({
@@ -2373,7 +2374,7 @@ async function executeSendInterviewConfirmation(input: SendInterviewConfirmation
 
     const updatedAt = new Date();
 
-    await db.transaction(async (tx: typeof db) => {
+    await db.transaction(async (tx) => {
       await tx
         .update(candidates)
         .set({
@@ -3260,7 +3261,7 @@ export const runFinalScheduleFlowTool = withGmailWrite(
       const durationMinutes = Number.isFinite(calculatedDuration) ? calculatedDuration : resolvedDurationMinutes;
       const updatedAt = new Date();
 
-      const [interviewRow] = await db.transaction(async (tx: typeof db) => {
+      const [interviewRow] = await db.transaction(async (tx) => {
         const [createdInterview] = await tx
           .insert(interviews)
           .values({

@@ -86,7 +86,8 @@ export async function shareDocument(documentId: string, sharedWith: string[]) {
     .select({ sharedWith: documentsTable.sharedWith })
     .from(documentsTable)
     .where(eq(documentsTable.id, documentId));
-  const mergedSharedWith = [...currentSharedWith[0]?.sharedWith, ...sharedWith];
+  const existingSharedWith = currentSharedWith[0]?.sharedWith ?? [];
+  const mergedSharedWith = [...existingSharedWith, ...sharedWith];
   await db.update(documentsTable).set({ sharedWith: mergedSharedWith }).where(eq(documentsTable.id, documentId));
   // write the relationship tuples to FGA
   for (const user of sharedWith) {
@@ -104,7 +105,7 @@ export async function deleteDocument(documentId: string) {
     .from(documentsTable)
     .where(eq(documentsTable.id, documentId));
   // delete the relationship tuples from FGA
-  for (const sUser of currentSharedWith[0]?.sharedWith) {
+  for (const sUser of currentSharedWith[0]?.sharedWith ?? []) {
     await deleteRelation(sUser, documentId, 'viewer');
   }
 

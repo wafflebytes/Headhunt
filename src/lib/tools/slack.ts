@@ -3,12 +3,23 @@ import { TokenVaultError } from '@auth0/ai/interrupts';
 import { tool } from 'ai';
 import { z } from 'zod';
 
-import { getAccessToken, SLACK_SCOPES, SLACK_TOKEN_VAULT_CONNECTION, withSlack } from '@/lib/auth0-ai';
+import { getSlackAccessToken, SLACK_SCOPES, SLACK_TOKEN_VAULT_CONNECTION, withSlack } from '@/lib/auth0-ai';
 
 type SlackChannel = {
   id: string;
   name: string | null;
 };
+
+function isSlackReauthErrorCode(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  return (
+    normalized === 'missing_scope' ||
+    normalized === 'not_authed' ||
+    normalized === 'invalid_auth' ||
+    normalized === 'account_inactive' ||
+    normalized === 'token_revoked'
+  );
+}
 
 function normalizeChannelInput(value: string): string {
   return value.trim().replace(/^#/, '');
@@ -39,6 +50,10 @@ async function resolveChannel(web: WebClient, channelInput: string): Promise<Sla
       cursor,
     });
 
+    if (!result.ok) {
+      throw new Error(result.error || 'Slack conversations.list failed.');
+    }
+
     const match = result.channels?.find((channel) => channel.name === normalizedInput);
     if (match?.id) {
       return { id: match.id, name: match.name ?? normalizedInput };
@@ -60,10 +75,16 @@ export const sendSlackMessageTool = withSlack(
       channel: z.string().min(1),
       text: z.string().min(1),
       threadTs: z.string().optional(),
+      tokenVaultLoginHint: z.string().optional(),
+      actorUserId: z.string().optional(),
+      allowTokenVaultFallback: z.boolean().optional(),
     }),
-    execute: async ({ channel, text, threadTs }) => {
+    execute: async ({ channel, text, threadTs, tokenVaultLoginHint, actorUserId, allowTokenVaultFallback }) => {
       try {
-        const accessToken = await getAccessToken();
+        const accessToken = await getSlackAccessToken({
+          loginHint: tokenVaultLoginHint ?? actorUserId,
+          allowTokenVaultFallback,
+        });
         const web = new WebClient(accessToken);
         const resolvedChannel = await resolveChannel(web, channel);
 
@@ -74,7 +95,14 @@ export const sendSlackMessageTool = withSlack(
         });
 
         if (!response.ok) {
-          throw new Error(response.error || 'Slack message could not be sent.');
+          const errorCode = response.error || 'Slack message could not be sent.';
+          if (typeof errorCode === 'string' && isSlackReauthErrorCode(errorCode)) {
+            throw new TokenVaultError(
+              `Authorization required to access the Token Vault: ${SLACK_TOKEN_VAULT_CONNECTION}. Required scopes: ${SLACK_SCOPES.join(', ')}`,
+            );
+          }
+
+          throw new Error(errorCode);
         }
 
         let permalink: string | null = null;
@@ -111,6 +139,12 @@ export const sendSlackMessageTool = withSlack(
       } catch (error) {
         if (error instanceof TokenVaultError) {
           throw error;
+        }
+
+        if (error instanceof Error && isSlackReauthErrorCode(error.message)) {
+          throw new TokenVaultError(
+            `Authorization required to access the Token Vault: ${SLACK_TOKEN_VAULT_CONNECTION}. Required scopes: ${SLACK_SCOPES.join(', ')}`,
+          );
         }
 
         if (error && typeof error === 'object' && 'code' in error && error.code === ErrorCode.HTTPError) {

@@ -100,7 +100,6 @@ export default async function Home() {
   }
 
   let activeJobs: Array<{ id: string; title: string; organizationId: string | null }> = [];
-
   try {
     activeJobs = await withTimeout(
       db

@@ -6,6 +6,13 @@ interface KeyValueMap {
   [key: string]: any;
 }
 
+type WorkspaceContext = {
+  organizationId?: string | null;
+  organizationName?: string | null;
+  role?: string | null;
+  avatarUrl?: string | null;
+};
+
 function getAvatarFallback(user: KeyValueMap) {
   const givenName = user.given_name;
   const familyName = user.family_name;
@@ -23,13 +30,25 @@ function getAvatarFallback(user: KeyValueMap) {
   return name?.[0] || 'U';
 }
 
-export default function UserInfoCard({ user }: { user: KeyValueMap }) {
+export default function UserInfoCard({ user, workspace }: { user: KeyValueMap; workspace?: WorkspaceContext | null }) {
+  const workspaceOrganizationName =
+    typeof workspace?.organizationName === 'string' && workspace.organizationName.trim().length > 0
+      ? workspace.organizationName.trim()
+      : null;
+
+  const workspaceRole =
+    typeof workspace?.role === 'string' && workspace.role.trim().length > 0
+      ? workspace.role.trim()
+      : null;
+
+  const avatarUrl = workspace?.avatarUrl ?? user.picture;
+
   return (
     <div className="bg-white/10 backdrop-blur-sm rounded-lg border border-white/20 p-6">
       <div className="flex flex-col items-center space-y-4">
         {/* Avatar */}
         <Avatar className="h-24 w-24">
-          <AvatarImage src={user.picture} alt={user.name} />
+          <AvatarImage src={avatarUrl} alt={user.name} />
           <AvatarFallback className="text-2xl bg-primary text-primary-foreground">
             {getAvatarFallback(user)}
           </AvatarFallback>
@@ -90,11 +109,27 @@ export default function UserInfoCard({ user }: { user: KeyValueMap }) {
               </div>
             )}
 
-            {user.org_id && (
+            {workspaceOrganizationName && (
+              <div className="flex items-center gap-2">
+                <HugeIcon icon={Globe02Icon} size={16} strokeWidth={2.2} className="h-4 w-4 text-white/60" />
+                <span className="text-white/80">Organization:</span>
+                <span className="text-white">{workspaceOrganizationName}</span>
+              </div>
+            )}
+
+            {workspaceRole && (
+              <div className="flex items-center gap-2">
+                <HugeIcon icon={User03Icon} size={16} strokeWidth={2.2} className="h-4 w-4 text-white/60" />
+                <span className="text-white/80">Role:</span>
+                <span className="text-white">{workspaceRole}</span>
+              </div>
+            )}
+
+            {workspace?.organizationId && (
               <div className="flex items-center gap-2">
                 <HugeIcon icon={Globe02Icon} size={16} strokeWidth={2.2} className="h-4 w-4 text-white/60" />
                 <span className="text-white/80">Organization ID:</span>
-                <span className="text-white">{user.org_id}</span>
+                <span className="text-white">{workspace.organizationId}</span>
               </div>
             )}
           </div>

@@ -26,6 +26,14 @@ function asBoolean(value: unknown): boolean | undefined {
   return undefined;
 }
 
+function buildQuarterHourBucket(date = new Date()): string {
+  const next = new Date(date);
+  const roundedMinutes = Math.floor(next.getUTCMinutes() / 15) * 15;
+
+  next.setUTCMinutes(roundedMinutes, 0, 0);
+  return next.toISOString().slice(0, 16);
+}
+
 Deno.serve(async (request) => {
   if (request.method !== 'POST') {
     return jsonResponse({ message: 'Method Not Allowed' }, 405);
@@ -57,6 +65,7 @@ Deno.serve(async (request) => {
   const intakeGenerateIntel = asBoolean(body.intakeGenerateIntel) ?? true;
   const intakeOrganizationId = asString(body.organizationId) ?? asString(body.intakeOrganizationId);
   const intakeJobId = asString(body.jobId) ?? asString(body.intakeJobId);
+  const intakeBucket = asString(body.intakeBucket) ?? buildQuarterHourBucket();
 
   const executeCookie =
     request.headers.get('x-automation-execute-cookie')?.trim() ||
@@ -68,7 +77,15 @@ Deno.serve(async (request) => {
     ? Math.max(1, Math.min(25, Math.floor(requestedLimit)))
     : 6;
 
-  const actorUserId = asString(body.actorUserId);
+  const actorUserId =
+    asString(body.actorUserId) ??
+    Deno.env.get('HEADHUNT_FOUNDER_USER_ID')?.trim() ??
+    Deno.env.get('AUTH0_FOUNDER_USER_ID')?.trim();
+  const tokenVaultLoginHint =
+    asString(body.intakeTokenVaultLoginHint) ??
+    asString(body.tokenVaultLoginHint) ??
+    asString(body.loginHint) ??
+    Deno.env.get('AUTH0_TOKEN_VAULT_LOGIN_HINT')?.trim();
 
   const response: Record<string, unknown> = {
     check: 'automation_cron',
@@ -76,6 +93,7 @@ Deno.serve(async (request) => {
     job,
     limit,
     autoIntakeEnabled,
+    intakeBucket,
   };
 
   try {
@@ -85,7 +103,6 @@ Deno.serve(async (request) => {
       response.watchdogs = await enqueueWatchdogs(client, { actorUserId });
 
       if (autoIntakeEnabled) {
-        const bucket = new Date().toISOString().slice(0, 13);
         response.intake = await enqueueRun(client, {
           handlerType: 'intake.scan',
           resourceType: 'automation',
@@ -94,12 +111,14 @@ Deno.serve(async (request) => {
             'intake-scan',
             intakeOrganizationId,
             intakeJobId,
-            bucket,
+            intakeBucket,
           ]),
           payload: {
             agentName: 'intercept',
             organizationId: intakeOrganizationId,
             jobId: intakeJobId,
+            actorUserId,
+            tokenVaultLoginHint,
             query: intakeQuery,
             maxResults: intakeMaxResults,
             processLimit: intakeProcessLimit,

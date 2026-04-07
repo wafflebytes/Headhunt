@@ -102,18 +102,23 @@ $ ANALYZE=true npm run build
 
 ## Supabase Automation Runtime
 
-Automation orchestration now runs in Supabase Edge Functions so cron/webhook execution logs are visible in Supabase:
+Automation orchestration runs in Supabase Edge Functions so cron/webhook execution logs are visible in Supabase.
 
-- `automation-cron`: enqueues watchdog runs and processes due queue runs.
-- `automation-webhook`: maps DB/internal webhook events into queue runs.
-- `automation-replay`: creates replay child runs.
-- `agent-intercept`: ingress-style inbox intercept trigger.
-- `agent-triage`: routing-focused intake trigger.
-- `agent-analyst`: candidate scoring trigger.
-- `agent-liaison`: interview scheduling request/reply trigger.
-- `agent-dispatch`: offer draft/clearance trigger.
+### v2 clean architecture (recommended)
 
-App routes under `/api/automation/*` are lightweight proxies to these Supabase functions.
+- `v2-orchestrator-cron`: enqueues watchdog/intake work and processes due queue runs.
+- `v2-webhook-candidate-created`: handles `candidates` INSERT webhook events only.
+- `v2-webhook-offer-status`: handles `offers` INSERT/UPDATE webhook events only.
+- `v2-replay`: creates replay child runs and optionally processes immediately.
+- `v2-agent-intercept`: ingress-style inbox intercept trigger.
+- `v2-agent-triage`: routing-focused intake trigger.
+- `v2-agent-analyst`: candidate scoring trigger.
+- `v2-agent-liaison`: interview scheduling request/reply trigger.
+- `v2-agent-dispatch`: offer draft/clearance trigger.
+
+Legacy `automation-*` and `agent-*` functions can remain deployed during migration, but v2 is the active path for new wiring.
+
+App routes under `/api/automation/*` and `/api/automation/v2/*` are lightweight proxies to these Supabase functions.
 Queue handler execution is called by Supabase via `/api/automation/execute`.
 
 ### Why 200 does not always mean flow success
@@ -136,23 +141,75 @@ Set these values in your app and Supabase function environment:
 - `NEXT_PUBLIC_SUPABASE_URL`
 - `SUPABASE_FUNCTIONS_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
-- `SUPABASE_AUTOMATION_FUNCTION_SECRET`
+- `SUPABASE_AUTOMATION_FUNCTION_SECRET` (can reuse `CRON_SECRET`)
+- `SUPABASE_FUNCTIONS_AUTH_MODE` (optional: `secret-header`, `bearer`, or `both`; defaults to `secret-header`)
 - `AUTOMATION_EXECUTE_URL`
-- `AUTOMATION_EXECUTE_SECRET`
+- `AUTOMATION_EXECUTE_SECRET` (optional if you reuse `SUPABASE_AUTOMATION_FUNCTION_SECRET`/`AUTOMATION_CRON_SECRET`/`CRON_SECRET`)
+- `CRON_SECRET` (recommended single secret for Vercel cron and proxy routes)
 - `AUTOMATION_EXECUTE_TIMEOUT_MS` (optional, defaults to `12000`)
 - `AUTOMATION_EXECUTE_COOKIE` (optional fallback cookie for headless cron runs that need Token Vault-backed tools)
 - `AUTOMATION_AUTO_INTAKE_ENABLED` (optional, defaults to `true`)
 - `AUTOMATION_INTAKE_QUERY` (optional Gmail query override for cron-driven intake scans)
+- `AUTOMATION_AUTO_INTAKE_ON_JOB_CREATE` (optional, defaults to `true`; enqueue first `intake.scan` ~1 minute after active job creation)
+- `AUTOMATION_INITIAL_INTAKE_DELAY_MS` (optional, defaults to `60000`)
+- `AUTOMATION_INITIAL_INTAKE_MAX_RESULTS` (optional, defaults to `20`)
+- `AUTOMATION_INITIAL_INTAKE_PROCESS_LIMIT` (optional, defaults to `8`)
+- `AUTOMATION_INITIAL_INTAKE_CANDIDATE_LIKE_ONLY` (optional, defaults to `true`)
+- `AUTOMATION_INITIAL_INTAKE_INCLUDE_BODY` (optional, defaults to `true`)
+- `AUTOMATION_INITIAL_INTAKE_GENERATE_INTEL` (optional, defaults to `true`)
+- `AUTOMATION_V2_KICKOFF_ENABLED` (optional, defaults to `true`)
+- `AUTOMATION_V2_KICKOFF_PROCESS_LIMIT` (optional, defaults to `3`)
 - `HEADHUNT_FOUNDER_USER_ID` or `HEADHUNT_FOUNDER_USER_IDS`
 - `AUTH0_CIBA_AUDIENCE`
 - `AUTH0_CIBA_SCOPE` (optional override, defaults to `openid`)
 - `AUTH0_CIBA_LOGIN_HINT_ISSUER` (optional override)
+- `AUTH0_GOOGLE_TOKEN_EXCHANGE_MODE` (optional: `refresh` or `access`; defaults to `access` when M2M env vars below are set)
+- `AUTH0_GOOGLE_ACCESS_TOKEN_SOURCE` (optional: `auto`, `management_api`, or `token_vault`; defaults to `auto`)
+- `AUTH0_SLACK_TOKEN_EXCHANGE_MODE` (optional: `refresh` or `access`; defaults to `access` when M2M env vars below are set)
+- `AUTH0_CAL_TOKEN_EXCHANGE_MODE` (optional: `refresh` or `access`; defaults to `access` when M2M env vars below are set)
+- `AUTH0_TOKEN_VAULT_M2M_CLIENT_ID` (required for headless Token Vault via privileged-worker flow)
+- `AUTH0_TOKEN_VAULT_M2M_CLIENT_SECRET` (required for headless Token Vault via privileged-worker flow)
+- `AUTH0_TOKEN_VAULT_M2M_AUDIENCE` (required for headless Token Vault via privileged-worker flow)
+- `AUTH0_TOKEN_VAULT_M2M_SCOPE` (optional scope override for client credentials token)
+- `AUTH0_TOKEN_VAULT_LOGIN_HINT` (recommended for headless Token Vault; usually founder user id/email)
+- `AUTH0_MANAGEMENT_CLIENT_ID` (optional override; falls back to `AUTH0_TOKEN_VAULT_M2M_CLIENT_ID`)
+- `AUTH0_MANAGEMENT_CLIENT_SECRET` (optional override; falls back to `AUTH0_TOKEN_VAULT_M2M_CLIENT_SECRET`)
+- `AUTH0_MANAGEMENT_AUDIENCE` (optional override; defaults to `https://<AUTH0_DOMAIN>/api/v2/`)
+- `AUTH0_MANAGEMENT_SCOPE` (optional override; defaults to `read:federated_connections_tokens`)
+- `AUTH0_MANAGEMENT_USER_ID` (optional fixed user id for managed-token lookup)
+- `AUTH0_MANAGEMENT_GOOGLE_CONNECTION` (optional override; defaults to `AUTH0_GOOGLE_CONNECTION`)
+- `AUTH0_GOOGLE_OAUTH_CLIENT_ID` and `AUTH0_GOOGLE_OAUTH_CLIENT_SECRET` (optional; only needed when you want refresh-token exchange at `oauth2.googleapis.com/token`)
 
-For the current edge flow, Token Vault-backed Gmail/Calendar/Cal tools require an authenticated cookie context.
+Token Vault-backed Gmail/Calendar/Cal tools support both headless M2M and session-cookie exchange.
+The recommended production/demo path is M2M-first and cookie-independent.
 Use one of these patterns:
 
-- Preferred for manual/relay calls: send `x-automation-execute-cookie` header when calling `/api/automation/cron`.
-- Headless cron fallback: set `AUTOMATION_EXECUTE_COOKIE` in function secrets.
+- Token-exchange mode for Google (recommended; works even when the Management API token-sets endpoint is deprecated/disabled):
+  - set `AUTH0_GOOGLE_ACCESS_TOKEN_SOURCE=token_exchange` (or keep legacy `management_api` — it maps to token exchange)
+  - make sure your Auth0 application allows the grant type `urn:auth0:params:oauth:grant-type:token-exchange:federated-connection-access-token`
+  - make sure your Auth0 app is configured to issue refresh tokens and your login scope includes `offline_access` (see `AUTH0_SCOPE` in `.env.example`), otherwise `session.tokenSet.refreshToken` will be empty and `auth0_subject_refresh_tokens` cannot be seeded
+  - runtime behavior:
+    - if a user refresh token is available (interactive session or stored in `auth0_subject_refresh_tokens`), exchange it for a Google access token
+    - otherwise, fall back to the privileged-worker exchange using a JWT access token + `login_hint` (requires `AUTH0_TOKEN_VAULT_M2M_*`)
+- Primary M2M mode: set `AUTH0_GOOGLE_TOKEN_EXCHANGE_MODE=access` and configure the `AUTH0_TOKEN_VAULT_M2M_*` vars plus `AUTH0_TOKEN_VAULT_LOGIN_HINT`.
+- Session/cookie mode (debug fallback): send `x-automation-execute-cookie` when calling `/api/automation/cron`.
+- Optional static fallback: set `AUTOMATION_EXECUTE_COOKIE` in function secrets.
+
+Execution topology (v2):
+
+- Vercel cron triggers `POST /api/cron/intake-polling` from `vercel.json`.
+- That route proxies to Supabase `v2-orchestrator-cron`.
+- Supabase orchestrator/enqueued workers call app `/api/automation/execute` to run agent handlers.
+- If you do not want Vercel cron, you must configure a Supabase-side scheduler (for example `pg_cron`) to call `v2-orchestrator-cron` directly.
+
+Rate-limit guardrails for Auth0 token endpoints are built in:
+
+- M2M access tokens are cached until near expiry.
+- Concurrent token fetches are deduplicated via in-flight promise sharing.
+
+Debug shortcut (recommended when you're trying to seed refresh tokens for token-exchange mode):
+
+- Visit `/api/debug/force-consent?returnTo=/onboarding` to force an Auth0 re-login with `prompt=consent` + `max_age=0` and the configured `AUTH0_SCOPE` (includes `offline_access` by default).
 
 ### 3. Deploy Edge Functions
 
@@ -166,44 +223,78 @@ npx supabase secrets set AUTOMATION_EXECUTE_URL="https://<your-app-domain>/api/a
 npx supabase secrets set AUTOMATION_EXECUTE_SECRET="<same-secret-used-by-execute-route>"
 npx supabase secrets set AUTOMATION_EXECUTE_TIMEOUT_MS="12000"
 npx supabase secrets set AUTOMATION_AUTO_INTAKE_ENABLED="true"
+npx supabase secrets set AUTOMATION_AUTO_INTAKE_ON_JOB_CREATE="true"
+npx supabase secrets set AUTOMATION_INITIAL_INTAKE_DELAY_MS="60000"
 npx supabase secrets set AUTOMATION_INTAKE_QUERY="in:inbox newer_than:14d -category:promotions -category:social -subject:newsletter -subject:digest -subject:unsubscribe"
+
+# Headless Token Vault via M2M privileged-worker subject token exchange
+npx supabase secrets set AUTH0_GOOGLE_TOKEN_EXCHANGE_MODE="access"
+npx supabase secrets set AUTH0_GOOGLE_ACCESS_TOKEN_SOURCE="management_api"
+npx supabase secrets set AUTH0_TOKEN_VAULT_M2M_CLIENT_ID="<auth0-m2m-client-id>"
+npx supabase secrets set AUTH0_TOKEN_VAULT_M2M_CLIENT_SECRET="<auth0-m2m-client-secret>"
+npx supabase secrets set AUTH0_TOKEN_VAULT_M2M_AUDIENCE="<auth0-api-audience-for-client-credentials>"
+npx supabase secrets set AUTH0_TOKEN_VAULT_LOGIN_HINT="<founder-user-sub-or-email>"
+npx supabase secrets set AUTH0_MANAGEMENT_SCOPE="read:federated_connections_tokens"
+npx supabase secrets set AUTH0_MANAGEMENT_USER_ID="<founder-auth0-user-id>"
+
+# Optional if you want Google refresh-token exchange instead of managed access-token passthrough
+npx supabase secrets set AUTH0_GOOGLE_OAUTH_CLIENT_ID="<google-oauth-client-id>"
+npx supabase secrets set AUTH0_GOOGLE_OAUTH_CLIENT_SECRET="<google-oauth-client-secret>"
 
 # Optional fallback if cron calls are headless and need Token Vault context
 npx supabase secrets set AUTOMATION_EXECUTE_COOKIE="__session=<cookie-value>"
 
-npx supabase functions deploy automation-cron
-npx supabase functions deploy automation-webhook
-npx supabase functions deploy automation-replay
-npx supabase functions deploy agent-intercept
-npx supabase functions deploy agent-triage
-npx supabase functions deploy agent-analyst
-npx supabase functions deploy agent-liaison
-npx supabase functions deploy agent-dispatch
+npx supabase functions deploy automation-cron --no-verify-jwt
+npx supabase functions deploy automation-webhook --no-verify-jwt
+npx supabase functions deploy automation-replay --no-verify-jwt
+npx supabase functions deploy agent-intercept --no-verify-jwt
+npx supabase functions deploy agent-triage --no-verify-jwt
+npx supabase functions deploy agent-analyst --no-verify-jwt
+npx supabase functions deploy agent-liaison --no-verify-jwt
+npx supabase functions deploy agent-dispatch --no-verify-jwt
+
+# v2 clean architecture deployment
+npx supabase functions deploy v2-orchestrator-cron --no-verify-jwt
+npx supabase functions deploy v2-webhook-candidate-created --no-verify-jwt
+npx supabase functions deploy v2-webhook-offer-status --no-verify-jwt
+npx supabase functions deploy v2-replay --no-verify-jwt
+npx supabase functions deploy v2-agent-intercept --no-verify-jwt
+npx supabase functions deploy v2-agent-triage --no-verify-jwt
+npx supabase functions deploy v2-agent-analyst --no-verify-jwt
+npx supabase functions deploy v2-agent-liaison --no-verify-jwt
+npx supabase functions deploy v2-agent-dispatch --no-verify-jwt
 ```
+
+If you see Supabase gateway responses like `{"code":401,"message":"Missing authorization header"}`
+or `{"code":401,"message":"Invalid Token or Protected Header formatting"}` when calling
+`/v2-*` functions with `x-automation-secret`, redeploy those functions with `--no-verify-jwt`.
 
 ### 4. Wire Supabase cron and webhooks
 
-- Cron target: `automation-cron` with body like `{"job":"all","limit":6}`.
-- Database webhook target: `automation-webhook` with Supabase event payloads.
-- Replay can be invoked manually via `automation-replay`.
+- Cron target: `v2-orchestrator-cron` with body like `{"job":"all","limit":8,"architecture":"v2"}`.
+- Database webhook target #1: `v2-webhook-candidate-created` for `candidates` `INSERT` events.
+- Database webhook target #2: `v2-webhook-offer-status` for `offers` `INSERT,UPDATE` events.
+- Replay can be invoked manually via `v2-replay`.
 
 For faster response paths, webhook and replay calls can process queue work immediately:
 
-- `automation-webhook`: include `{"processNow":true,"processLimit":1}` to enqueue and execute in one call.
-- `automation-replay`: defaults to immediate execution (`processNow=true`), override with `{"processNow":false}` to enqueue-only.
+- `v2-webhook-candidate-created`: include `{"processNow":true,"processLimit":2}` to enqueue and execute in one call.
+- `v2-webhook-offer-status`: include `{"processNow":true,"processLimit":2}` to enqueue and execute in one call.
+- `v2-replay`: defaults to immediate execution (`processNow=true`), override with `{"processNow":false}` to enqueue-only.
 
 Agent facade endpoints (same auth header as other functions):
 
-- `agent-intercept`: enqueue/process `intake.scan` runs tagged `agentName: intercept`.
-- `agent-triage`: enqueue/process `intake.scan` runs tagged `agentName: triage`.
-- `agent-analyst`: enqueue/process `candidate.score` runs tagged `agentName: analyst`.
-- `agent-liaison`: enqueue/process `scheduling.request.send` or `scheduling.reply.parse_book` tagged `agentName: liaison`.
-- `agent-dispatch`: enqueue/process `offer.draft.create` or `offer.clearance.poll` tagged `agentName: dispatch`.
+- `v2-agent-intercept`: enqueue/process `intake.scan` runs tagged `agentName: intercept`.
+- `v2-agent-triage`: enqueue/process `intake.scan` runs tagged `agentName: triage`.
+- `v2-agent-analyst`: enqueue/process `candidate.score` runs tagged `agentName: analyst`.
+- `v2-agent-liaison`: enqueue/process `scheduling.request.send` or `scheduling.reply.parse_book` tagged `agentName: liaison`.
+- `v2-agent-dispatch`: enqueue/process `offer.draft.create` or `offer.clearance.poll` tagged `agentName: dispatch`.
 
-`automation-cron`, `automation-webhook`, and follow-up chaining now include per-agent counters in `processed.agents` so UI layers can display "which agent is processing what".
+`v2-orchestrator-cron`, `v2-webhook-*`, and follow-up chaining include per-agent counters in `processed.agents` so UI layers can display "which agent is processing what".
 
-Use the `Authorization: Bearer <SUPABASE_AUTOMATION_FUNCTION_SECRET>` header (or `x-automation-secret`) for all automation function calls.
-When triggering cron via app proxy routes, `x-automation-execute-cookie` (or `cookie`) can be forwarded so downstream `/api/automation/execute` calls have an authenticated session.
+Use `x-automation-secret: <SUPABASE_AUTOMATION_FUNCTION_SECRET>` for all automation function calls.
+Bearer auth remains supported where needed; app proxies can opt in with `SUPABASE_FUNCTIONS_AUTH_MODE=bearer` or `both`.
+When triggering cron via app proxy routes, `x-automation-execute-cookie` (or `cookie`) may be forwarded for debug flows, but is not required in M2M-first mode.
 
 ### 5. Quick health checks
 

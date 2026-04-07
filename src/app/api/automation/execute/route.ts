@@ -10,7 +10,10 @@ const inputSchema = z.object({
 });
 
 function isAuthorized(request: NextRequest) {
-  const configuredSecret = process.env.AUTOMATION_EXECUTE_SECRET?.trim() || process.env.AUTOMATION_CRON_SECRET?.trim();
+  const configuredSecret =
+    process.env.AUTOMATION_EXECUTE_SECRET?.trim() ||
+    process.env.AUTOMATION_CRON_SECRET?.trim() ||
+    process.env.CRON_SECRET?.trim();
   if (!configuredSecret) {
     return false;
   }

@@ -45,6 +45,14 @@ Deno.serve(async (request) => {
     agentName: 'triage',
     organizationId: asString(body.organizationId) ?? asString(body.intakeOrganizationId),
     jobId: asString(body.jobId) ?? asString(body.intakeJobId),
+    actorUserId:
+      asString(body.actorUserId) ??
+      Deno.env.get('HEADHUNT_FOUNDER_USER_ID')?.trim() ??
+      Deno.env.get('AUTH0_FOUNDER_USER_ID')?.trim(),
+    tokenVaultLoginHint:
+      asString(body.tokenVaultLoginHint) ??
+      asString(body.loginHint) ??
+      Deno.env.get('AUTH0_TOKEN_VAULT_LOGIN_HINT')?.trim(),
     query,
     maxResults: Math.max(1, Math.min(25, asNumber(body.maxResults) ?? 15)),
     processLimit: Math.max(1, Math.min(10, asNumber(body.processLimit) ?? 6)),

@@ -69,7 +69,7 @@ export async function ingestCandidateFromEmail(input: IngestCandidateFromEmailIn
     }
   }
 
-  return db.transaction(async (tx: typeof db) => {
+  const result = await db.transaction(async (tx) => {
     const sourceMessageId = input.source.gmailMessageId;
     const sourceThreadId = input.source.gmailThreadId ?? null;
     const sourceReceivedAt = input.source.receivedAt ? new Date(input.source.receivedAt) : null;
@@ -145,7 +145,6 @@ export async function ingestCandidateFromEmail(input: IngestCandidateFromEmailIn
         .returning();
 
       candidateRow = insertedCandidates[0];
-      await addCandidateRelation(input.actorId, candidateRow.id, 'owner');
       identityResolution = 'created_new';
     } else {
       idempotent = true;
@@ -232,43 +231,56 @@ export async function ingestCandidateFromEmail(input: IngestCandidateFromEmailIn
       });
     }
 
-    for (const identityKey of identityKeyInputs) {
-      await tx
-        .insert(candidateIdentityKeys)
-        .values({
-          organizationId: input.organizationId ?? candidateRow.organizationId ?? null,
-          jobId: input.jobId,
-          candidateId: candidateRow.id,
-          keyType: identityKey.keyType,
-          keyValue: identityKey.keyValue,
-          metadata: {
-            source: 'ingest_candidate_from_email',
-            sourceMessageId,
-            sourceThreadId,
-            identityResolution,
-          },
-          firstSeenAt: identityKey.seenAt,
-          lastSeenAt: identityKey.seenAt,
-        })
-        .onConflictDoUpdate({
-          target: [
-            candidateIdentityKeys.keyType,
-            candidateIdentityKeys.keyValue,
-            candidateIdentityKeys.jobId,
-          ],
-          set: {
-            candidateId: candidateRow.id,
+    try {
+      for (const identityKey of identityKeyInputs) {
+        await tx
+          .insert(candidateIdentityKeys)
+          .values({
             organizationId: input.organizationId ?? candidateRow.organizationId ?? null,
-            lastSeenAt: identityKey.seenAt,
+            jobId: input.jobId,
+            candidateId: candidateRow.id,
+            keyType: identityKey.keyType,
+            keyValue: identityKey.keyValue,
             metadata: {
               source: 'ingest_candidate_from_email',
               sourceMessageId,
               sourceThreadId,
               identityResolution,
             },
-            updatedAt: now,
-          },
+            firstSeenAt: identityKey.seenAt,
+            lastSeenAt: identityKey.seenAt,
+          })
+          .onConflictDoUpdate({
+            target: [
+              candidateIdentityKeys.keyType,
+              candidateIdentityKeys.keyValue,
+              candidateIdentityKeys.jobId,
+            ],
+            set: {
+              candidateId: candidateRow.id,
+              organizationId: input.organizationId ?? candidateRow.organizationId ?? null,
+              lastSeenAt: identityKey.seenAt,
+              metadata: {
+                source: 'ingest_candidate_from_email',
+                sourceMessageId,
+                sourceThreadId,
+                identityResolution,
+              },
+              updatedAt: now,
+            },
+          });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/relation\s+"candidate_identity_keys"\s+does\s+not\s+exist/i.test(message)) {
+        console.warn('candidate_identity_keys table missing; skipping identity-key upserts for ingest.', {
+          jobId: input.jobId,
+          candidateId: candidateRow.id,
+          sourceMessageId,
         });
+      } else {
+        throw error;
+      }
     }
 
     await tx.insert(auditLogs).values({
@@ -300,4 +312,18 @@ export async function ingestCandidateFromEmail(input: IngestCandidateFromEmailIn
       application: applicationRow,
     };
   });
+
+  if (result.identityResolution === 'created_new') {
+    try {
+      await addCandidateRelation(input.actorId, result.candidate.id, 'owner');
+    } catch (error) {
+      console.error('FGA tuple write failed; candidate ingest committed without visibility tuple.', {
+        actorId: input.actorId,
+        candidateId: result.candidate.id,
+        error,
+      });
+    }
+  }
+
+  return result;
 }

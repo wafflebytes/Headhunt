@@ -126,7 +126,8 @@ export function jsonResponse(body: unknown, status = 200) {
 export function isAuthorized(request: Request): boolean {
   const configuredSecret =
     Deno.env.get('SUPABASE_AUTOMATION_FUNCTION_SECRET')?.trim() ||
-    Deno.env.get('AUTOMATION_CRON_SECRET')?.trim();
+    Deno.env.get('AUTOMATION_CRON_SECRET')?.trim() ||
+    Deno.env.get('CRON_SECRET')?.trim();
 
   if (!configuredSecret) {
     return false;
@@ -316,6 +317,26 @@ function shouldEscalateToManualReview(handlerType: string, result: JsonObject): 
   return false;
 }
 
+function isTokenVaultAuthorizationErrorMessage(message: string): boolean {
+  const normalized = message.toLowerCase();
+
+  return (
+    normalized.includes('authorization required to access the token vault') ||
+    normalized.includes('missing scopes:') ||
+    normalized.includes('token vault') && normalized.includes('authorization')
+  );
+}
+
+function shouldPauseAwaitingReauth(result: JsonObject): boolean {
+  const status = asString(result.status);
+  if (status !== 'error') {
+    return false;
+  }
+
+  const message = asString(result.message) ?? '';
+  return isTokenVaultAuthorizationErrorMessage(message);
+}
+
 function shouldDeadLetterWithoutRetry(run: AutomationRunRow, result: JsonObject): boolean {
   const status = asString(result.status);
   if (status !== 'error') {
@@ -323,15 +344,6 @@ function shouldDeadLetterWithoutRetry(run: AutomationRunRow, result: JsonObject)
   }
 
   const message = (asString(result.message) ?? '').toLowerCase();
-
-  // Token Vault consent/scope errors require user re-authorization, so retries will not self-heal.
-  if (message.includes('authorization required to access the token vault')) {
-    return true;
-  }
-
-  if (message.includes('missing scopes:')) {
-    return true;
-  }
 
   if (run.handler_type === 'offer.submit.clearance' && message.includes('offer not found')) {
     return true;
@@ -731,7 +743,8 @@ async function invokeAutomationExecutor(
   const executeSecret =
     Deno.env.get('AUTOMATION_EXECUTE_SECRET')?.trim() ||
     Deno.env.get('SUPABASE_AUTOMATION_FUNCTION_SECRET')?.trim() ||
-    Deno.env.get('AUTOMATION_CRON_SECRET')?.trim();
+    Deno.env.get('AUTOMATION_CRON_SECRET')?.trim() ||
+    Deno.env.get('CRON_SECRET')?.trim();
   const executeCookie =
     executeCookieOverride?.trim() ||
     Deno.env.get('AUTOMATION_EXECUTE_COOKIE')?.trim() ||
@@ -739,7 +752,9 @@ async function invokeAutomationExecutor(
   const timeoutMs = resolveExecuteTimeoutMs();
 
   if (!executeSecret) {
-    throw new Error('Missing automation execute secret. Set AUTOMATION_EXECUTE_SECRET.');
+    throw new Error(
+      'Missing automation execute secret. Set AUTOMATION_EXECUTE_SECRET, SUPABASE_AUTOMATION_FUNCTION_SECRET, AUTOMATION_CRON_SECRET, or CRON_SECRET.',
+    );
   }
 
   const controller = new AbortController();
@@ -849,17 +864,22 @@ export async function processQueue(
   let remainingClaims = Math.max(1, limit);
   let completed = 0;
   let retried = 0;
+  let pausedAwaitingReauth = 0;
   let deadLettered = 0;
-  const agents: Record<string, { claimed: number; completed: number; retried: number; deadLettered: number }> = {};
+  const agents: Record<
+    string,
+    { claimed: number; completed: number; retried: number; pausedAwaitingReauth: number; deadLettered: number }
+  > = {};
 
   const bumpAgentMetric = (
     agentName: AgentName,
-    key: 'claimed' | 'completed' | 'retried' | 'deadLettered',
+    key: 'claimed' | 'completed' | 'retried' | 'pausedAwaitingReauth' | 'deadLettered',
   ) => {
     const current = agents[agentName] ?? {
       claimed: 0,
       completed: 0,
       retried: 0,
+      pausedAwaitingReauth: 0,
       deadLettered: 0,
     };
     current[key] += 1;
@@ -921,6 +941,24 @@ export async function processQueue(
           continue;
         }
 
+        if (shouldPauseAwaitingReauth(result)) {
+          await updateRun(client, run.id, {
+            status: 'paused_awaiting_reauth',
+            result: {
+              ...withAgentName(result, agentName),
+              mode: 'awaiting_reauth',
+              remediation: 'Reconnect required integrations and resume this run.',
+            },
+            updated_at: nowIso,
+            last_error: asString(result.message) ?? 'Authorization required to access the Token Vault.',
+            last_error_at: nowIso,
+          });
+
+          pausedAwaitingReauth += 1;
+          bumpAgentMetric(agentName, 'pausedAwaitingReauth');
+          continue;
+        }
+
         const nextAttemptCount = run.attempt_count + 1;
         const reachedMax = shouldDeadLetterWithoutRetry(run, result) || nextAttemptCount >= run.max_attempts;
 
@@ -954,6 +992,27 @@ export async function processQueue(
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Unknown automation error.';
         const nextAttemptCount = run.attempt_count + 1;
+
+        if (isTokenVaultAuthorizationErrorMessage(message)) {
+          await updateRun(client, run.id, {
+            status: 'paused_awaiting_reauth',
+            result: {
+              status: 'error',
+              mode: 'awaiting_reauth',
+              message,
+              remediation: 'Reconnect required integrations and resume this run.',
+              agentName,
+            },
+            updated_at: nowIso,
+            last_error: message,
+            last_error_at: nowIso,
+          });
+
+          pausedAwaitingReauth += 1;
+          bumpAgentMetric(agentName, 'pausedAwaitingReauth');
+          continue;
+        }
+
         const terminalAuthError = shouldDeadLetterWithoutRetry(run, {
           status: 'error',
           message,
@@ -1009,6 +1068,7 @@ export async function processQueue(
     claimed: totalClaimed,
     completed,
     retried,
+    pausedAwaitingReauth,
     deadLettered,
     agents,
   };

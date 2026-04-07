@@ -52,6 +52,7 @@ export const candidates = pgTable(
     contactEmail: varchar('contact_email', { length: 191 }).notNull(),
     stage: varchar('stage', { length: 50 }).notNull().default('applied'),
     score: integer('score'),
+    objectiveScore: integer('objective_score'),
     intelConfidence: integer('intel_confidence'),
     scoreBreakdown: jsonb('score_breakdown')
       .$type<Array<z.infer<typeof candidateScoreBreakdownItemSchema>>>()
@@ -86,6 +87,7 @@ export const candidates = pgTable(
 export const candidateSchema = createSelectSchema(candidates, {
   stage: candidateStageSchema,
   score: z.number().int().min(0).max(100).nullable(),
+  objectiveScore: z.number().int().min(0).max(100).nullable(),
   intelConfidence: z.number().int().min(0).max(100).nullable(),
   scoreBreakdown: z.array(candidateScoreBreakdownItemSchema),
   qualificationChecks: z.array(candidateQualificationCheckSchema),
@@ -95,6 +97,7 @@ export const candidateSchema = createSelectSchema(candidates, {
 export const candidateInsertSchema = createInsertSchema(candidates, {
   stage: candidateStageSchema,
   score: z.number().int().min(0).max(100).nullable(),
+  objectiveScore: z.number().int().min(0).max(100).nullable(),
   intelConfidence: z.number().int().min(0).max(100).nullable(),
   scoreBreakdown: z.array(candidateScoreBreakdownItemSchema),
   qualificationChecks: z.array(candidateQualificationCheckSchema),

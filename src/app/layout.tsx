@@ -25,6 +25,9 @@ const copernicus = localFont({
 export const metadata: Metadata = {
   title: 'Headhunt Dashboard',
   description: 'Headhunt operator dashboard and onboarding experience.',
+  icons: {
+    icon: '/images/favicon.png',
+  },
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

@@ -21,10 +21,11 @@ export async function POST(request: NextRequest) {
 
   return proxyToSupabaseAutomationFunction({
     request,
-    functionName: 'automation-cron',
+    functionName: 'v2-orchestrator-cron',
     fallbackBody: {
       job: 'all',
-      limit: 6,
+      limit: 8,
+      architecture: 'v2',
     },
   });
 }

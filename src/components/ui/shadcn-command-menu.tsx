@@ -223,8 +223,14 @@ export default function CommandMenu({ tree, colors }: CommandMenuProps) {
       }
     };
 
+    const onOpenExternal = () => setOpen(true);
+    document.addEventListener("open-command-menu", onOpenExternal);
+
     document.addEventListener("keydown", down);
-    return () => document.removeEventListener("keydown", down);
+    return () => {
+      document.removeEventListener("keydown", down);
+      document.removeEventListener("open-command-menu", onOpenExternal);
+    };
   }, [copyPayload, runCommand, selectedType]);
 
   const listRef = React.useRef<HTMLDivElement>(null);

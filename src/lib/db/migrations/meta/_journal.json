@@ -99,6 +99,41 @@
       "when": 1775340000000,
       "tag": "0013_candidate_identity_keys",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1775433600000,
+      "tag": "0014_jobs_jd_template",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1775440800000,
+      "tag": "0015_frontend_mock_snapshots",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1775455200000,
+      "tag": "0016_user_workspaces",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1775518200000,
+      "tag": "0017_auth0_subject_refresh_tokens",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1775518212850,
+      "tag": "0018_candidates_objective_score",
+      "breakpoints": true
     }
   ]
 }

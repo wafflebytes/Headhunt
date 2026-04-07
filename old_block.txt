@@ -1,0 +1,81 @@
+                          </div>
+                        ) : pendingApprovals.length === 0 ? (
+                          <Card className="rounded-[18px] bg-[#fcfdff] border border-[#e2e8f0] shadow-none">
+                            <CardContent className="p-6 text-center">
+                              <div className="w-12 h-12 rounded-full bg-[#f1f5f9] text-[#94a3b8] mx-auto mb-3 flex items-center justify-center">
+                                <CheckCircle2 size={20} />
+                              </div>
+                              <div className="text-[15px] font-medium font-sans text-[#334155] mb-1">Queue is clear</div>
+                              <div className="text-[13px] font-sans text-[#94a3b8]">
+                                New protected actions will appear here with full context and agent routing.
+                              </div>
+                            </CardContent>
+                          </Card>
+                        ) : (
+                          <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_320px] gap-4">
+                            <div className="flex flex-col gap-3">
+                              {pendingApprovals.map((approval) => {
+                                const candidate = parseApprovalCandidate(approval.payloadJson);
+                                const isSelected = selectedApproval?._id === approval._id;
+                                const agentKey = resolveApprovalAgentKey(approval, candidate);
+                                const agentSeed = findHeadieSeed(agentKey);
+                                const agentVisual = HEADIE_AGENT_VISUALS[agentKey];
+                                const urgency = resolveApprovalUrgency(approval.expiresAtMs);
+
+                                return (
+                                  <Card
+                                    key={approval._id}
+                                    onClick={() => setSelectedApprovalId(approval._id)}
+                                    className={cn(
+                                      'rounded-[18px] border bg-white transition-all cursor-pointer',
+                                      isSelected
+                                        ? 'border-[#0f172a] shadow-[0_10px_24px_rgba(15,23,42,0.10)]'
+                                        : 'border-[#e2e8f0] shadow-[0_2px_8px_rgba(0,0,0,0.04)] hover:border-[#cbd5e1] hover:shadow-[0_8px_20px_rgba(15,23,42,0.08)]',
+                                    )}
+                                  >
+                                    <CardContent className="p-4">
+                                      <div className="flex items-start gap-3">
+                                        <div className="w-12 h-12 flex items-center justify-center shrink-0">
+                                          <img src={agentVisual.coloredSrc} alt={agentSeed.name} className="w-9 h-9 object-contain" />
+                                        </div>
+
+                                        <div className="min-w-0 flex-1">
+                                          <div className="flex items-center gap-2 mb-1 flex-wrap">
+                                            <div className="text-[14px] font-semibold text-[#334155] truncate">
+                                              {toActionLabel(candidate.actionType ?? approval.actionType)}
+                                            </div>
+                                            <Badge className={urgency.className}>{urgency.label}</Badge>
+                                          </div>
+
+                                          <div className="text-[12px] font-sans text-[#64748b] truncate">
+                                            {(candidate.candidateName ?? candidate.clientName ?? 'Unknown candidate')} · {(candidate.jobTitle ?? candidate.invoiceNumber ?? approval.resourceId ?? 'No target')} · {formatApprovalSummaryMeta(candidate)}
+                                          </div>
+
+                                          <div className="text-[11px] text-[#94a3b8] mt-2 flex items-center gap-2">
+                                            <span className="font-medium text-[#334155]">{agentSeed.name}</span>
+                                            <span className="text-[#cbd5e1]">•</span>
+                                            <span>Requested {formatRelativeTime(approval.requestedAtMs)}</span>
+                                          </div>
+                                        </div>
+
+                                        <ArrowRight size={18} className="text-[#94a3b8] opacity-70 mt-1 shrink-0" />
+                                      </div>
+                                    </CardContent>
+                                  </Card>
+                                );
+                              })}
+                            </div>
+
+                            <Card className="rounded-[18px] bg-white border border-[#dbe4ef] shadow-[0_8px_22px_rgba(15,23,42,0.08)] h-fit xl:sticky xl:top-4">
+                              <CardContent className="p-4">
+                                {selectedApproval ? (
+                                  (() => {
+                                    const candidate = parseApprovalCandidate(selectedApproval.payloadJson);
+                                    const selectedAgentKey = resolveApprovalAgentKey(selectedApproval, candidate);
+                                    const selectedAgentSeed = findHeadieSeed(selectedAgentKey);
+                                    const selectedAgentVisual = HEADIE_AGENT_VISUALS[selectedAgentKey];
+                                    const selectedUrgency = resolveApprovalUrgency(selectedApproval.expiresAtMs);
+
+                                    return (
+                                      <div>
+                                        <div className="flex items-center justify-between mb-2">

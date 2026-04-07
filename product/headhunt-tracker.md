@@ -99,7 +99,7 @@ Rule: every architecture decision references one of Auth0 Docs MCP, Supabase MCP
 - [x] Calling external IdP API references confirmed.
 	- Source: https://auth0.com/docs/authenticate/identity-providers/calling-an-external-idp-api
 	- Source: https://auth0.com/docs/authenticate/identity-providers/adding-scopes-for-an-external-idp
-	- Decision: ensure M2M token used for token retrieval has read:user_idp_tokens equivalent capability where applicable.
+	- Decision: ensure M2M token used for token retrieval has read:federated_connections_tokens capability where applicable.
 
 - [x] CIBA flow references confirmed.
 	- Source: https://auth0.com/docs/get-started/authentication-and-authorization-flow/client-initiated-backchannel-authentication-flow/user-authorization-with-ciba

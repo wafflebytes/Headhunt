@@ -2,7 +2,7 @@ import { ErrorCode, WebClient } from '@slack/web-api';
 import { TokenVaultError } from '@auth0/ai/interrupts';
 import {
   withSlack,
-  getAccessToken,
+  getSlackAccessToken,
   SLACK_SCOPES,
   SLACK_TOKEN_VAULT_CONNECTION,
 } from '@/lib/auth0-ai';
@@ -12,12 +12,19 @@ import { z } from 'zod';
 export const listSlackChannels = withSlack(
   tool({
     description: 'List channels for the current user on Slack',
-    inputSchema: z.object({}),
-    execute: async () => {
+    inputSchema: z.object({
+      tokenVaultLoginHint: z.string().optional(),
+      actorUserId: z.string().optional(),
+      allowTokenVaultFallback: z.boolean().optional(),
+    }),
+    execute: async ({ tokenVaultLoginHint, actorUserId, allowTokenVaultFallback }) => {
       const hasPrivateChannelScope = SLACK_SCOPES.includes('groups:read');
 
       // Get the access token from Auth0 AI
-      const accessToken = await getAccessToken();
+      const accessToken = await getSlackAccessToken({
+        loginHint: tokenVaultLoginHint ?? actorUserId,
+        allowTokenVaultFallback,
+      });
 
       // Slack SDK
       try {

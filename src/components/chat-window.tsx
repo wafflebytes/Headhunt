@@ -68,6 +68,15 @@ const TOKEN_VAULT_DEFAULT_SCOPES_BY_CONNECTION: Record<string, string[]> = {
     'EVENT_TYPE_READ',
     'EVENT_TYPE_WRITE',
   ],
+  cal: [
+    'PROFILE_READ',
+    'SCHEDULE_READ',
+    'SCHEDULE_WRITE',
+    'BOOKING_READ',
+    'BOOKING_WRITE',
+    'EVENT_TYPE_READ',
+    'EVENT_TYPE_WRITE',
+  ],
 };
 
 const TOKEN_VAULT_DEFAULT_AUTHORIZATION_PARAMS_BY_CONNECTION: Record<string, Record<string, string>> = {
@@ -75,6 +84,7 @@ const TOKEN_VAULT_DEFAULT_AUTHORIZATION_PARAMS_BY_CONNECTION: Record<string, Rec
   slack: { prompt: 'consent' },
   'slack-oauth2': { prompt: 'consent' },
   'cal-connection': { prompt: 'consent' },
+  cal: { prompt: 'consent' },
 };
 
 const OPERATOR_COMMAND_TEMPLATES: Array<{ label: string; value: string }> = [
@@ -566,7 +576,7 @@ function inferConnectionFromToolName(toolName: string | null): string | null {
   }
 
   if (normalized.includes('verify_cal_connection') || normalized.includes('schedule_with_cal')) {
-    return 'cal-connection';
+    return 'cal';
   }
 
   return null;

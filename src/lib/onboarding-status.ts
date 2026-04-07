@@ -25,7 +25,10 @@ export type OnboardingIntegrationStatus = {
 export type OnboardingIntegrationStatusSnapshot = {
   statuses: OnboardingIntegrationStatus[];
   degraded: boolean;
+  reauthRequired: boolean;
 };
+
+const REQUIRED_ONBOARDING_INTEGRATION_IDS: readonly OnboardingIntegrationId[] = ['google', 'slack'];
 
 const CONNECTED_ACCOUNTS_AUDIENCE = `https://${process.env.AUTH0_DOMAIN}/me/`;
 const CONNECTED_ACCOUNTS_ACCOUNTS_URL = `https://${process.env.AUTH0_DOMAIN}/me/v1/connected-accounts/accounts`;
@@ -44,6 +47,71 @@ const logOnboardingStatusSnapshotFailure = (error: unknown) => {
     '[onboarding-status] Failed to load connected accounts snapshot; returning degraded onboarding status.',
     error,
   );
+};
+
+const isObjectLike = (value: unknown): value is Record<string, unknown> => {
+  return Boolean(value) && typeof value === 'object';
+};
+
+const collectErrorCodes = (error: unknown, codes: Set<string>) => {
+  if (!isObjectLike(error)) {
+    return;
+  }
+
+  const code = error.code;
+  if (typeof code === 'string' && code.trim().length > 0) {
+    codes.add(code.trim().toLowerCase());
+  }
+
+  const cause = error.cause;
+  if (cause && cause !== error) {
+    collectErrorCodes(cause, codes);
+  }
+};
+
+const collectErrorMessages = (error: unknown, messages: string[]) => {
+  if (typeof error === 'string') {
+    const normalized = error.trim().toLowerCase();
+    if (normalized) {
+      messages.push(normalized);
+    }
+    return;
+  }
+
+  if (!isObjectLike(error)) {
+    return;
+  }
+
+  const message = error.message;
+  if (typeof message === 'string' && message.trim().length > 0) {
+    messages.push(message.trim().toLowerCase());
+  }
+
+  const cause = error.cause;
+  if (cause && cause !== error) {
+    collectErrorMessages(cause, messages);
+  }
+};
+
+const isAuthSessionRefreshFailure = (error: unknown) => {
+  const codes = new Set<string>();
+  collectErrorCodes(error, codes);
+
+  if (codes.has('failed_to_refresh_token') || codes.has('invalid_grant')) {
+    return true;
+  }
+
+  const messages: string[] = [];
+  collectErrorMessages(error, messages);
+
+  return messages.some((message) => {
+    return (
+      message.includes('failed_to_refresh_token') ||
+      message.includes('invalid_grant') ||
+      message.includes('unknown or invalid refresh token') ||
+      message.includes('invalid refresh token')
+    );
+  });
 };
 
 const hasRefreshCapableAccess = (accounts: ConnectedAccountSnapshot[]): boolean => {
@@ -93,10 +161,12 @@ export async function getOnboardingIntegrationStatusSnapshot(origin: string): Pr
   try {
     accounts = await loadConnectedAccountsSnapshot();
   } catch (error) {
+    const reauthRequired = isAuthSessionRefreshFailure(error);
     logOnboardingStatusSnapshotFailure(error);
     return {
       statuses: buildDisconnectedStatuses(origin),
       degraded: true,
+      reauthRequired,
     };
   }
 
@@ -134,6 +204,7 @@ export async function getOnboardingIntegrationStatusSnapshot(origin: string): Pr
   return {
     statuses,
     degraded: false,
+    reauthRequired: false,
   };
 }
 
@@ -143,5 +214,9 @@ export async function getOnboardingIntegrationStatuses(origin: string): Promise<
 }
 
 export const areAllRequiredIntegrationsConnected = (statuses: OnboardingIntegrationStatus[]) => {
-  return statuses.every((status) => status.connected);
+  const connectedByIntegration = new Map(statuses.map((status) => [status.id, status.connected]));
+
+  return REQUIRED_ONBOARDING_INTEGRATION_IDS.every(
+    (requiredIntegrationId) => connectedByIntegration.get(requiredIntegrationId) === true,
+  );
 };

@@ -109,7 +109,7 @@ const parseAuthorizationParams = (
 
 export const getRequiredOnboardingConnections = (): RequiredOnboardingConnection[] => {
   const googleConnection = process.env.AUTH0_GOOGLE_CONNECTION || 'google-oauth2';
-  const calConnection = process.env.AUTH0_CAL_CONNECTION || 'cal-connection';
+  const calConnection = process.env.AUTH0_CAL_CONNECTION || 'cal';
   const slackConnection = process.env.AUTH0_SLACK_CONNECTION || 'sign-in-with-slack';
 
   return [

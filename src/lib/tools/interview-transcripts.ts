@@ -8,7 +8,7 @@ import { auth0 } from '@/lib/auth0';
 import {
   CAL_BOOKINGS_API_VERSION,
   CAL_COM_API_BASE_URL,
-  getAccessToken,
+  getCalComAccessToken,
   getGoogleAccessToken,
   withCal,
   withDrive,
@@ -63,6 +63,8 @@ const summarizeCalBookingTranscriptInputSchema = z.object({
   jobId: z.string().min(1).optional(),
   organizationId: z.string().optional(),
   actorUserId: z.string().min(1).optional(),
+  tokenVaultLoginHint: z.string().min(1).optional(),
+  automationMode: z.boolean().optional(),
   jobRequirements: z.array(z.string().min(1)).optional(),
   maxTranscriptChars: z.number().int().min(2000).max(120000).default(22000),
 });
@@ -77,9 +79,339 @@ const summarizeDriveTranscriptPdfInputSchema = z
     jobId: z.string().min(1).optional(),
     organizationId: z.string().optional(),
     actorUserId: z.string().min(1).optional(),
+    tokenVaultLoginHint: z.string().min(1).optional(),
+    automationMode: z.boolean().optional(),
     jobRequirements: z.array(z.string().min(1)).optional(),
     maxTranscriptChars: z.number().int().min(2000).max(120000).default(22000),
   });
+
+function resolveLoginHint(input: { tokenVaultLoginHint?: string; actorUserId?: string }): string | undefined {
+  return asString(input.tokenVaultLoginHint) ?? asString(input.actorUserId) ?? undefined;
+}
+
+export async function runSummarizeCalBookingTranscript(input: z.infer<typeof summarizeCalBookingTranscriptInputSchema>) {
+  const automationMode = input.automationMode === true;
+  const loginHint = resolveLoginHint(input);
+
+  const contextResult = await resolveContext({
+    actorUserId: input.actorUserId,
+    organizationId: input.organizationId,
+    candidateId: input.candidateId,
+    jobId: input.jobId,
+    bookingUid: input.bookingUid,
+  });
+
+  if (!contextResult.ok) {
+    return {
+      ...contextResult.error,
+      check: 'summarize_cal_booking_transcript',
+    };
+  }
+
+  const context = contextResult.value;
+
+  try {
+    const calAccessToken = await getCalComAccessToken({
+      loginHint,
+      allowTokenVaultFallback: !automationMode,
+    });
+    const transcriptsUrl = new URL(
+      `/v2/bookings/${encodeURIComponent(input.bookingUid)}/transcripts`,
+      CAL_COM_API_BASE_URL,
+    );
+
+    const transcriptsResponse = await fetch(transcriptsUrl.toString(), {
+      headers: {
+        Authorization: `Bearer ${calAccessToken}`,
+        'cal-api-version': CAL_BOOKINGS_API_VERSION,
+      },
+    });
+
+    if (!transcriptsResponse.ok) {
+      const details = await transcriptsResponse.text();
+      return {
+        check: 'summarize_cal_booking_transcript',
+        status: 'error',
+        message: `Failed to fetch Cal transcripts (${transcriptsResponse.status}): ${details}`,
+      };
+    }
+
+    const payload = (await transcriptsResponse.json()) as unknown;
+    const root = asRecord(payload);
+    const transcriptUrlsRaw = Array.isArray(root?.data) ? root?.data : [];
+    const transcriptUrls = transcriptUrlsRaw
+      .map((value) => asString(value))
+      .filter((value): value is string => Boolean(value));
+
+    if (transcriptUrls.length === 0) {
+      return {
+        check: 'summarize_cal_booking_transcript',
+        status: 'error',
+        message: 'No transcript URLs returned for this booking UID.',
+        bookingUid: input.bookingUid,
+        fallback: {
+          recommended: true,
+          nextTool: 'summarize_drive_transcript_pdf',
+          reason: 'Provide driveFileId, driveQuery, driveFolderId, or driveFolderName for PDF transcript fallback.',
+        },
+      };
+    }
+
+    const extractedChunks: Array<{ url: string; text: string }> = [];
+    for (const url of transcriptUrls.slice(0, 6)) {
+      const text = await fetchTranscriptTextFromUrl(url, calAccessToken);
+      if (text) {
+        extractedChunks.push({ url, text });
+      }
+    }
+
+    const combinedTranscript = compactWhitespace(extractedChunks.map((chunk) => chunk.text).join(' '));
+
+    if (!combinedTranscript) {
+      return {
+        check: 'summarize_cal_booking_transcript',
+        status: 'error',
+        message:
+          'Cal transcript URLs were found, but transcript text could not be extracted. Use summarize_drive_transcript_pdf as fallback if a PDF transcript exists in Drive.',
+        bookingUid: input.bookingUid,
+        transcriptUrls,
+        fallback: {
+          recommended: true,
+          nextTool: 'summarize_drive_transcript_pdf',
+          reason: 'Unable to parse text from Cal transcript URLs. Use driveFileId, driveQuery, driveFolderId, or driveFolderName.',
+        },
+      };
+    }
+
+    const summary = await generateTranscriptSummary({
+      sourceText: combinedTranscript,
+      maxChars: input.maxTranscriptChars,
+      candidateName: context.candidate?.name ?? null,
+      jobTitle: context.job?.title ?? null,
+      jobRequirements: input.jobRequirements,
+    });
+
+    await persistTranscriptSummary({
+      context,
+      summary,
+      action: 'summarize_cal_booking_transcript',
+      sourceType: 'cal_transcript',
+      sourceId: input.bookingUid,
+      metadata: {
+        bookingUid: input.bookingUid,
+        transcriptUrlCount: transcriptUrls.length,
+        extractedTranscriptCount: extractedChunks.length,
+        transcriptLength: combinedTranscript.length,
+      },
+    });
+
+    return {
+      check: 'summarize_cal_booking_transcript',
+      status: 'success',
+      source: 'cal_transcript',
+      bookingUid: input.bookingUid,
+      candidateId: context.candidate?.id ?? null,
+      jobId: context.job?.id ?? null,
+      interviewId: context.interview?.id ?? null,
+      transcriptUrls,
+      transcriptStats: {
+        transcriptUrlCount: transcriptUrls.length,
+        extractedTranscriptCount: extractedChunks.length,
+        transcriptLength: combinedTranscript.length,
+      },
+      summary,
+    };
+  } catch (error) {
+    return {
+      check: 'summarize_cal_booking_transcript',
+      status: 'error',
+      message:
+        error instanceof Error
+          ? error.message
+          : 'Unknown error while summarizing Cal booking transcripts.',
+    };
+  }
+}
+
+export async function runSummarizeDriveTranscriptPdf(input: z.infer<typeof summarizeDriveTranscriptPdfInputSchema>) {
+  const automationMode = input.automationMode === true;
+  const loginHint = resolveLoginHint(input);
+
+  const contextResult = await resolveContext({
+    actorUserId: input.actorUserId,
+    organizationId: input.organizationId,
+    candidateId: input.candidateId,
+    jobId: input.jobId,
+  });
+
+  if (!contextResult.ok) {
+    return {
+      ...contextResult.error,
+      check: 'summarize_drive_transcript_pdf',
+    };
+  }
+
+  const context = contextResult.value;
+
+  try {
+    const accessToken = await getGoogleAccessToken({
+      loginHint,
+      allowTokenVaultFallback: !automationMode,
+    });
+    const auth = new google.auth.OAuth2();
+    auth.setCredentials({ access_token: accessToken });
+
+    const drive = google.drive('v3');
+    let fileId = input.driveFileId ?? null;
+    let fileName: string | null = null;
+    let webViewLink: string | null = null;
+    const resolvedFolder = await resolveDriveFolderId({
+      drive,
+      auth,
+      explicitFolderId: input.driveFolderId,
+      explicitFolderName: input.driveFolderName,
+    });
+    const folderId = resolvedFolder.folderId;
+    const folderName = resolvedFolder.folderName;
+
+    if (!fileId) {
+      const queryParts = [`trashed = false`, `mimeType = 'application/pdf'`];
+      if (folderId) {
+        queryParts.push(`'${escapeDriveQueryValue(folderId)}' in parents`);
+      }
+
+      const driveQuery = asString(input.driveQuery);
+      if (driveQuery) {
+        const escapedDriveQuery = escapeDriveQueryValue(driveQuery);
+        queryParts.push(`(name contains '${escapedDriveQuery}' or fullText contains '${escapedDriveQuery}')`);
+      }
+
+      const q = queryParts.join(' and ');
+
+      const listed = await drive.files.list({
+        auth,
+        q,
+        pageSize: 5,
+        orderBy: 'modifiedTime desc',
+        fields: 'files(id,name,webViewLink)',
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
+      });
+
+      const picked = listed.data.files?.[0];
+      fileId = picked?.id ?? null;
+      fileName = picked?.name ?? null;
+      webViewLink = picked?.webViewLink ?? null;
+    }
+
+    if (!fileId) {
+      if (!input.driveQuery && !input.driveFileId && !folderId) {
+        return {
+          check: 'summarize_drive_transcript_pdf',
+          status: 'error',
+          message:
+            'No Drive transcript target provided. Pass driveFileId, driveQuery, driveFolderId, or driveFolderName (for example: Headhunt Transcripts).',
+        };
+      }
+
+      return {
+        check: 'summarize_drive_transcript_pdf',
+        status: 'error',
+        message: 'No matching transcript PDF found in Google Drive.',
+        driveQuery: input.driveQuery ?? null,
+        driveFolderId: folderId,
+        driveFolderName: folderName,
+      };
+    }
+
+    if (!fileName || !webViewLink) {
+      const details = await drive.files.get({
+        auth,
+        fileId,
+        fields: 'id,name,webViewLink',
+        supportsAllDrives: true,
+      });
+
+      fileName = details.data.name ?? fileName ?? null;
+      webViewLink = details.data.webViewLink ?? webViewLink ?? null;
+    }
+
+    const media = await drive.files.get(
+      {
+        auth,
+        fileId,
+        alt: 'media',
+        supportsAllDrives: true,
+      },
+      { responseType: 'arraybuffer' },
+    );
+
+    const buffer = Buffer.from(media.data as ArrayBuffer);
+    const parsed = await pdf(buffer);
+    const transcriptText = compactWhitespace(parsed.text || '');
+
+    if (!transcriptText) {
+      return {
+        check: 'summarize_drive_transcript_pdf',
+        status: 'error',
+        message: 'Drive PDF was found, but no transcript text could be extracted.',
+        driveFileId: fileId,
+        fileName,
+      };
+    }
+
+    const summary = await generateTranscriptSummary({
+      sourceText: transcriptText,
+      maxChars: input.maxTranscriptChars,
+      candidateName: context.candidate?.name ?? null,
+      jobTitle: context.job?.title ?? null,
+      jobRequirements: input.jobRequirements,
+    });
+
+    await persistTranscriptSummary({
+      context,
+      summary,
+      action: 'summarize_drive_transcript_pdf',
+      sourceType: 'drive_pdf',
+      sourceId: fileId,
+      metadata: {
+        driveFileId: fileId,
+        fileName,
+        webViewLink,
+        driveFolderId: folderId,
+        driveFolderName: folderName,
+        transcriptLength: transcriptText.length,
+      },
+    });
+
+    return {
+      check: 'summarize_drive_transcript_pdf',
+      status: 'success',
+      source: 'drive_pdf',
+      candidateId: context.candidate?.id ?? null,
+      jobId: context.job?.id ?? null,
+      interviewId: context.interview?.id ?? null,
+      driveFile: {
+        fileId,
+        fileName,
+        webViewLink,
+        folderId,
+        folderName,
+      },
+      transcriptStats: {
+        transcriptLength: transcriptText.length,
+      },
+      summary,
+    };
+  } catch (error) {
+    return {
+      check: 'summarize_drive_transcript_pdf',
+      status: 'error',
+      message:
+        error instanceof Error ? error.message : 'Unknown error while summarizing Drive transcript PDF.',
+    };
+  }
+}
 
 type CandidateContext = {
   id: string;
@@ -328,91 +660,105 @@ async function resolveContext(params: {
     };
   }
 
-  let interview: InterviewContext | null = null;
-  if (params.bookingUid) {
-    const [foundInterview] = await db
-      .select({
-        id: interviews.id,
-        organizationId: interviews.organizationId,
-        candidateId: interviews.candidateId,
-        jobId: interviews.jobId,
-        googleCalendarEventId: interviews.googleCalendarEventId,
-      })
-      .from(interviews)
-      .where(eq(interviews.googleCalendarEventId, `cal:${params.bookingUid}`))
-      .orderBy(desc(interviews.createdAt))
-      .limit(1);
+  const canUseDb = Boolean(process.env.DATABASE_URL);
 
-    interview = foundInterview ?? null;
+  let interview: InterviewContext | null = null;
+  if (canUseDb && params.bookingUid) {
+    try {
+      const [foundInterview] = await db
+        .select({
+          id: interviews.id,
+          organizationId: interviews.organizationId,
+          candidateId: interviews.candidateId,
+          jobId: interviews.jobId,
+          googleCalendarEventId: interviews.googleCalendarEventId,
+        })
+        .from(interviews)
+        .where(eq(interviews.googleCalendarEventId, `cal:${params.bookingUid}`))
+        .orderBy(desc(interviews.createdAt))
+        .limit(1);
+
+      interview = foundInterview ?? null;
+    } catch {
+      interview = null;
+    }
   }
 
   const effectiveCandidateId = params.candidateId ?? interview?.candidateId ?? null;
   let candidate: CandidateContext | null = null;
 
-  if (effectiveCandidateId) {
-    const [foundCandidate] = await db
-      .select({
-        id: candidates.id,
-        name: candidates.name,
-        contactEmail: candidates.contactEmail,
-        organizationId: candidates.organizationId,
-        jobId: candidates.jobId,
-      })
-      .from(candidates)
-      .where(eq(candidates.id, effectiveCandidateId))
-      .limit(1);
+  if (canUseDb && effectiveCandidateId) {
+    try {
+      const [foundCandidate] = await db
+        .select({
+          id: candidates.id,
+          name: candidates.name,
+          contactEmail: candidates.contactEmail,
+          organizationId: candidates.organizationId,
+          jobId: candidates.jobId,
+        })
+        .from(candidates)
+        .where(eq(candidates.id, effectiveCandidateId))
+        .limit(1);
 
-    if (!foundCandidate) {
-      return {
-        ok: false,
-        error: {
-          check: 'transcript_summary',
-          status: 'error',
-          message: `Candidate ${effectiveCandidateId} not found.`,
-        },
-      };
+      if (!foundCandidate) {
+        return {
+          ok: false,
+          error: {
+            check: 'transcript_summary',
+            status: 'error',
+            message: `Candidate ${effectiveCandidateId} not found.`,
+          },
+        };
+      }
+
+      const canView = await canViewCandidate(actorUserId, foundCandidate.id);
+      if (!canView) {
+        return {
+          ok: false,
+          error: {
+            check: 'transcript_summary',
+            status: 'error',
+            message: `Forbidden: no candidate visibility access for ${foundCandidate.id}.`,
+          },
+        };
+      }
+
+      candidate = foundCandidate;
+    } catch {
+      candidate = null;
     }
-
-    const canView = await canViewCandidate(actorUserId, foundCandidate.id);
-    if (!canView) {
-      return {
-        ok: false,
-        error: {
-          check: 'transcript_summary',
-          status: 'error',
-          message: `Forbidden: no candidate visibility access for ${foundCandidate.id}.`,
-        },
-      };
-    }
-
-    candidate = foundCandidate;
   }
 
   const effectiveJobId = params.jobId ?? interview?.jobId ?? candidate?.jobId ?? null;
   let job: JobContext | null = null;
 
-  if (effectiveJobId) {
-    const [foundJob] = await db
-      .select({
-        id: jobs.id,
-        title: jobs.title,
-      })
-      .from(jobs)
-      .where(eq(jobs.id, effectiveJobId))
-      .limit(1);
+  if (canUseDb && effectiveJobId) {
+    try {
+      const [foundJob] = await db
+        .select({
+          id: jobs.id,
+          title: jobs.title,
+        })
+        .from(jobs)
+        .where(eq(jobs.id, effectiveJobId))
+        .limit(1);
 
-    if (!foundJob) {
-      return {
-        ok: false,
-        error: {
-          check: 'transcript_summary',
-          status: 'error',
-          message: `Job ${effectiveJobId} not found.`,
-        },
-      };
+      if (!foundJob) {
+        return {
+          ok: false,
+          error: {
+            check: 'transcript_summary',
+            status: 'error',
+            message: `Job ${effectiveJobId} not found.`,
+          },
+        };
+      }
+
+      job = foundJob;
+    } catch {
+      job = null;
     }
-
-    job = foundJob;
   }
 
   const organizationId =
@@ -487,42 +833,51 @@ async function persistTranscriptSummary(params: {
   sourceId: string;
   metadata: Record<string, unknown>;
 }) {
+  if (!process.env.DATABASE_URL) {
+    return;
+  }
+
   const { context } = params;
   const now = new Date();
 
-  await db.transaction(async (tx: typeof db) => {
-    if (context.interview?.id) {
-      await tx
-        .update(interviews)
-        .set({
-          summary: params.summary.executiveSummary,
-          updatedAt: now,
-        })
-        .where(eq(interviews.id, context.interview.id));
-    }
+  try {
+    await db.transaction(async (tx) => {
+      if (context.interview?.id) {
+        await tx
+          .update(interviews)
+          .set({
+            summary: params.summary.executiveSummary,
+            updatedAt: now,
+          })
+          .where(eq(interviews.id, context.interview.id));
+      }
 
-    await tx.insert(auditLogs).values({
-      organizationId: context.organizationId,
-      actorType: 'agent',
-      actorId: params.action,
-      actorDisplayName: 'Liaison Agent',
-      action: 'interview.transcript.summary.generated',
-      resourceType: context.candidate?.id ? 'candidate' : 'interview',
-      resourceId: context.candidate?.id ?? context.interview?.id ?? params.sourceId,
-      metadata: {
-        actorUserId: context.actorUserId,
-        candidateId: context.candidate?.id ?? null,
-        jobId: context.job?.id ?? null,
-        interviewId: context.interview?.id ?? null,
-        sourceType: params.sourceType,
-        sourceId: params.sourceId,
-        recommendation: params.summary.recommendation,
-        overallRubricScore: params.summary.overallRubricScore,
-        ...params.metadata,
-      },
-      result: 'success',
+      await tx.insert(auditLogs).values({
+        organizationId: context.organizationId,
+        actorType: 'agent',
+        actorId: params.action,
+        actorDisplayName: 'Liaison Agent',
+        action: 'interview.transcript.summary.generated',
+        resourceType: context.candidate?.id ? 'candidate' : 'interview',
+        resourceId: context.candidate?.id ?? context.interview?.id ?? params.sourceId,
+        metadata: {
+          actorUserId: context.actorUserId,
+          candidateId: context.candidate?.id ?? null,
+          jobId: context.job?.id ?? null,
+          interviewId: context.interview?.id ?? null,
+          sourceType: params.sourceType,
+          sourceId: params.sourceId,
+          recommendation: params.summary.recommendation,
+          overallRubricScore: params.summary.overallRubricScore,
+          ...params.metadata,
+        },
+        result: 'success',
+      });
     });
-  });
+  } catch {
+    // Best-effort persistence only; transcript summary should still succeed for Slack digest.
+    return;
+  }
 }
 
 export const summarizeCalBookingTranscriptTool = withCal(
@@ -531,138 +886,7 @@ export const summarizeCalBookingTranscriptTool = withCal(
       'Fetch transcript URLs for a Cal booking UID via /v2/bookings/{bookingUid}/transcripts, pull transcript text, and generate an HR-style rubric summary.',
     inputSchema: summarizeCalBookingTranscriptInputSchema,
     execute: async (input) => {
-      const contextResult = await resolveContext({
-        actorUserId: input.actorUserId,
-        organizationId: input.organizationId,
-        candidateId: input.candidateId,
-        jobId: input.jobId,
-        bookingUid: input.bookingUid,
-      });
-
-      if (!contextResult.ok) {
-        return {
-          ...contextResult.error,
-          check: 'summarize_cal_booking_transcript',
-        };
-      }
-
-      const context = contextResult.value;
-
-      try {
-        const calAccessToken = await getAccessToken();
-        const transcriptsUrl = new URL(`/v2/bookings/${encodeURIComponent(input.bookingUid)}/transcripts`, CAL_COM_API_BASE_URL);
-
-        const transcriptsResponse = await fetch(transcriptsUrl.toString(), {
-          headers: {
-            Authorization: `Bearer ${calAccessToken}`,
-            'cal-api-version': CAL_BOOKINGS_API_VERSION,
-          },
-        });
-
-        if (!transcriptsResponse.ok) {
-          const details = await transcriptsResponse.text();
-          return {
-            check: 'summarize_cal_booking_transcript',
-            status: 'error',
-            message: `Failed to fetch Cal transcripts (${transcriptsResponse.status}): ${details}`,
-          };
-        }
-
-        const payload = (await transcriptsResponse.json()) as unknown;
-        const root = asRecord(payload);
-        const transcriptUrlsRaw = Array.isArray(root?.data) ? root?.data : [];
-        const transcriptUrls = transcriptUrlsRaw
-          .map((value) => asString(value))
-          .filter((value): value is string => Boolean(value));
-
-        if (transcriptUrls.length === 0) {
-          return {
-            check: 'summarize_cal_booking_transcript',
-            status: 'error',
-            message: 'No transcript URLs returned for this booking UID.',
-            bookingUid: input.bookingUid,
-            fallback: {
-              recommended: true,
-              nextTool: 'summarize_drive_transcript_pdf',
-              reason: 'Provide driveFileId, driveQuery, driveFolderId, or driveFolderName for PDF transcript fallback.',
-            },
-          };
-        }
-
-        const extractedChunks: Array<{ url: string; text: string }> = [];
-        for (const url of transcriptUrls.slice(0, 6)) {
-          const text = await fetchTranscriptTextFromUrl(url, calAccessToken);
-          if (text) {
-            extractedChunks.push({ url, text });
-          }
-        }
-
-        const combinedTranscript = compactWhitespace(extractedChunks.map((chunk) => chunk.text).join(' '));
-
-        if (!combinedTranscript) {
-          return {
-            check: 'summarize_cal_booking_transcript',
-            status: 'error',
-            message:
-              'Cal transcript URLs were found, but transcript text could not be extracted. Use summarize_drive_transcript_pdf as fallback if a PDF transcript exists in Drive.',
-            bookingUid: input.bookingUid,
-            transcriptUrls,
-            fallback: {
-              recommended: true,
-              nextTool: 'summarize_drive_transcript_pdf',
-              reason: 'Unable to parse text from Cal transcript URLs. Use driveFileId, driveQuery, driveFolderId, or driveFolderName.',
-            },
-          };
-        }
-
-        const summary = await generateTranscriptSummary({
-          sourceText: combinedTranscript,
-          maxChars: input.maxTranscriptChars,
-          candidateName: context.candidate?.name ?? null,
-          jobTitle: context.job?.title ?? null,
-          jobRequirements: input.jobRequirements,
-        });
-
-        await persistTranscriptSummary({
-          context,
-          summary,
-          action: 'summarize_cal_booking_transcript',
-          sourceType: 'cal_transcript',
-          sourceId: input.bookingUid,
-          metadata: {
-            bookingUid: input.bookingUid,
-            transcriptUrlCount: transcriptUrls.length,
-            extractedTranscriptCount: extractedChunks.length,
-            transcriptLength: combinedTranscript.length,
-          },
-        });
-
-        return {
-          check: 'summarize_cal_booking_transcript',
-          status: 'success',
-          source: 'cal_transcript',
-          bookingUid: input.bookingUid,
-          candidateId: context.candidate?.id ?? null,
-          jobId: context.job?.id ?? null,
-          interviewId: context.interview?.id ?? null,
-          transcriptUrls,
-          transcriptStats: {
-            transcriptUrlCount: transcriptUrls.length,
-            extractedTranscriptCount: extractedChunks.length,
-            transcriptLength: combinedTranscript.length,
-          },
-          summary,
-        };
-      } catch (error) {
-        return {
-          check: 'summarize_cal_booking_transcript',
-          status: 'error',
-          message:
-            error instanceof Error
-              ? error.message
-              : 'Unknown error while summarizing Cal booking transcripts.',
-        };
-      }
+      return runSummarizeCalBookingTranscript(input);
     },
   }),
 );
@@ -673,177 +897,7 @@ export const summarizeDriveTranscriptPdfTool = withDrive(
       'Fallback transcript summarization: fetch a transcript PDF from Google Drive (by file ID or search query) and generate an HR-style rubric summary.',
     inputSchema: summarizeDriveTranscriptPdfInputSchema,
     execute: async (input) => {
-      const contextResult = await resolveContext({
-        actorUserId: input.actorUserId,
-        organizationId: input.organizationId,
-        candidateId: input.candidateId,
-        jobId: input.jobId,
-      });
-
-      if (!contextResult.ok) {
-        return {
-          ...contextResult.error,
-          check: 'summarize_drive_transcript_pdf',
-        };
-      }
-
-      const context = contextResult.value;
-
-      try {
-        const accessToken = await getGoogleAccessToken();
-        const auth = new google.auth.OAuth2();
-        auth.setCredentials({ access_token: accessToken });
-
-        const drive = google.drive('v3');
-        let fileId = input.driveFileId ?? null;
-        let fileName: string | null = null;
-        let webViewLink: string | null = null;
-        const resolvedFolder = await resolveDriveFolderId({
-          drive,
-          auth,
-          explicitFolderId: input.driveFolderId,
-          explicitFolderName: input.driveFolderName,
-        });
-        const folderId = resolvedFolder.folderId;
-        const folderName = resolvedFolder.folderName;
-
-        if (!fileId) {
-          const queryParts = [`trashed = false`, `mimeType = 'application/pdf'`];
-          if (folderId) {
-            queryParts.push(`'${escapeDriveQueryValue(folderId)}' in parents`);
-          }
-
-          const driveQuery = asString(input.driveQuery);
-          if (driveQuery) {
-            const escapedDriveQuery = escapeDriveQueryValue(driveQuery);
-            queryParts.push(`(name contains '${escapedDriveQuery}' or fullText contains '${escapedDriveQuery}')`);
-          }
-
-          const q = queryParts.join(' and ');
-
-          const listed = await drive.files.list({
-            auth,
-            q,
-            pageSize: 5,
-            orderBy: 'modifiedTime desc',
-            fields: 'files(id,name,webViewLink)',
-            supportsAllDrives: true,
-            includeItemsFromAllDrives: true,
-          });
-
-          const picked = listed.data.files?.[0];
-          fileId = picked?.id ?? null;
-          fileName = picked?.name ?? null;
-          webViewLink = picked?.webViewLink ?? null;
-        }
-
-        if (!fileId) {
-          if (!input.driveQuery && !input.driveFileId && !folderId) {
-            return {
-              check: 'summarize_drive_transcript_pdf',
-              status: 'error',
-              message:
-                'No Drive transcript target provided. Pass driveFileId, driveQuery, driveFolderId, or driveFolderName (for example: Headhunt Transcripts).',
-            };
-          }
-
-          return {
-            check: 'summarize_drive_transcript_pdf',
-            status: 'error',
-            message: 'No matching transcript PDF found in Google Drive.',
-            driveQuery: input.driveQuery ?? null,
-            driveFolderId: folderId,
-            driveFolderName: folderName,
-          };
-        }
-
-        if (!fileName || !webViewLink) {
-          const details = await drive.files.get({
-            auth,
-            fileId,
-            fields: 'id,name,webViewLink',
-            supportsAllDrives: true,
-          });
-
-          fileName = details.data.name ?? fileName ?? null;
-          webViewLink = details.data.webViewLink ?? webViewLink ?? null;
-        }
-
-        const media = await drive.files.get(
-          {
-            auth,
-            fileId,
-            alt: 'media',
-            supportsAllDrives: true,
-          },
-          { responseType: 'arraybuffer' },
-        );
-
-        const buffer = Buffer.from(media.data as ArrayBuffer);
-        const parsed = await pdf(buffer);
-        const transcriptText = compactWhitespace(parsed.text || '');
-
-        if (!transcriptText) {
-          return {
-            check: 'summarize_drive_transcript_pdf',
-            status: 'error',
-            message: 'Drive PDF was found, but no transcript text could be extracted.',
-            driveFileId: fileId,
-            fileName,
-          };
-        }
-
-        const summary = await generateTranscriptSummary({
-          sourceText: transcriptText,
-          maxChars: input.maxTranscriptChars,
-          candidateName: context.candidate?.name ?? null,
-          jobTitle: context.job?.title ?? null,
-          jobRequirements: input.jobRequirements,
-        });
-
-        await persistTranscriptSummary({
-          context,
-          summary,
-          action: 'summarize_drive_transcript_pdf',
-          sourceType: 'drive_pdf',
-          sourceId: fileId,
-          metadata: {
-            driveFileId: fileId,
-            fileName,
-            webViewLink,
-            driveFolderId: folderId,
-            driveFolderName: folderName,
-            transcriptLength: transcriptText.length,
-          },
-        });
-
-        return {
-          check: 'summarize_drive_transcript_pdf',
-          status: 'success',
-          source: 'drive_pdf',
-          candidateId: context.candidate?.id ?? null,
-          jobId: context.job?.id ?? null,
-          interviewId: context.interview?.id ?? null,
-          driveFile: {
-            fileId,
-            fileName,
-            webViewLink,
-            folderId,
-            folderName,
-          },
-          transcriptStats: {
-            transcriptLength: transcriptText.length,
-          },
-          summary,
-        };
-      } catch (error) {
-        return {
-          check: 'summarize_drive_transcript_pdf',
-          status: 'error',
-          message:
-            error instanceof Error ? error.message : 'Unknown error while summarizing Drive transcript PDF.',
-        };
-      }
+      return runSummarizeDriveTranscriptPdf(input);
     },
   }),
 );
