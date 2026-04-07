@@ -1,373 +1,362 @@
-# Assistant0: An AI Personal Assistant Secured with Auth0 - Vercel AI Version
+# Headhunt — hire at founder speed
 
-Assistant0 an AI personal assistant that consolidates your digital life by dynamically accessing multiple tools to help you stay organized and efficient.
+Headhunt is an autonomous, agentic recruiting platform for early-stage founders.
 
-![Architecture](./public/images/arch-bg.png)
+Connect Gmail, Cal.com, and Slack via **Auth0 for AI Agents Token Vault**. A crew of five agents runs the pipeline in the background. You step in only when it’s time to approve something high-stakes.
 
-## About the template
+**Demo video (≤ 3 minutes):** <ADD_VIDEO_LINK>  
+**Live app:** <ADD_PUBLIC_URL>  
+**Devpost:** <ADD_DEVPOST_LINK>
 
-This template scaffolds an Auth0 + Next.js starter app. It mainly uses the following libraries:
+**Test user (for judges/testing):**
 
-- Vercel's [AI SDK](https://github.com/vercel-labs/ai) to handle the AI agent.
-- The [Auth0 AI SDK](https://github.com/auth0/auth0-ai-js) and [Auth0 Next.js SDK](https://github.com/auth0/nextjs-auth0) to secure the application and call third-party APIs.
-- [Auth0 FGA](https://auth0.com/fine-grained-authorization) to define fine-grained access control policies for your tools and RAG pipelines.
-- Postgres with [Drizzle ORM](https://orm.drizzle.team/) and [pgvector](https://github.com/pgvector/pgvector) to store the documents and embeddings.
-
-It's Vercel's free-tier friendly too! Check out the [bundle size stats below](#-bundle-size).
-
-[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/auth0-samples/auth0-assistant0)
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fauth0-samples%2Fauth0-assistant0)
-
-## 🚀 Getting Started
-
-First, clone this repo and download it locally.
-
-```bash
-git clone https://github.com/auth0-samples/auth0-assistant0.git
-cd auth0-assistant0/ts-vercel-ai
+```text
+Email: test@test.com
+Password: Headhunt@123
 ```
 
-Next, you'll need to set up environment variables in your repo's `.env.local` file. Copy the `.env.example` file to `.env.local`.
+---
 
-- To start with the examples, you'll just need to add your NVIDIA NIM API key and Auth0 credentials for the Web app and Machine to Machine App.
-  - You can set up a new Auth0 tenant with an Auth0 Web App and Token Vault following the Prerequisites instructions [here](https://auth0.com/ai/docs/get-started/call-others-apis-on-users-behalf).
-  - Click on the tenant name on the [Quickstarts](https://auth0.com/ai/docs/call-your-apis-on-users-behalf), Go to the app settings (**Applications** -> **Applications** -> **WebApp Quickstart Client** -> **Settings** -> **Advanced Settings** -> **Grant Types**) and enable the CIBA grant and save.
-  - For Async Authorizations, you can set up Guardian Push and Enroll the your user for Guardian following the Prerequisites instructions [here](https://auth0.com/ai/docs/async-authorization).
-  - An Auth0 FGA account, you can create one [here](https://dashboard.fga.dev). Add the FGA store ID, client ID, client secret, and API URL to the `.env.local` file.
-  - Optionally add a [SerpAPI](https://serpapi.com/) API key for using web search tool.
+## What it does
 
-Next, install the required packages using your preferred package manager and initialize the database.
+- **Intercepts** candidate emails + resume attachments from Gmail.
+- **Triages** inbound threads into the right lane (application vs scheduling reply vs noise).
+- **Analyzes** candidates with multi-pass scoring (objective score + confidence + breakdown).
+- **Schedules** interviews by fetching live availability, proposing **3 options total (1 per day)**, then booking.
+- **Drafts** offer letters and requires a founder approval gate (CIBA) before sending.
+
+This README follows the execution flow in `plan.md` (priority 1), then product logic from `product/headhunt-spec-v1.md`.
+
+---
+
+## Contents
+
+- Demo flow
+- System architecture
+- Hackathon rubric (judge checklist)
+- Screenshots
+- Local development
+- Deployment (Vercel + Supabase)
+- MCP server (FastMCP)
+- Agent skill doc
+- Credits / non-commercial note
+
+---
+
+## Demo flow (Plan v2)
+
+1. Log in as a founder.
+2. Finish onboarding (connect Gmail + Slack + Cal.com via Token Vault).
+3. Enter the dashboard.
+4. A first intake run triggers automatically post-onboarding.
+5. Send an application email with a resume PDF attached.
+6. Headhunt triages + analyzes the candidate and updates the pipeline.
+7. Schedule an interview from the pipeline: pick a provider (Cal.com or Google Meet fallback) and select slots.
+8. Candidate replies; Headhunt parses the reply, rechecks overlap, and books.
+9. Draft an offer from Cmd+K.
+10. Founder receives a CIBA push and approves in Auth0 Guardian.
+11. Offer is released only after approval; pipeline state updates everywhere.
+
+---
+
+## System architecture (how it works)
+
+### The 5-agent crew
+
+- **Intercept** — ingests inbox signals (thread, body, attachments).
+- **Triage** — classifies inbound messages and decides whether to write pipeline state.
+- **Analyst** — deep candidate evaluation with multi-pass scoring.
+- **Liaison** — scheduling orchestration: slots → outreach → reply parsing → booking.
+- **Dispatch** — offer workflow (draft → CIBA approval → send).
+
+### Execution surfaces
+
+Headhunt has two ways to run agent work:
+
+1) **Interactive operator runtime (in-app)**
+
+- Next.js UI (App Router) under `src/app`.
+- Tool-calling agent runtime under `src/app/api/chat/route.ts` (Vercel AI SDK).
+
+2) **Headless automation runtime (cron/webhook/worker style)**
+
+- **Vercel Cron** triggers `GET/POST /api/cron/intake-polling` (configured in `vercel.json`).
+- That route proxies to Supabase Edge Function: `v2-orchestrator-cron`.
+- Supabase orchestration calls back into the app via `POST /api/automation/execute` to execute specific handler types.
+
+This gives you:
+
+- cookie-independent execution when M2M is configured
+- deterministic handler execution
+- observable run state in the database
+
+### Automation queue (idempotent by design)
+
+The automation runtime is a persistent queue:
+
+- Queue table: `automation_runs` (Drizzle schema in `src/lib/db/schema/automation-runs.ts`)
+- Audit table: `audit_logs`
+- Core engine: `src/lib/automation/queue.ts`
+
+Key properties:
+
+- **Idempotency:** inserts use `(handlerType, idempotencyKey)` conflict protection.
+- **Retries:** runs can retry with backoff and end in `dead_letter` when terminal.
+- **Separation of concerns:** orchestration (cron/webhooks) schedules work; execution runs a single handler deterministically.
+
+Common handler types you’ll see:
+
+- `intake.scan`
+- `candidate.score`
+- `scheduling.request.send`
+- `scheduling.reply.parse_book`
+- `offer.draft.create`
+- `offer.submit.*` / approval + send flows
+
+### Triage (classification)
+
+Triage is built to be cheap and decisive:
+
+- one structured `generateObject` classification pass
+- outputs a classification + confidence (e.g. application vs scheduling reply)
+- only “application” results trigger candidate/application persistence
+
+### Analyst (multi-pass scoring)
+
+Analyst is built to be strict:
+
+- multiple evaluator passes (not surface-level filtering)
+- produces distinct **objective score** and **confidence score** plus a breakdown
+- persists structured output to candidate records so the UI can render instantly
+
+### Scheduling (Cal.com + Google Meet fallback)
+
+Scheduling is designed to feel like a human coordinator:
+
+- fetch live slots
+- propose **3 options total (1 per day)** across the next few days
+- parse the candidate reply (option number or freeform window)
+- recheck overlap to avoid stale selections
+- book and move the candidate stage forward
+
+---
+
+## Built for “Authorized to Act” (judge checklist)
+
+**Security model**
+
+- Token Vault holds OAuth tokens; agents don’t handle raw credentials.
+- Headless execution uses an M2M app rather than replaying user cookies.
+- High-stakes actions are gated with step-up approval (CIBA).
+
+**User control**
+
+- Role enforcement is handled via Auth0 FGA checks, not only UI.
+- All important transitions are persisted and auditable.
+
+**Technical execution**
+
+- Next.js 15 + Vercel AI SDK for interactive tool-calling.
+- Supabase Edge Functions + Vercel Cron for automation.
+- FastMCP server to expose the pipeline to any MCP client.
+
+**Design**
+
+- Operator-first UI: pipeline board, candidate detail, and command-center actions.
+
+**Insight value**
+
+- CIBA used as a delegation escalation gate: draft is easy, release is protected.
+
+---
+
+## Screenshots (drop in your own images)
+
+Create `docs/images/*` and replace the placeholders below.
+
+| | |
+| --- | --- |
+| ![Landing Page](docs/images/landing.png)<br/><sub>Landing page</sub> | ![Dashboard](docs/images/dashboard.png)<br/><sub>Dashboard</sub> |
+| ![Pipeline](docs/images/pipeline.png)<br/><sub>Pipeline (Applied → Interview → Offer)</sub> | ![Jobs](docs/images/jobs.png)<br/><sub>Jobs</sub> |
+| ![Candidate](docs/images/candidate.png)<br/><sub>Candidate detail (score + intel)</sub> | ![Scheduling](docs/images/scheduling.png)<br/><sub>Scheduling modal (slots + provider)</sub> |
+
+---
+
+## Local development
+
+### Prerequisites
+
+- Node.js `>=18`
+- Docker (for Postgres + pgvector)
+
+### 1) Install dependencies
 
 ```bash
-npm install # or bun install
-# start the postgres database
+npm install
+```
+
+### 2) Start the database
+
+```bash
 docker compose up -d
-# create the database schema
-npm run db:migrate # or bun db:migrate
-# initialize FGA store
-npm run fga:init # or bun fga:init
 ```
 
-## Offer Clearance With CIBA (Phone Approval)
-
-Offer emails are gated by CIBA clearance in this project: `submit_offer_for_clearance` creates a CIBA request, and the email is only sent after `poll_offer_clearance` sees an approved status.
-
-1. Configure CIBA on your Auth0 app
-- In Auth0 Dashboard, open your app settings and enable the `Client Initiated Backchannel Authentication (CIBA)` grant type.
-- Reference: [Configure Client-Initiated Backchannel Authentication](https://auth0.com/docs/get-started/applications/configure-client-initiated-backchannel-authentication).
-
-2. Configure API audience + CIBA policy
-- Set up/confirm the API audience used by the app (`AUTH0_CIBA_AUDIENCE`).
-- In the API CIBA settings/policy, allow the founder user(s) who can approve offers.
-
-3. Enable phone approvals (Guardian push)
-- Enable Auth0 Guardian push notifications.
-- Enroll the founder user in Guardian on their phone.
-- References:
-  - [Mobile Push Notifications with CIBA](https://auth0.com/docs/get-started/authentication-and-authorization-flow/client-initiated-backchannel-authentication-flow/mobile-push-notifications-with-ciba)
-  - [Enroll in push notifications](https://auth0.com/docs/secure/multi-factor-authentication/auth0-guardian#enroll-in-push-notifications)
-
-4. Set required app environment variables
-- `HEADHUNT_FOUNDER_USER_ID` (or `HEADHUNT_FOUNDER_USER_IDS`)
-- `AUTH0_CIBA_AUDIENCE`
-- `AUTH0_CIBA_SCOPE` (usually `openid`)
-- Optional: `AUTH0_CIBA_LOGIN_HINT_ISSUER` if not `https://<AUTH0_DOMAIN>/`
-
-5. Validate end-to-end behavior
-- `submit_offer_for_clearance` should return `mode=awaiting_clearance` with a `cibaAuthReqId`.
-- Approve on phone.
-- `poll_offer_clearance` should return `mode=sent_after_clearance`.
-
-Now you're ready to run the development server:
+### 3) Configure environment
 
 ```bash
-npm run dev  # or bun dev
+cp .env.example .env.local
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result! Ask the bot something and you'll see a streamed response:
+Minimum envs for local dev:
 
-![A streaming conversation between the user and the AI](/public/images/home-page.png)
+- `NIM_API_KEY`
+- `AUTH0_DOMAIN`, `AUTH0_CLIENT_ID`, `AUTH0_CLIENT_SECRET`, `AUTH0_SECRET`, `APP_BASE_URL`
+- `DATABASE_URL`
+- `FGA_STORE_ID`, `FGA_CLIENT_ID`, `FGA_CLIENT_SECRET`, `FGA_API_URL`, `FGA_API_AUDIENCE`
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
-
-Backend logic lives in `app/api/chat/route.ts`. From here, you can change the prompt and model, or add other modules and logic.
-
-## 📦 Bundle size
-
-This package has [@next/bundle-analyzer](https://www.npmjs.com/package/@next/bundle-analyzer) set up by default - you can explore the bundle size interactively by running:
-
-```bash
-$ ANALYZE=true npm run build
-```
-
-## Supabase Automation Runtime
-
-Automation orchestration runs in Supabase Edge Functions so cron/webhook execution logs are visible in Supabase.
-
-### v2 clean architecture (recommended)
-
-- `v2-orchestrator-cron`: enqueues watchdog/intake work and processes due queue runs.
-- `v2-webhook-candidate-created`: handles `candidates` INSERT webhook events only.
-- `v2-webhook-offer-status`: handles `offers` INSERT/UPDATE webhook events only.
-- `v2-replay`: creates replay child runs and optionally processes immediately.
-- `v2-agent-intercept`: ingress-style inbox intercept trigger.
-- `v2-agent-triage`: routing-focused intake trigger.
-- `v2-agent-analyst`: candidate scoring trigger.
-- `v2-agent-liaison`: interview scheduling request/reply trigger.
-- `v2-agent-dispatch`: offer draft/clearance trigger.
-
-Legacy `automation-*` and `agent-*` functions can remain deployed during migration, but v2 is the active path for new wiring.
-
-App routes under `/api/automation/*` and `/api/automation/v2/*` are lightweight proxies to these Supabase functions.
-Queue handler execution is called by Supabase via `/api/automation/execute`.
-
-### Why 200 does not always mean flow success
-
-`automation-cron` can return HTTP 200 even when downstream queue handlers fail and are retried/dead-lettered.
-Always inspect `automation_runs` and `audit_logs` (or the cron response `processed` block) to confirm real progress.
-
-### 1. Apply migrations
-
-Run the project migration flow so helper SQL functions exist:
+### 4) Migrate DB + initialize FGA
 
 ```bash
 npm run db:migrate
+npm run fga:init
 ```
 
-### 2. Configure environment
-
-Set these values in your app and Supabase function environment:
-
-- `NEXT_PUBLIC_SUPABASE_URL`
-- `SUPABASE_FUNCTIONS_URL`
-- `SUPABASE_SERVICE_ROLE_KEY`
-- `SUPABASE_AUTOMATION_FUNCTION_SECRET` (can reuse `CRON_SECRET`)
-- `SUPABASE_FUNCTIONS_AUTH_MODE` (optional: `secret-header`, `bearer`, or `both`; defaults to `secret-header`)
-- `AUTOMATION_EXECUTE_URL`
-- `AUTOMATION_EXECUTE_SECRET` (optional if you reuse `SUPABASE_AUTOMATION_FUNCTION_SECRET`/`AUTOMATION_CRON_SECRET`/`CRON_SECRET`)
-- `CRON_SECRET` (recommended single secret for Vercel cron and proxy routes)
-- `AUTOMATION_EXECUTE_TIMEOUT_MS` (optional, defaults to `12000`)
-- `AUTOMATION_EXECUTE_COOKIE` (optional fallback cookie for headless cron runs that need Token Vault-backed tools)
-- `AUTOMATION_AUTO_INTAKE_ENABLED` (optional, defaults to `true`)
-- `AUTOMATION_INTAKE_QUERY` (optional Gmail query override for cron-driven intake scans)
-- `AUTOMATION_AUTO_INTAKE_ON_JOB_CREATE` (optional, defaults to `true`; enqueue first `intake.scan` ~1 minute after active job creation)
-- `AUTOMATION_INITIAL_INTAKE_DELAY_MS` (optional, defaults to `60000`)
-- `AUTOMATION_INITIAL_INTAKE_MAX_RESULTS` (optional, defaults to `20`)
-- `AUTOMATION_INITIAL_INTAKE_PROCESS_LIMIT` (optional, defaults to `8`)
-- `AUTOMATION_INITIAL_INTAKE_CANDIDATE_LIKE_ONLY` (optional, defaults to `true`)
-- `AUTOMATION_INITIAL_INTAKE_INCLUDE_BODY` (optional, defaults to `true`)
-- `AUTOMATION_INITIAL_INTAKE_GENERATE_INTEL` (optional, defaults to `true`)
-- `AUTOMATION_V2_KICKOFF_ENABLED` (optional, defaults to `true`)
-- `AUTOMATION_V2_KICKOFF_PROCESS_LIMIT` (optional, defaults to `3`)
-- `HEADHUNT_FOUNDER_USER_ID` or `HEADHUNT_FOUNDER_USER_IDS`
-- `AUTH0_CIBA_AUDIENCE`
-- `AUTH0_CIBA_SCOPE` (optional override, defaults to `openid`)
-- `AUTH0_CIBA_LOGIN_HINT_ISSUER` (optional override)
-- `AUTH0_GOOGLE_TOKEN_EXCHANGE_MODE` (optional: `refresh` or `access`; defaults to `access` when M2M env vars below are set)
-- `AUTH0_GOOGLE_ACCESS_TOKEN_SOURCE` (optional: `auto`, `management_api`, or `token_vault`; defaults to `auto`)
-- `AUTH0_SLACK_TOKEN_EXCHANGE_MODE` (optional: `refresh` or `access`; defaults to `access` when M2M env vars below are set)
-- `AUTH0_CAL_TOKEN_EXCHANGE_MODE` (optional: `refresh` or `access`; defaults to `access` when M2M env vars below are set)
-- `AUTH0_TOKEN_VAULT_M2M_CLIENT_ID` (required for headless Token Vault via privileged-worker flow)
-- `AUTH0_TOKEN_VAULT_M2M_CLIENT_SECRET` (required for headless Token Vault via privileged-worker flow)
-- `AUTH0_TOKEN_VAULT_M2M_AUDIENCE` (required for headless Token Vault via privileged-worker flow)
-- `AUTH0_TOKEN_VAULT_M2M_SCOPE` (optional scope override for client credentials token)
-- `AUTH0_TOKEN_VAULT_LOGIN_HINT` (recommended for headless Token Vault; usually founder user id/email)
-- `AUTH0_MANAGEMENT_CLIENT_ID` (optional override; falls back to `AUTH0_TOKEN_VAULT_M2M_CLIENT_ID`)
-- `AUTH0_MANAGEMENT_CLIENT_SECRET` (optional override; falls back to `AUTH0_TOKEN_VAULT_M2M_CLIENT_SECRET`)
-- `AUTH0_MANAGEMENT_AUDIENCE` (optional override; defaults to `https://<AUTH0_DOMAIN>/api/v2/`)
-- `AUTH0_MANAGEMENT_SCOPE` (optional override; defaults to `read:federated_connections_tokens`)
-- `AUTH0_MANAGEMENT_USER_ID` (optional fixed user id for managed-token lookup)
-- `AUTH0_MANAGEMENT_GOOGLE_CONNECTION` (optional override; defaults to `AUTH0_GOOGLE_CONNECTION`)
-- `AUTH0_GOOGLE_OAUTH_CLIENT_ID` and `AUTH0_GOOGLE_OAUTH_CLIENT_SECRET` (optional; only needed when you want refresh-token exchange at `oauth2.googleapis.com/token`)
-
-Token Vault-backed Gmail/Calendar/Cal tools support both headless M2M and session-cookie exchange.
-The recommended production/demo path is M2M-first and cookie-independent.
-Use one of these patterns:
-
-- Token-exchange mode for Google (recommended; works even when the Management API token-sets endpoint is deprecated/disabled):
-  - set `AUTH0_GOOGLE_ACCESS_TOKEN_SOURCE=token_exchange` (or keep legacy `management_api` — it maps to token exchange)
-  - make sure your Auth0 application allows the grant type `urn:auth0:params:oauth:grant-type:token-exchange:federated-connection-access-token`
-  - make sure your Auth0 app is configured to issue refresh tokens and your login scope includes `offline_access` (see `AUTH0_SCOPE` in `.env.example`), otherwise `session.tokenSet.refreshToken` will be empty and `auth0_subject_refresh_tokens` cannot be seeded
-  - runtime behavior:
-    - if a user refresh token is available (interactive session or stored in `auth0_subject_refresh_tokens`), exchange it for a Google access token
-    - otherwise, fall back to the privileged-worker exchange using a JWT access token + `login_hint` (requires `AUTH0_TOKEN_VAULT_M2M_*`)
-- Primary M2M mode: set `AUTH0_GOOGLE_TOKEN_EXCHANGE_MODE=access` and configure the `AUTH0_TOKEN_VAULT_M2M_*` vars plus `AUTH0_TOKEN_VAULT_LOGIN_HINT`.
-- Session/cookie mode (debug fallback): send `x-automation-execute-cookie` when calling `/api/automation/cron`.
-- Optional static fallback: set `AUTOMATION_EXECUTE_COOKIE` in function secrets.
-
-Execution topology (v2):
-
-- Vercel cron triggers `POST /api/cron/intake-polling` from `vercel.json`.
-- That route proxies to Supabase `v2-orchestrator-cron`.
-- Supabase orchestrator/enqueued workers call app `/api/automation/execute` to run agent handlers.
-- If you do not want Vercel cron, you must configure a Supabase-side scheduler (for example `pg_cron`) to call `v2-orchestrator-cron` directly.
-
-Rate-limit guardrails for Auth0 token endpoints are built in:
-
-- M2M access tokens are cached until near expiry.
-- Concurrent token fetches are deduplicated via in-flight promise sharing.
-
-Debug shortcut (recommended when you're trying to seed refresh tokens for token-exchange mode):
-
-- Visit `/api/debug/force-consent?returnTo=/onboarding` to force an Auth0 re-login with `prompt=consent` + `max_age=0` and the configured `AUTH0_SCOPE` (includes `offline_access` by default).
-
-### 3. Deploy Edge Functions
+### 5) Run the app
 
 ```bash
-npx supabase login
-npx supabase link --project-ref <your_project_ref>
-
-# Set edge function secrets (repeat/update as needed)
-npx supabase secrets set SUPABASE_AUTOMATION_FUNCTION_SECRET="<same-secret-used-by-app-proxy>"
-npx supabase secrets set AUTOMATION_EXECUTE_URL="https://<your-app-domain>/api/automation/execute"
-npx supabase secrets set AUTOMATION_EXECUTE_SECRET="<same-secret-used-by-execute-route>"
-npx supabase secrets set AUTOMATION_EXECUTE_TIMEOUT_MS="12000"
-npx supabase secrets set AUTOMATION_AUTO_INTAKE_ENABLED="true"
-npx supabase secrets set AUTOMATION_AUTO_INTAKE_ON_JOB_CREATE="true"
-npx supabase secrets set AUTOMATION_INITIAL_INTAKE_DELAY_MS="60000"
-npx supabase secrets set AUTOMATION_INTAKE_QUERY="in:inbox newer_than:14d -category:promotions -category:social -subject:newsletter -subject:digest -subject:unsubscribe"
-
-# Headless Token Vault via M2M privileged-worker subject token exchange
-npx supabase secrets set AUTH0_GOOGLE_TOKEN_EXCHANGE_MODE="access"
-npx supabase secrets set AUTH0_GOOGLE_ACCESS_TOKEN_SOURCE="management_api"
-npx supabase secrets set AUTH0_TOKEN_VAULT_M2M_CLIENT_ID="<auth0-m2m-client-id>"
-npx supabase secrets set AUTH0_TOKEN_VAULT_M2M_CLIENT_SECRET="<auth0-m2m-client-secret>"
-npx supabase secrets set AUTH0_TOKEN_VAULT_M2M_AUDIENCE="<auth0-api-audience-for-client-credentials>"
-npx supabase secrets set AUTH0_TOKEN_VAULT_LOGIN_HINT="<founder-user-sub-or-email>"
-npx supabase secrets set AUTH0_MANAGEMENT_SCOPE="read:federated_connections_tokens"
-npx supabase secrets set AUTH0_MANAGEMENT_USER_ID="<founder-auth0-user-id>"
-
-# Optional if you want Google refresh-token exchange instead of managed access-token passthrough
-npx supabase secrets set AUTH0_GOOGLE_OAUTH_CLIENT_ID="<google-oauth-client-id>"
-npx supabase secrets set AUTH0_GOOGLE_OAUTH_CLIENT_SECRET="<google-oauth-client-secret>"
-
-# Optional fallback if cron calls are headless and need Token Vault context
-npx supabase secrets set AUTOMATION_EXECUTE_COOKIE="__session=<cookie-value>"
-
-npx supabase functions deploy automation-cron --no-verify-jwt
-npx supabase functions deploy automation-webhook --no-verify-jwt
-npx supabase functions deploy automation-replay --no-verify-jwt
-npx supabase functions deploy agent-intercept --no-verify-jwt
-npx supabase functions deploy agent-triage --no-verify-jwt
-npx supabase functions deploy agent-analyst --no-verify-jwt
-npx supabase functions deploy agent-liaison --no-verify-jwt
-npx supabase functions deploy agent-dispatch --no-verify-jwt
-
-# v2 clean architecture deployment
-npx supabase functions deploy v2-orchestrator-cron --no-verify-jwt
-npx supabase functions deploy v2-webhook-candidate-created --no-verify-jwt
-npx supabase functions deploy v2-webhook-offer-status --no-verify-jwt
-npx supabase functions deploy v2-replay --no-verify-jwt
-npx supabase functions deploy v2-agent-intercept --no-verify-jwt
-npx supabase functions deploy v2-agent-triage --no-verify-jwt
-npx supabase functions deploy v2-agent-analyst --no-verify-jwt
-npx supabase functions deploy v2-agent-liaison --no-verify-jwt
-npx supabase functions deploy v2-agent-dispatch --no-verify-jwt
+npm run dev
 ```
 
-If you see Supabase gateway responses like `{"code":401,"message":"Missing authorization header"}`
-or `{"code":401,"message":"Invalid Token or Protected Header formatting"}` when calling
-`/v2-*` functions with `x-automation-secret`, redeploy those functions with `--no-verify-jwt`.
-
-### 4. Wire Supabase cron and webhooks
-
-- Cron target: `v2-orchestrator-cron` with body like `{"job":"all","limit":8,"architecture":"v2"}`.
-- Database webhook target #1: `v2-webhook-candidate-created` for `candidates` `INSERT` events.
-- Database webhook target #2: `v2-webhook-offer-status` for `offers` `INSERT,UPDATE` events.
-- Replay can be invoked manually via `v2-replay`.
-
-For faster response paths, webhook and replay calls can process queue work immediately:
-
-- `v2-webhook-candidate-created`: include `{"processNow":true,"processLimit":2}` to enqueue and execute in one call.
-- `v2-webhook-offer-status`: include `{"processNow":true,"processLimit":2}` to enqueue and execute in one call.
-- `v2-replay`: defaults to immediate execution (`processNow=true`), override with `{"processNow":false}` to enqueue-only.
-
-Agent facade endpoints (same auth header as other functions):
-
-- `v2-agent-intercept`: enqueue/process `intake.scan` runs tagged `agentName: intercept`.
-- `v2-agent-triage`: enqueue/process `intake.scan` runs tagged `agentName: triage`.
-- `v2-agent-analyst`: enqueue/process `candidate.score` runs tagged `agentName: analyst`.
-- `v2-agent-liaison`: enqueue/process `scheduling.request.send` or `scheduling.reply.parse_book` tagged `agentName: liaison`.
-- `v2-agent-dispatch`: enqueue/process `offer.draft.create` or `offer.clearance.poll` tagged `agentName: dispatch`.
-
-`v2-orchestrator-cron`, `v2-webhook-*`, and follow-up chaining include per-agent counters in `processed.agents` so UI layers can display "which agent is processing what".
-
-Use `x-automation-secret: <SUPABASE_AUTOMATION_FUNCTION_SECRET>` for all automation function calls.
-Bearer auth remains supported where needed; app proxies can opt in with `SUPABASE_FUNCTIONS_AUTH_MODE=bearer` or `both`.
-When triggering cron via app proxy routes, `x-automation-execute-cookie` (or `cookie`) may be forwarded for debug flows, but is not required in M2M-first mode.
-
-### 5. Quick health checks
-
-After deploy, run:
+Optional:
 
 ```bash
-curl -X POST "https://<your-app-domain>/api/automation/cron" \
-  -H "Authorization: Bearer <AUTOMATION_CRON_SECRET>" \
-  -H "x-automation-secret: <AUTOMATION_CRON_SECRET>" \
+npm run lint
+npm run seed:demo
+```
+
+---
+
+## Deployment (Vercel + Supabase)
+
+### Vercel
+
+- Set all required env vars from `.env.example`.
+- Configure a cron auth secret:
+  - `CRON_SECRET` (or `AUTOMATION_CRON_SECRET`)
+
+Cron endpoint:
+
+- `GET/POST /api/cron/intake-polling`
+- schedule is configured in `vercel.json`
+
+You can also trigger it manually:
+
+```bash
+curl -X POST "https://<your-app-domain>/api/cron/intake-polling" \
+  -H "Authorization: Bearer <CRON_SECRET>" \
   -H "Content-Type: application/json" \
-  --data '{"job":"all","limit":6}'
+  --data '{}'
 ```
 
-Then verify queue progress in DB:
+### Supabase Edge Functions
 
-- `automation_runs`: confirm `intake.scan`, `candidate.score`, and `scheduling.reply.parse_book` are being inserted/executed.
-- `audit_logs`: confirm intake and scheduling actions are being written.
+Edge functions live under `supabase/functions/*` (legacy and `v2-*`). The recommended wiring uses:
 
-### 6. Full Edge Flow Smoke Test
+- `v2-orchestrator-cron`
+- `v2-webhook-candidate-created`
+- `v2-webhook-offer-status`
+- `v2-agent-*` facades (intercept/triage/analyst/liaison/dispatch)
 
-Use one command to validate the full automated path:
+Set secrets (names in `.env.example`) and deploy functions. Then wire DB webhooks for inserts/updates that should enqueue work.
 
-- ingest intercept
-- candidate scoring
-- scheduling request send/draft with Cal slots
-- booking from candidate reply (Cal invitation link)
-- offer draft generation
+---
+
+## Auth0 setup (Token Vault + M2M + CIBA)
+
+Headhunt is built to run without fragile cookie forwarding. The clean setup is:
+
+1) **Auth0 Web App** for interactive login
+2) **Auth0 Machine-to-Machine (M2M) App** for headless execution
+3) **Token Vault** connections (Google, Cal.com, Slack)
+4) **CIBA + Guardian Push** for step-up approval
+5) **Auth0 FGA** for role enforcement
+
+### M2M (headless) env vars
+
+- `AUTH0_TOKEN_VAULT_M2M_CLIENT_ID`
+- `AUTH0_TOKEN_VAULT_M2M_CLIENT_SECRET`
+- `AUTH0_TOKEN_VAULT_M2M_AUDIENCE`
+
+### Offer approval (CIBA)
+
+- Enable the CIBA grant type.
+- Enable Guardian push and enroll the founder user.
+- Set:
+  - `HEADHUNT_FOUNDER_USER_ID` (or `HEADHUNT_FOUNDER_USER_IDS`)
+  - `AUTH0_CIBA_AUDIENCE`
+  - `AUTH0_CIBA_SCOPE`
+
+### Management API fallback (recommended for robustness)
+
+If token exchange isn’t available in a given environment, Headhunt can fall back to the Auth0 **Management API** to retrieve federated connection token material (requires explicit permissions).
+
+- `AUTH0_MANAGEMENT_CLIENT_ID`
+- `AUTH0_MANAGEMENT_CLIENT_SECRET`
+- `AUTH0_MANAGEMENT_AUDIENCE` (typically `https://YOUR_DOMAIN/api/v2/`)
+- `AUTH0_MANAGEMENT_SCOPE` (must include `read:federated_connections_tokens`)
+
+---
+
+## MCP server (FastMCP)
+
+This repo includes an MCP server so you can query jobs/pipeline/candidate details from any MCP-compatible client.
+
+### Run locally
 
 ```bash
-npm run smoke:edge-e2e
+npm run mcp:http
 ```
 
-Default mode is request-first/non-strict: if no newer candidate reply exists yet, the script reports `waiting_for_candidate_reply` instead of forcing booking.
-Use strict mode when you expect a fresh reply and full booking->offer draft chain in a single run:
+Or for local dev-only stdio:
 
 ```bash
-npm run smoke:edge-e2e -- --strict
+npm run mcp:stdio
 ```
 
-Useful overrides:
+Env vars:
 
-```bash
-# Run in draft mode for scheduling request email
-npm run smoke:edge-e2e -- --request-send-mode draft
+- `MCP_AUTH_AUDIENCE`
+- `MCP_AUTH_ISSUER` (optional; defaults to `AUTH0_DOMAIN`)
+- `MCP_PORT`, `MCP_ENDPOINT` (optional)
 
-# Use custom candidate/job ids and verbose output
-npm run smoke:edge-e2e -- \
-  --candidate-id <candidate_id> \
-  --job-id <job_id> \
-  --organization-id <org_id> \
-  --verbose
-```
+Tools exposed include:
 
-Required env/secret inputs for the smoke script:
+- `list_jobs`
+- `list_pipeline`
+- `get_candidate_detail`
+- `summarize_pipeline_health`
 
-- `AUTOMATION_CRON_SECRET` (or `SUPABASE_AUTOMATION_FUNCTION_SECRET`)
-- `SUPABASE_FUNCTIONS_URL` or `NEXT_PUBLIC_SUPABASE_URL`
-- `SUPABASE_SERVICE_ROLE_KEY` to read `automation_runs` for stage-level assertions
+### Example prompts (copy/paste)
 
-Recommended edge secrets for liaison scheduling:
+- “List my jobs, then show my pipeline for the most recent job. Return the top candidates by score and any stalled stages.”
+- “Summarize pipeline health across all jobs and tell me what to do next.”
 
-- `CAL_PUBLIC_USERNAME` (or `CAL_PUBLIC_TEAM_SLUG` / `CAL_PUBLIC_ORGANIZATION_SLUG`)
-- `CAL_INTERVIEW_EVENT_TYPE_SLUG`
+---
 
-Offer stage note:
+## Agent skill doc
 
-- `offer.draft.create` creates/updates an offer draft record and draft content.
-- Sending the offer email is handled by `submit_offer_for_clearance` / clearance flow, not by draft creation alone.
+See `skills/SKILL.md` for a detailed “operating manual” designed for AI agents and contributors.
 
-## License
+---
 
-This project is open-sourced under the MIT License - see the [LICENSE](LICENSE) file for details.
+## Credits
 
-## Author
+- **Agentation** (by Benji Taylor)
+- Auth0 for AI Agents — Token Vault, CIBA, and FGA
+- Next.js, Vercel AI SDK, Supabase, Drizzle, FastMCP
 
-This project is built by [Deepu K Sasidharan](https://github.com/deepu105).
+---
+
+## Non-commercial note
+
+This project is MIT licensed, but the current intent is non-commercial, demo/hackathon usage only.

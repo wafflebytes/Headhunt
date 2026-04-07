@@ -47,6 +47,10 @@ next-env.d.ts
 # LangGraph API
 .langgraph_api
 
+# local scratch
+.tmp-nop/
+.VSCodeCounter/
+
 # Bun
 bun.lock
 
