@@ -5,7 +5,15 @@ import { z } from 'zod';
 
 import { nanoid } from '@/utils/nano-id';
 
-export const AUTOMATION_RUN_STATUSES = ['pending', 'running', 'retrying', 'completed', 'dead_letter', 'cancelled'] as const;
+export const AUTOMATION_RUN_STATUSES = [
+  'pending',
+  'running',
+  'retrying',
+  'paused_awaiting_reauth',
+  'completed',
+  'dead_letter',
+  'cancelled',
+] as const;
 export const automationRunStatusSchema = z.enum(AUTOMATION_RUN_STATUSES);
 
 export const automationRuns = pgTable(

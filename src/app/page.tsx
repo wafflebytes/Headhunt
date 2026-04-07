@@ -1,8 +1,8 @@
 'use client';
-import { useUser } from "@/app/api-mock";
+import { requestHiringRefresh, useUser } from "@/app/api-mock";
 import type { Doc, Id } from "@/app/api-mock";
 import { useQuery, useMutation, useAction, api } from "@/app/api-mock";
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import CommandMenuWrapper from '@/components/command-menu-wrapper';
 import { ChatWindow, type ChatJobPickerOption } from '@/components/chat-window';
@@ -42,7 +42,7 @@ import {
   File01Icon,
 } from '@hugeicons/core-free-icons';
 import { DropdownMenuCheckboxItem } from '@/components/ui/dropdown-menu';
-import { X, Github } from 'lucide-react';
+import { X, Github, Info } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -51,9 +51,11 @@ import { Badge } from '@/components/ui/badge';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuLabel } from '@/components/ui/dropdown-menu';
 import { HugeIcon } from '@/components/ui/huge-icon';
 import { Dialog, DialogContent } from '@/components/ui/dialog';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 
 import { DialogTitle } from '@radix-ui/react-dialog';
 import { VisuallyHidden } from '@radix-ui/react-visually-hidden';
+import { AnimatedNumber } from '@/components/ui/animated-number';
 
 type AppIconProps = {
   size?: number | string;
@@ -97,6 +99,7 @@ const Bot = createAppIcon(Robot02HugeIcon);
 const Roles = createAppIcon(WorkHugeIcon);
 const Settings = createAppIcon(Settings02HugeIcon);
 const ArrowRight = createAppIcon(ArrowRight01HugeIcon);
+const ArrowUpDown = createAppIcon(ArrowUpDownHugeIcon);
 const Play = createAppIcon(PlayHugeIcon);
 const CheckCircle2 = createAppIcon(CheckmarkCircle02HugeIcon);
 const ChevronDown = createAppIcon(ArrowDown01HugeIcon);
@@ -135,6 +138,35 @@ type JdSynthesisResponse = {
   message?: string;
 };
 
+type JobsApiRecord = {
+  id: string;
+  slug: string;
+  title: string;
+  team: string;
+  openedAt: string;
+  status: string;
+  applied: number;
+  reviewed: number;
+  interviewed: number;
+  manager: string;
+  description: string;
+  jdSynthesis: JdSynthesisTemplate | null;
+  organizationId?: string | null;
+  organizationName?: string | null;
+};
+
+type JobsApiResponse = {
+  status?: string;
+  jobs?: JobsApiRecord[];
+  message?: string;
+};
+
+type CreateJobApiResponse = {
+  status?: string;
+  job?: JobsApiRecord;
+  message?: string;
+};
+
 type DraftJdFormState = {
   companyStage: string;
   employmentType: string;
@@ -161,7 +193,7 @@ type JobRecord = {
   title: string;
   team: string;
   openedAt: string;
-  status: 'active' | 'paused' | 'draft';
+  status: 'active' | 'paused' | 'draft' | 'closed';
   statusClass: string;
   applied: number;
   reviewed: number;
@@ -216,6 +248,56 @@ const slugifyJobTitle = (value: string) =>
     .replace(/[^a-z0-9\s-]/g, '')
     .replace(/\s+/g, '-')
     .replace(/-+/g, '-');
+
+const getJobStatusClass = (status: JobRecord['status']) => {
+  if (status === 'active') {
+    return 'bg-[#ecfdf5] text-[#15803d] border-[#bbf7d0]';
+  }
+
+  if (status === 'paused') {
+    return 'bg-[#fffbeb] text-[#b45309] border-[#fde68a]';
+  }
+
+  if (status === 'closed') {
+    return 'bg-[#fef2f2] text-[#b91c1c] border-[#fecaca]';
+  }
+
+  return 'bg-[#f8fafc] text-[#475569] border-[#e2e8f0]';
+};
+
+const normalizeJobStatus = (status: string): JobRecord['status'] => {
+  if (status === 'active' || status === 'paused' || status === 'draft' || status === 'closed') {
+    return status;
+  }
+
+  return 'paused';
+};
+
+const toJobRecord = (job: JobsApiRecord): JobRecord => {
+  const status = normalizeJobStatus(job.status);
+  const normalizedTitle = job.title.trim() || 'Untitled role';
+  const normalizedTeam = job.team.trim() || job.jdSynthesis?.department?.trim() || 'General';
+  const normalizedDescription = job.description.trim() || job.jdSynthesis?.roleSummary || '';
+  const normalizedSlug = job.slug.trim() || `${slugifyJobTitle(normalizedTitle) || 'job'}-${job.id.slice(-6)}`;
+  const normalizedManager = job.manager.trim() || 'Hiring Team';
+
+  return {
+    id: job.id,
+    slug: normalizedSlug,
+    title: normalizedTitle,
+    team: normalizedTeam,
+    openedAt: job.openedAt,
+    status,
+    statusClass: getJobStatusClass(status),
+    applied: job.applied,
+    reviewed: job.reviewed,
+    interviewed: job.interviewed,
+    manager: normalizedManager,
+    description: normalizedDescription,
+    jdSynthesis: job.jdSynthesis,
+    offerTemplate: buildDefaultOfferTemplate(normalizedTitle, normalizedTeam),
+  };
+};
 
 interface UnifiedFilterProps {
   options: FilterOption[];
@@ -699,62 +781,6 @@ function resolvePathFromScreen(screen: string): string {
 const SCREEN_EXIT_TRANSITION_MS = 250;
 const SCREEN_NAVIGATION_FALLBACK_MS = 700;
 
-function AnimatedNumber({ value, prefix = "", suffix = "", delay = 0, padZero = false }: { value: number, prefix?: string, suffix?: string, delay?: number, padZero?: boolean }) {
-  const [count, setCount] = useState(0);
-  const countRef = useRef(0);
-
-  useEffect(() => {
-    let startTimestamp: number;
-    const duration = 1400; // ms
-    const initialCount = countRef.current;
-
-    if (initialCount === value) return;
-
-    let timeoutId: NodeJS.Timeout;
-    let animationFrameId: number;
-
-    const step = (timestamp: number) => {
-      if (!startTimestamp) startTimestamp = timestamp;
-      const progress = Math.min((timestamp - startTimestamp) / duration, 1);
-
-      const easeOut = progress === 1 ? 1 : 1 - Math.pow(2, -10 * progress);
-      const nextCount = Math.floor(initialCount + easeOut * (value - initialCount));
-
-      setCount(nextCount);
-      countRef.current = nextCount;
-
-      if (progress < 1) {
-        animationFrameId = window.requestAnimationFrame(step);
-      } else {
-        setCount(value);
-        countRef.current = value;
-      }
-    };
-
-    timeoutId = setTimeout(() => {
-      animationFrameId = window.requestAnimationFrame(step);
-    }, delay);
-
-    return () => {
-      clearTimeout(timeoutId);
-      if (animationFrameId) window.cancelAnimationFrame(animationFrameId);
-    };
-
-  }, [value, delay]);
-
-  const displayCount = padZero && count < 10 ? `0${count}` : count.toLocaleString('en-US');
-
-  return (
-    <span
-      className="inline-flex items-baseline animate-slide-up-fade"
-      style={{ animationDelay: `${delay}ms` }}
-    >
-      {prefix && <span className="mr-[1px]">{prefix}</span>}
-      <span className="tabular-nums inline-block" style={{ minWidth: value > 999 ? '3em' : value > 9 ? '1.2em' : '0.6em' }}>{displayCount}</span>
-      {suffix && <span className="ml-[4px]">{suffix}</span>}
-    </span>
-  );
-}
 
 function NavItem({ icon, label, active = false, onClick, badge, isSidebarOpen = true }: { icon: React.ReactNode; label: string; active?: boolean, onClick?: () => void, badge?: number, isSidebarOpen?: boolean }) {
   return (
@@ -924,17 +950,44 @@ function AssistantScreen() {
 }
 
 function PipelineScreen() {
+  const router = useRouter();
   const [confirmAction, setConfirmAction] = useState<'reject' | 'fire' | null>(null);
   const [confirmCandidate, setConfirmCandidate] = useState<{ name: string; role: string; stageLabel: string } | null>(null);
+  const [scheduleTarget, setScheduleTarget] = useState<{
+    candidateId: string;
+    jobId: string;
+    candidateName: string;
+  } | null>(null);
   const [activeFilters, setActiveFilters] = useState<string[]>([]);
+  const [pipelineSearch, setPipelineSearch] = useState('');
+  const [isSearchFocused, setIsSearchFocused] = useState(false);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const [isAutoInvite, setIsAutoInvite] = useState(false);
+  const [laneSorts, setLaneSorts] = useState<Record<string, { field: 'score' | 'intelConfidence' | 'name', direction: 'asc' | 'desc' }>>({});
+  const pipelineRaw = useQuery(api.pipeline.listStages);
+  const candidatesRaw = useQuery(api.candidates.listCandidates);
+
+  const candidateJobMap = useMemo(() => {
+    const map = new Map<string, string>();
+    if (Array.isArray(candidatesRaw)) {
+      for (const candidate of candidatesRaw as any[]) {
+        const id = typeof candidate?.id === 'string' ? candidate.id : null;
+        const jobId = typeof candidate?.jobId === 'string' ? candidate.jobId : null;
+        if (id && jobId) {
+          map.set(id, jobId);
+        }
+      }
+    }
+    return map;
+  }, [candidatesRaw]);
 
   const filterOptions: FilterOption[] = [
     { id: 'score-90', label: 'Score 90+', category: 'Performance' },
     { id: 'score-80', label: 'Score 80+', category: 'Performance' },
     { id: 'role-design', label: 'Product Designer', category: 'Role' },
     { id: 'role-ml', label: 'ML Engineer', category: 'Role' },
-    { id: 'role-pm', label: 'Product Manager', category: 'Role' },
     { id: 'role-frontend', label: 'Frontend Lead', category: 'Role' },
+    { id: 'role-backend', label: 'Backend Engineer', category: 'Role' },
   ];
 
   const handleToggleFilter = (id: string) => {
@@ -943,57 +996,36 @@ function PipelineScreen() {
     );
   };
 
-  const stages = [
-    {
-      key: 'reviewed',
-      label: 'Reviewed',
-      count: 18,
-      color: 'bg-[#e0f2fe] text-[#0369a1] border-[#bae6fd]',
-      cards: [
-        { name: 'Anya Sharma', role: 'Senior Product Designer', score: 93, eta: 'Reply pending' },
-        { name: 'Marco Lin', role: 'Staff ML Engineer', score: 89, eta: 'Schedule next round' },
-      ],
-    },
-    {
-      key: 'interview_scheduled',
-      label: 'Interview Scheduled',
-      count: 9,
-      color: 'bg-[#fffbeb] text-[#b45309] border-[#fde68a]',
-      cards: [
-        { name: 'Riya Patel', role: 'Founding PM', score: 91, eta: 'Mon 3:30 PM' },
-        { name: 'Ibrahim Noor', role: 'Frontend Lead', score: 87, eta: 'Tue 11:00 AM' },
-      ],
-    },
-    {
-      key: 'interviewed',
-      label: 'Interviewed',
-      count: 7,
-      color: 'bg-[#eef2ff] text-[#4338ca] border-[#c7d2fe]',
-      cards: [
-        { name: 'Keiko Sato', role: 'Senior Product Designer', score: 90, eta: 'Digest ready' },
-        { name: 'Tommy Reed', role: 'Staff ML Engineer', score: 84, eta: 'Founder note needed' },
-      ],
-    },
-    {
-      key: 'offer_sent',
-      label: 'Offer Sent',
-      count: 3,
-      color: 'bg-[#fff7ed] text-[#c2410c] border-[#fed7aa]',
-      cards: [
-        { name: 'Yuki Tan', role: 'Founding PM', score: 95, eta: 'Awaiting clearance' },
-        { name: 'Nora Bloom', role: 'Frontend Lead', score: 88, eta: 'Comp revision' },
-      ],
-    },
-    {
-      key: 'hired',
-      label: 'Hired',
-      count: 2,
-      color: 'bg-[#f0fdf4] text-[#15803d] border-[#bbf7d0]',
-      cards: [
-        { name: 'Jules Park', role: 'Product Designer', score: 92, eta: 'Start Apr 22' },
-      ],
-    },
-  ];
+  const stages = useMemo(
+    () =>
+      Array.isArray(pipelineRaw)
+        ? (pipelineRaw as Array<{
+            key: string;
+            label: string;
+            count: number;
+            color: string;
+            cards: Array<{ id: string; name: string; role: string; score: number; intelConfidence: number; eta: string }>;
+          }>).map(stage => {
+            const sort = laneSorts[stage.key] || { field: 'score', direction: 'desc' };
+            const sortedCards = [...stage.cards].sort((a, b) => {
+              let valA = a[sort.field];
+              let valB = b[sort.field];
+              
+              if (typeof valA === 'string' && typeof valB === 'string') {
+                return sort.direction === 'asc' ? valA.localeCompare(valB) : valB.localeCompare(valA);
+              }
+              
+              if (typeof valA === 'number' && typeof valB === 'number') {
+                return sort.direction === 'asc' ? valA - valB : valB - valA;
+              }
+              
+              return 0;
+            });
+            return { ...stage, cards: sortedCards };
+          })
+        : [],
+    [pipelineRaw, laneSorts],
+  );
 
   return (
     <div className="flex flex-col gap-4 max-w-[1120px] w-full mx-auto pb-10">
@@ -1002,29 +1034,104 @@ function PipelineScreen() {
           <div className="text-[18px] font-heading font-medium text-[#1e293b]">Hiring Stage Board</div>
           <div className="text-[13px] font-sans text-[#64748b]">Move candidates through rounds with guardrails and fast actions.</div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <div className={cn(
+            "relative flex items-center transition-all duration-300 ease-in-out",
+            isSearchFocused ? "w-[220px] md:w-[240px]" : "w-[160px] md:w-[180px]"
+          )}>
+            <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#94a3b8] pointer-events-none z-10" />
+            <Input
+              ref={searchInputRef}
+              placeholder="Search candidates..."
+              value={pipelineSearch}
+              onChange={(e) => setPipelineSearch(e.target.value)}
+              onFocus={() => setIsSearchFocused(true)}
+              onBlur={() => setIsSearchFocused(false)}
+              className={cn(
+                "pl-9 pr-8 w-full h-[36px] bg-white border-[#cbd5e1] text-[13px] rounded-xl shadow-sm font-sans transition-all duration-300",
+                "focus-visible:ring-1 focus-visible:ring-[#e18131]/30 focus-visible:border-[#e18131]/50",
+                isSearchFocused && "border-[#e18131]/50 shadow-[0_0_0_3px_rgba(225,129,49,0.08)]"
+              )}
+            />
+            {pipelineSearch && (
+              <button
+                onClick={() => {
+                  setPipelineSearch('');
+                  searchInputRef.current?.focus();
+                }}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[#94a3b8] hover:text-[#64748b] transition-colors z-10"
+              >
+                <X size={14} />
+              </button>
+            )}
+          </div>
           <UnifiedFilter 
             options={filterOptions}
             selected={activeFilters}
             onToggle={handleToggleFilter}
             onClear={() => setActiveFilters([])}
           />
-          <Button className="h-8 rounded-full bg-[#e18131] hover:bg-[#c76922] text-white text-[12px]">
-            Invite Top Candidates
-          </Button>
+          <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-[#cbd5e1] bg-[#f8fafc] transition-all duration-200">
+            <span className="text-[11px] font-medium text-[#475569] whitespace-nowrap">Auto invite top candidates</span>
+            <button
+               onClick={() => {
+                 setIsAutoInvite(!isAutoInvite);
+               }}
+               className={cn(
+                 "relative inline-flex h-[20px] w-[36px] shrink-0 cursor-pointer items-center rounded-full transition-all duration-300 outline-none shadow-inner",
+                 isAutoInvite ? "bg-[#e18131] ring-2 ring-[#e18131]/20" : "bg-[#cbd5e1]",
+               )}
+            >
+               <span
+                 className={cn(
+                   "pointer-events-none block h-[16px] w-[16px] rounded-full bg-white shadow-[0_2px_4px_rgba(0,0,0,0.1)] ring-0 transition-all duration-500 ease-in-out",
+                   isAutoInvite ? "translate-x-[18px]" : "translate-x-[2px]",
+                 )}
+               />
+            </button>
+          </div>
         </div>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-4 h-[calc(100vh-265px)] min-h-[420px]">
+        {stages.length === 0 && (
+          <Card className="rounded-[18px] border border-[#e2e8f0] shadow-[0_2px_8px_rgba(0,0,0,0.03)] overflow-hidden flex items-center justify-center xl:col-span-5">
+            <CardContent className="p-8 text-center">
+              <div className="text-[14px] font-sans text-[#475569]">Loading pipeline from persisted records...</div>
+            </CardContent>
+          </Card>
+        )}
         {stages.map((stage) => (
           <Card key={stage.key} className="rounded-[18px] border border-[#e2e8f0] shadow-[0_2px_8px_rgba(0,0,0,0.03)] overflow-hidden flex flex-col">
             <CardContent className="p-0 flex flex-col h-full">
               <div className="px-3.5 py-3 border-b border-[#eef2f7] flex items-center justify-between bg-[#fbfcfe]">
                 <span className="text-[11px] uppercase tracking-wider font-heading font-semibold text-[#64748b]">{stage.label}</span>
-                <Badge className={cn('text-[10px] shadow-none border font-sans', stage.color)}>{stage.count}</Badge>
+                <div className="flex items-center gap-2">
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <button className="text-[#94a3b8] hover:text-[#64748b] transition-colors">
+                        <ArrowUpDown size={12} />
+                      </button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="w-36 rounded-xl border-[#e2e8f0] shadow-lg">
+                      <DropdownMenuLabel className="text-[10px] font-bold uppercase tracking-wider text-[#94a3b8] px-2 py-1.5">Sort by</DropdownMenuLabel>
+                      <DropdownMenuItem className="text-[12px] cursor-pointer" onClick={() => setLaneSorts(prev => ({ ...prev, [stage.key]: { field: 'score', direction: 'desc' } }))}>Highest Score</DropdownMenuItem>
+                      <DropdownMenuItem className="text-[12px] cursor-pointer" onClick={() => setLaneSorts(prev => ({ ...prev, [stage.key]: { field: 'intelConfidence', direction: 'desc' } }))}>Highest Confidence</DropdownMenuItem>
+                      <DropdownMenuItem className="text-[12px] cursor-pointer" onClick={() => setLaneSorts(prev => ({ ...prev, [stage.key]: { field: 'name', direction: 'asc' } }))}>Alphabetical</DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                  <Badge className={cn('text-[10px] shadow-none border font-sans', stage.color)}>{stage.count}</Badge>
+                </div>
               </div>
               <div className="p-3 space-y-3 overflow-y-auto hide-scrollbar">
                 {stage.cards.filter(candidate => {
+                  // Search filter — if search is active, only show matching candidates
+                  const searchQuery = pipelineSearch.trim().toLowerCase();
+                  if (searchQuery) {
+                    const searchable = `${candidate.name} ${candidate.role}`.toLowerCase();
+                    if (!searchable.includes(searchQuery)) return false;
+                  }
+
                   if (activeFilters.length === 0) return true;
                   
                   const matchesScore90 = activeFilters.includes('score-90') && candidate.score >= 90;
@@ -1034,8 +1141,8 @@ function PipelineScreen() {
                   const matchesRole = roleFilters.length === 0 || roleFilters.some(f => {
                     if (f === 'role-design') return candidate.role.includes('Designer');
                     if (f === 'role-ml') return candidate.role.includes('ML');
-                    if (f === 'role-pm') return candidate.role.includes('PM');
                     if (f === 'role-frontend') return candidate.role.includes('Frontend');
+                    if (f === 'role-backend') return candidate.role.includes('Backend') || candidate.role.includes('Engineer');
                     return false;
                   });
 
@@ -1052,32 +1159,92 @@ function PipelineScreen() {
                       <div className="text-[13px] font-sans font-medium text-[#1e293b] truncate">{candidate.name}</div>
                       <div className="text-[12px] font-sans text-[#64748b] mt-1 truncate">{candidate.role}</div>
                       <div className="flex items-center justify-between mt-3">
-                        <Badge className="text-[10px] bg-[#f8fafc] text-[#475569] border border-[#e2e8f0] shadow-none">score {candidate.score}</Badge>
+                        <div className="flex items-center gap-1.5">
+                          <div 
+                            title={`Objective score: ${candidate.score}`}
+                            className={cn(
+                              "w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-bold border",
+                              candidate.score >= 90 ? "bg-[#f0fdf4] text-[#15803d] border-[#bbf7d0]" :
+                              candidate.score >= 80 ? "bg-[#fffbeb] text-[#b45309] border-[#fde68a]" :
+                              "bg-[#fef2f2] text-[#ef4444] border-[#fee2e2]"
+                            )}
+                          >
+                            {candidate.score}
+                          </div>
+                          <div 
+                            title={`Confidence score: ${candidate.intelConfidence}%`}
+                            className={cn(
+                              "w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-bold border",
+                              candidate.intelConfidence >= 90 ? "bg-[#f0f9ff] text-[#0369a1] border-[#bae6fd]" :
+                              candidate.intelConfidence >= 80 ? "bg-[#f5f3ff] text-[#5b21b6] border-[#ddd6fe]" :
+                              "bg-[#f8fafc] text-[#64748b] border-[#e2e8f0]"
+                            )}
+                          >
+                            {candidate.intelConfidence}
+                          </div>
+                        </div>
                         <span className="text-[11px] font-sans text-[#94a3b8]">{candidate.eta}</span>
                       </div>
                     </div>
 
                     <div className="absolute inset-0 p-3 flex flex-col justify-center gap-1.5 opacity-0 blur-[8px] scale-[0.98] transition-all duration-250 group-hover:opacity-100 group-hover:blur-none group-hover:scale-100 pointer-events-none group-hover:pointer-events-auto">
+
                       {stage.key === 'hired' ? (
                         <>
                           <Button size="sm" className="h-7 rounded-full bg-[#e18131] hover:bg-[#c76922] text-white text-[11px]">Manage Payroll</Button>
-                          <Button 
-                            size="sm" 
-                            variant="outline" 
-                            onClick={() => {
-                              setConfirmAction('fire');
-                              setConfirmCandidate({ name: candidate.name, role: candidate.role, stageLabel: stage.label });
-                            }}
-                            className="h-7 rounded-full border-red-200 text-red-600 hover:bg-red-50 hover:text-red-700 hover:border-red-300 text-[11px]"
-                          >
-                            Fire Candidate
-                          </Button>
+                          <div className="flex gap-2 w-full">
+                            <Button 
+                              size="sm" 
+                              variant="outline" 
+                              className="flex-1 h-7 rounded-full border-[#cbd5e1] text-[#334155] text-[11px] bg-white hover:bg-[#f8fafc]"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                router.push(`/candidates/${candidate.id}`);
+                              }}
+                            >
+                              See more
+                            </Button>
+                            <Button 
+                              size="sm" 
+                              variant="outline" 
+                              onClick={() => {
+                                setConfirmAction('fire');
+                                setConfirmCandidate({ name: candidate.name, role: candidate.role, stageLabel: stage.label });
+                              }}
+                              className="flex-1 h-7 rounded-full border-red-200 text-red-600 hover:bg-red-50 hover:text-red-700 hover:border-red-300 text-[11px]"
+                            >
+                              Fire
+                            </Button>
+                          </div>
                         </>
                       ) : (
                         <>
                           {(stage.key === 'reviewed' || stage.key === 'interview_scheduled' || stage.key === 'interviewed') && (
-                            <Button size="sm" className="h-7 rounded-full bg-[#e18131] hover:bg-[#c76922] text-white text-[11px]">
-                              {stage.key === 'interviewed' ? 'Schedule again' : 'Schedule'}
+                            <Button
+                              size="sm"
+                              className="h-7 rounded-full bg-[#e18131] hover:bg-[#c76922] text-white text-[11px]"
+                              onClick={(e) => {
+                                e.stopPropagation();
+
+                                if (stage.key === 'interview_scheduled') {
+                                  router.push(`/candidates/${candidate.id}`);
+                                  return;
+                                }
+
+                                const jobId = candidateJobMap.get(candidate.id) || (candidate as any)?.jobId;
+                                if (!jobId || typeof jobId !== 'string') {
+                                  router.push(`/candidates/${candidate.id}`);
+                                  return;
+                                }
+
+                                setScheduleTarget({
+                                  candidateId: candidate.id,
+                                  jobId,
+                                  candidateName: candidate.name,
+                                });
+                              }}
+                            >
+                              {stage.key === 'interviewed' ? 'Schedule again' : stage.key === 'interview_scheduled' ? 'Commence Interview' : 'Schedule'}
                             </Button>
                           )}
                           
@@ -1089,30 +1256,62 @@ function PipelineScreen() {
                             <Button size="sm" className="h-7 rounded-full bg-[#e18131] hover:bg-[#c76922] text-white text-[11px]">Send offer again</Button>
                           )}
 
-                          <Button 
-                            size="sm" 
-                            variant="outline" 
-                            onClick={() => {
-                              setConfirmAction('reject');
-                              setConfirmCandidate({ name: candidate.name, role: candidate.role, stageLabel: stage.label });
-                            }}
-                            className="h-7 rounded-full border-red-200 text-red-600 hover:bg-red-50 hover:text-red-700 hover:border-red-300 text-[11px]"
-                          >
-                            Reject Candidate
-                          </Button>
+                          <div className="flex gap-2 w-full">
+                            <Button 
+                              size="sm" 
+                              variant="outline" 
+                              className="flex-1 h-7 rounded-full border-[#cbd5e1] text-[#334155] text-[11px] bg-white hover:bg-[#f8fafc]"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                router.push(`/candidates/${candidate.id}`);
+                              }}
+                            >
+                              See more
+                            </Button>
+                            <Button 
+                              size="sm" 
+                              variant="outline" 
+                              onClick={() => {
+                                setConfirmAction('reject');
+                                setConfirmCandidate({ name: candidate.name, role: candidate.role, stageLabel: stage.label });
+                              }}
+                              className="flex-1 h-7 rounded-full border-red-200 text-red-600 hover:bg-red-50 hover:text-red-700 hover:border-red-300 text-[11px]"
+                            >
+                              Reject
+                            </Button>
+                          </div>
                         </>
                       )}
                     </div>
                   </div>
                 ))}
+                {pipelineSearch.trim() && stage.cards.filter(c => {
+                  const q = pipelineSearch.trim().toLowerCase();
+                  return `${c.name} ${c.role}`.toLowerCase().includes(q);
+                }).length === 0 && (
+                  <div className="flex flex-col items-center justify-center py-6 text-center">
+                    <Search size={18} className="text-[#cbd5e1] mb-2" />
+                    <span className="text-[11px] font-sans text-[#94a3b8]">No matches</span>
+                  </div>
+                )}
               </div>
             </CardContent>
           </Card>
         ))}
       </div>
 
+      <SchedulingDialog
+        open={!!scheduleTarget}
+        onOpenChange={(open) => {
+          if (!open) setScheduleTarget(null);
+        }}
+        candidateId={scheduleTarget?.candidateId ?? ''}
+        jobId={scheduleTarget?.jobId ?? ''}
+        candidateName={scheduleTarget?.candidateName ?? null}
+      />
+
       <Dialog open={!!confirmAction} onOpenChange={(open) => !open && setConfirmAction(null)}>
-        <DialogContent className="sm:max-w-[400px] rounded-[24px] p-6 bg-white border border-[#dbe4ef] shadow-[0_10px_40px_rgba(15,23,42,0.12)]">
+        <DialogContent className="sm:max-w-[400px] rounded-[24px] p-6 bg-white border border-[#dbe4ef] shadow-[0_10px_40px_rgba(15,23,42,0.12)] [&>button[class*='absolute']]:hidden">
           <div className="flex flex-col items-center text-center py-4">
             <div className="w-12 h-12 rounded-full bg-red-50 flex items-center justify-center text-red-500 mb-4">
               <HistoryIcon size={24} />
@@ -1338,9 +1537,9 @@ function ClientsScreen() {
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="lg:col-span-2 flex flex-col gap-6">
             <div className="grid grid-cols-3 gap-4">
-              <Card className="rounded-[16px] bg-white border border-[#e2e8f0] shadow-[0_2px_8px_rgba(0,0,0,0.04),0_1px_2px_rgba(0,0,0,0.02)]"><CardContent className="p-4"><div className="text-[12px] font-heading text-[#64748b] uppercase tracking-wide">Avg payment</div><div className="text-[24px] font-sans font-medium text-[#1e293b] mt-1">2.4 days</div><div className="text-[11px] text-[#42a872] mt-1">Excellent payer</div></CardContent></Card>
-              <Card className="rounded-[16px] bg-white border border-[#e2e8f0] shadow-[0_2px_8px_rgba(0,0,0,0.04),0_1px_2px_rgba(0,0,0,0.02)]"><CardContent className="p-4"><div className="text-[12px] font-heading text-[#64748b] uppercase tracking-wide">Total paid</div><div className="text-[24px] font-sans font-medium text-[#1e293b] mt-1">$42,800</div><div className="text-[11px] text-[#64748b] mt-1">YTD: $12,600</div></CardContent></Card>
-              <Card className="rounded-[16px] bg-white border border-[#e2e8f0] shadow-[0_2px_8px_rgba(0,0,0,0.04),0_1px_2px_rgba(0,0,0,0.02)]"><CardContent className="p-4"><div className="text-[12px] font-heading text-[#64748b] uppercase tracking-wide">Outstanding</div><div className="text-[24px] font-sans font-medium text-[#1e293b] mt-1 text-[#e94235]">$4,800</div><div className="text-[11px] text-[#e94235] mt-1 font-medium">1 overdue</div></CardContent></Card>
+              <Card className="rounded-[16px] bg-white border border-[#e2e8f0] shadow-[0_2px_8px_rgba(0,0,0,0.04),0_1px_2px_rgba(0,0,0,0.02)]"><CardContent className="p-4"><div className="text-[12px] font-heading text-[#64748b] uppercase tracking-wide">Avg payment</div><div className="text-[24px] font-sans font-medium text-[#1e293b] mt-1"><AnimatedNumber value={2.4} precision={1} suffix=" days" delay={100} /></div><div className="text-[11px] text-[#42a872] mt-1">Excellent payer</div></CardContent></Card>
+              <Card className="rounded-[16px] bg-white border border-[#e2e8f0] shadow-[0_2px_8px_rgba(0,0,0,0.04),0_1px_2px_rgba(0,0,0,0.02)]"><CardContent className="p-4"><div className="text-[12px] font-heading text-[#64748b] uppercase tracking-wide">Total paid</div><div className="text-[24px] font-sans font-medium text-[#1e293b] mt-1"><AnimatedNumber value={42800} prefix="$" delay={200} /></div><div className="text-[11px] text-[#64748b] mt-1">YTD: $12,600</div></CardContent></Card>
+              <Card className="rounded-[16px] bg-white border border-[#e2e8f0] shadow-[0_2px_8px_rgba(0,0,0,0.04),0_1px_2px_rgba(0,0,0,0.02)]"><CardContent className="p-4"><div className="text-[12px] font-heading text-[#64748b] uppercase tracking-wide">Outstanding</div><div className="text-[24px] font-sans font-medium text-[#1e293b] mt-1 text-[#e94235]"><AnimatedNumber value={4800} prefix="$" delay={300} /></div><div className="text-[11px] text-[#e94235] mt-1 font-medium">1 overdue</div></CardContent></Card>
             </div>
             
             <div className="flex flex-col">
@@ -1807,12 +2006,29 @@ export default function App() {
   const [isNavigatingScreen, setIsNavigatingScreen] = useState(false);
   const navigationTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const navigationFallbackRef = useRef<NodeJS.Timeout | null>(null);
-  const [showCommandCenter, setShowCommandCenter] = useState(false);
   const [query, setQuery] = useState('');
   const [automationQuery, setAutomationQuery] = useState<{ text: string; id: number } | null>(null);
   const [teamOpen, setTeamOpen] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [hasMounted, setHasMounted] = useState(false);
+
+  type AppNotification = {
+    id: string;
+    createdAt: string;
+    title: string;
+    subtitle: string | null;
+    candidateId: string;
+    jobId: string | null;
+  };
+
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [notificationsLoading, setNotificationsLoading] = useState(false);
+  const [notifications, setNotifications] = useState<AppNotification[]>([]);
+  const [notificationsServerNow, setNotificationsServerNow] = useState<string | null>(null);
+  const [unreadNotifications, setUnreadNotifications] = useState(0);
+  const notificationsLastSeenRef = useRef<number>(0);
+  const notificationsEtagRef = useRef<string | null>(null);
+  const notificationsSignatureRef = useRef<string>('');
 
   // Background Cursor Effect — ref-based to avoid React re-renders, localized to Sidebar
   const sidebarGradientRef = useRef<HTMLDivElement>(null);
@@ -1851,6 +2067,152 @@ export default function App() {
   }, []);
   const { user } = useUser();
   const userInitial = user?.name?.[0]?.toUpperCase() || user?.email?.[0]?.toUpperCase() || 'C';
+  const userAvatarUrl =
+    typeof user?.picture === 'string' && user.picture.trim().length > 0 ? user.picture.trim() : null;
+  const onboardedOrganizationName =
+    typeof user?.organizationName === 'string' && user.organizationName.trim().length > 0
+      ? user.organizationName.trim()
+      : 'No onboarded organization';
+  const onboardedOrganizationInitials = onboardedOrganizationName
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((segment) => segment[0]?.toUpperCase() ?? '')
+    .join('') || 'NA';
+
+  const notificationStorageKey = user?.sub ? `headhunt.notifications.lastSeen:${user.sub}` : null;
+
+  const recomputeUnreadNotifications = useCallback(
+    (items: AppNotification[]) => {
+      const lastSeenMs = notificationsLastSeenRef.current;
+      const unread = items.filter((item) => {
+        const createdMs = new Date(item.createdAt).getTime();
+        return Number.isFinite(createdMs) && createdMs > lastSeenMs;
+      }).length;
+
+      setUnreadNotifications(unread);
+    },
+    [],
+  );
+
+  const fetchNotifications = useCallback(async (options?: { quiet?: boolean }) => {
+    if (!notificationStorageKey) {
+      return;
+    }
+
+    const quiet = options?.quiet ?? false;
+
+    if (!quiet) {
+      setNotificationsLoading(true);
+    }
+    try {
+      const headers: HeadersInit = {};
+      if (notificationsEtagRef.current) {
+        headers['If-None-Match'] = notificationsEtagRef.current;
+      }
+
+      const response = await fetch('/api/notifications', { cache: 'no-store', headers });
+      if (response.status === 304) {
+        return;
+      }
+
+      if (!response.ok) {
+        if (!quiet) {
+          setNotifications([]);
+          setNotificationsServerNow(null);
+          setUnreadNotifications(0);
+          notificationsSignatureRef.current = '';
+        }
+        return;
+      }
+
+      const etag = response.headers.get('etag');
+      if (etag) {
+        notificationsEtagRef.current = etag;
+      }
+
+      const payload = await response.json();
+      const items = Array.isArray(payload?.notifications) ? (payload.notifications as AppNotification[]) : [];
+      const serverNow = typeof payload?.serverNow === 'string' ? payload.serverNow : null;
+
+      const signature = items.map((item) => item.id).join('|');
+
+      if (signature !== notificationsSignatureRef.current) {
+        notificationsSignatureRef.current = signature;
+        setNotifications(items);
+        setNotificationsServerNow(serverNow);
+      }
+
+      recomputeUnreadNotifications(items);
+    } catch {
+      // Non-blocking: notifications are best-effort.
+    } finally {
+      if (!quiet) {
+        setNotificationsLoading(false);
+      }
+    }
+  }, [notificationStorageKey, recomputeUnreadNotifications]);
+
+  const markAllNotificationsRead = useCallback(() => {
+    if (!notificationStorageKey) {
+      return;
+    }
+
+    const nowMs = notificationsServerNow ? new Date(notificationsServerNow).getTime() : Date.now();
+    if (!Number.isFinite(nowMs)) {
+      return;
+    }
+
+    notificationsLastSeenRef.current = nowMs;
+    try {
+      window.localStorage.setItem(notificationStorageKey, String(nowMs));
+    } catch {
+      // ignore
+    }
+
+    recomputeUnreadNotifications(notifications);
+  }, [notificationStorageKey, notifications, notificationsServerNow, recomputeUnreadNotifications]);
+
+  useEffect(() => {
+    if (!notificationStorageKey) {
+      return;
+    }
+
+    notificationsEtagRef.current = null;
+    notificationsSignatureRef.current = '';
+
+    try {
+      const stored = window.localStorage.getItem(notificationStorageKey);
+      const storedMs = stored ? Number(stored) : 0;
+      notificationsLastSeenRef.current = Number.isFinite(storedMs) ? storedMs : 0;
+    } catch {
+      notificationsLastSeenRef.current = 0;
+    }
+
+    void fetchNotifications({ quiet: true });
+
+    const refreshIfVisible = () => {
+      if (document.visibilityState === 'visible') {
+        void fetchNotifications({ quiet: true });
+      }
+    };
+
+    window.addEventListener('focus', refreshIfVisible);
+    document.addEventListener('visibilitychange', refreshIfVisible);
+
+    return () => {
+      window.removeEventListener('focus', refreshIfVisible);
+      document.removeEventListener('visibilitychange', refreshIfVisible);
+    };
+  }, [notificationStorageKey, fetchNotifications]);
+
+  useEffect(() => {
+    if (!notificationsOpen) {
+      return;
+    }
+
+    void fetchNotifications({ quiet: false });
+  }, [notificationsOpen, fetchNotifications]);
 
   useEffect(() => {
     const uniqueRoutes = new Set<string>([...Object.values(SCREEN_TO_ROUTE), '/workflows']);
@@ -2089,7 +2451,6 @@ export default function App() {
   const activeTaskAgentVisual = HEADIE_AGENT_VISUALS[activeTaskAgentKey];
 
   const handleCommand = (cmdText: string) => {
-    setShowCommandCenter(false);
     
     setActiveTask({
       query: cmdText,
@@ -2129,11 +2490,6 @@ export default function App() {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // ⌥K
-      if (e.key === 'k' && e.altKey) {
-        e.preventDefault();
-        setShowCommandCenter(open => !open);
-      }
       // ⌥N: New job brief
       if (e.key === 'n' && e.altKey) {
         e.preventDefault();
@@ -2151,7 +2507,7 @@ export default function App() {
       }
       
       if (e.key === 'Escape') {
-        setShowCommandCenter(false);
+        // Handled by individual dialogs
       }
     };
     document.addEventListener('keydown', handleKeyDown);
@@ -2308,18 +2664,16 @@ export default function App() {
         <div className={cn("relative mb-5 shrink-0 flex justify-center", isSidebarOpen ? "w-full px-1" : "w-11 mx-auto px-0")}>
           <DropdownMenu open={teamOpen} onOpenChange={setTeamOpen}>
             <DropdownMenuTrigger asChild>
-              <div title={!isSidebarOpen ? "Talent Org" : undefined} className={cn("flex items-center rounded-[12px] bg-white shadow-[0_2px_8px_rgba(0,0,0,0.05),0_1px_2px_rgba(0,0,0,0.02)] border border-[#e2e8f0] cursor-pointer hover:shadow-[0_4px_12px_rgba(0,0,0,0.08)] hover:border-[#cbd5e1] overflow-hidden", isSidebarOpen ? "gap-3 px-3 py-2.5 min-h-[54px] w-[220px]" : "justify-center w-11 h-11 p-0")}>
+              <div title={!isSidebarOpen ? onboardedOrganizationName : undefined} className={cn("flex items-center rounded-[12px] bg-white shadow-[0_2px_8px_rgba(0,0,0,0.05),0_1px_2px_rgba(0,0,0,0.02)] border border-[#e2e8f0] cursor-pointer hover:shadow-[0_4px_12px_rgba(0,0,0,0.08)] hover:border-[#cbd5e1] overflow-hidden", isSidebarOpen ? "gap-3 px-3 py-2.5 min-h-[54px] w-[220px]" : "justify-center w-11 h-11 p-0")}>
                 <div className={cn("rounded-[10px] bg-gradient-to-b from-[#f9a865] to-[#e18131] flex items-center justify-center text-white relative shrink-0", isSidebarOpen ? "w-10 h-10 shadow-[inset_0_1px_rgba(255,255,255,0.4),0_2px_4px_rgba(225,129,49,0.3)]" : "w-[36px] h-[36px]")}>
-                  <div className="w-5 h-5 border-2 border-white rounded-full flex items-center justify-center">
-                    <div className="w-[2px] h-2.5 bg-white rounded-full -mt-1" />
-                  </div>
+                  <span className="text-[10px] font-bold font-sans tracking-wide">{onboardedOrganizationInitials}</span>
                 </div>
                 
                 {isSidebarOpen && (
                   <>
                     <div className="min-w-0 flex flex-1 flex-col justify-center whitespace-nowrap leading-tight">
-                      <span className="text-[11px] font-sans font-medium text-[#94a3b8] mb-0.5 tracking-wide leading-[1.25] truncate">Acme Inc</span>
-                      <span className="text-[14px] font-sans font-semibold text-[#334155] leading-[1.2] truncate">Talent Org</span>
+                      <span className="text-[11px] font-sans font-medium text-[#94a3b8] mb-0.5 tracking-wide leading-[1.25] truncate">Organization</span>
+                      <span className="text-[14px] font-sans font-semibold text-[#334155] leading-[1.2] truncate">{onboardedOrganizationName}</span>
                     </div>
                     <div className="text-[#a0afbb] shrink-0">
                       <ChevronsUpDown size={14} />
@@ -2331,8 +2685,8 @@ export default function App() {
             <DropdownMenuContent className="w-[220px] mt-1 bg-white border-[#d6dce1] rounded-[14px] shadow-[0_10px_30px_rgba(0,0,0,0.08)] font-sans" align="center">
               <DropdownMenuLabel className="px-3 py-1.5 text-[10px] font-medium text-[#a0afbb] uppercase tracking-wider font-sans">Organizations</DropdownMenuLabel>
               <DropdownMenuItem className="px-2 py-2 flex items-center gap-3 cursor-pointer mx-1 rounded-lg bg-[#f0f2f5] focus:bg-[#f0f2f5]">
-                <div className="w-7 h-7 rounded-md bg-[#e18131] text-white flex items-center justify-center text-[10px] font-medium shadow-sm">PT</div>
-                <div className="flex-1 text-[13px] font-sans font-medium text-[#0f172a]">Project Team</div>
+                <div className="w-7 h-7 rounded-md bg-[#e18131] text-white flex items-center justify-center text-[10px] font-medium shadow-sm">{onboardedOrganizationInitials}</div>
+                <div className="flex-1 text-[13px] font-sans font-medium text-[#0f172a] truncate">{onboardedOrganizationName}</div>
               </DropdownMenuItem>
               <DropdownMenuItem className="px-2 py-2 flex items-center gap-3 cursor-pointer mx-1 rounded-lg focus:bg-[#f8f9fa]">
                 <div className="w-7 h-7 rounded-md bg-[#f8fafc] border border-[#d6dce1] text-[#64748b] flex items-center justify-center text-[10px] font-medium shadow-sm"><Plus size={14}/></div>
@@ -2405,10 +2759,82 @@ export default function App() {
               <span className="text-[14px] font-sans text-[#94a3b8]">Overview</span>
             </div>
             <div className="flex items-center gap-3">
-              {activeScreen !== 'dashboard' && <CommandMenuWrapper />}
-              <Button variant="outline" size="icon" className="w-8 h-8 rounded-full border-[#e2e8f0] text-[#64748b] hover:bg-[#f8fafc] hover:text-[#334155]">
-                <Bell size={16} />
-              </Button>
+              <CommandMenuWrapper />
+              <Popover open={notificationsOpen} onOpenChange={setNotificationsOpen}>
+                <PopoverTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    className="relative w-8 h-8 rounded-full border-[#e2e8f0] text-[#64748b] hover:bg-[#f8fafc] hover:text-[#334155]"
+                    aria-label="Notifications"
+                  >
+                    <Bell size={16} />
+                    {unreadNotifications > 0 ? (
+                      <span className="absolute -top-1 -right-1 min-w-[16px] h-[16px] px-1 rounded-full bg-[#e94235] text-white text-[10px] font-sans font-semibold flex items-center justify-center shadow-sm">
+                        {Math.min(unreadNotifications, 99)}
+                      </span>
+                    ) : null}
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent
+                  align="end"
+                  className="w-[360px] p-0 rounded-[18px] overflow-hidden border-[#dbe4ef] shadow-[0_20px_50px_rgba(15,23,42,0.12)] bg-white"
+                >
+                  <div className="p-4 border-b border-[#f1f5f9] bg-[#fbfcfe] flex items-center justify-between">
+                    <div>
+                      <div className="text-[11px] font-heading uppercase tracking-wider text-[#94a3b8]">Notifications</div>
+                      <div className="text-[14px] font-sans font-semibold text-[#1e293b]">Recruiting updates</div>
+                    </div>
+                    <button
+                      type="button"
+                      className="text-[11px] font-sans text-[#64748b] hover:text-[#334155]"
+                      onClick={() => markAllNotificationsRead()}
+                    >
+                      Mark all read
+                    </button>
+                  </div>
+
+                  <div className="max-h-[340px] overflow-y-auto">
+                    {notificationsLoading ? (
+                      <div className="p-4 text-[12px] text-[#64748b]">Loading...</div>
+                    ) : notifications.length === 0 ? (
+                      <div className="p-4 text-[12px] text-[#64748b]">No notifications yet.</div>
+                    ) : (
+                      notifications.slice(0, 20).map((item) => {
+                        const createdLabel = (() => {
+                          const created = new Date(item.createdAt);
+                          return Number.isFinite(created.getTime())
+                            ? created.toLocaleString(undefined, { hour: 'numeric', minute: '2-digit' })
+                            : '';
+                        })();
+
+                        return (
+                          <button
+                            key={item.id}
+                            type="button"
+                            className="w-full text-left px-4 py-3 border-b border-[#f1f5f9] last:border-0 hover:bg-[#f8fafc] transition-colors"
+                            onClick={() => {
+                              markAllNotificationsRead();
+                              setNotificationsOpen(false);
+                              setActiveScreen('candidates');
+                            }}
+                          >
+                            <div className="flex items-start justify-between gap-4">
+                              <div className="min-w-0">
+                                <div className="text-[13px] font-sans font-medium text-[#334155] truncate">{item.title}</div>
+                                {item.subtitle ? (
+                                  <div className="text-[11px] font-sans text-[#94a3b8] truncate">{item.subtitle}</div>
+                                ) : null}
+                              </div>
+                              <div className="text-[10px] font-mono text-[#94a3b8] shrink-0">{createdLabel}</div>
+                            </div>
+                          </button>
+                        );
+                      })
+                    )}
+                  </div>
+                </PopoverContent>
+              </Popover>
               <Button 
                 variant="outline" 
                 size="icon" 
@@ -2420,7 +2846,15 @@ export default function App() {
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-[#3a3a4a] to-[#2a2a36] flex items-center justify-center text-white text-[11px] font-medium font-sans shadow-sm cursor-pointer ml-2 hover:opacity-80 transition-opacity">
-                    {userInitial}
+                    {userAvatarUrl ? (
+                      <img
+                        src={userAvatarUrl}
+                        alt={user?.name ?? 'User avatar'}
+                        className="w-full h-full rounded-full object-cover"
+                      />
+                    ) : (
+                      userInitial
+                    )}
                   </div>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" className="w-[120px] p-1.5 rounded-xl border-[#d6dce1] shadow-[0_4px_16px_rgba(0,0,0,0.06)] font-sans">
@@ -2557,7 +2991,7 @@ export default function App() {
                       />
                       <div className="flex items-center gap-2.5 shrink-0 hidden sm:flex">
                         <div 
-                          onClick={() => setShowCommandCenter(true)}
+                          onClick={() => document.dispatchEvent(new CustomEvent('open-command-menu'))}
                           className="bg-[#f8fafc] text-[#94a3b8] border border-[#e2e8f0] px-3 py-1.5 rounded-[10px] text-[13px] font-sans font-medium shadow-sm flex items-center justify-center min-w-[36px] cursor-pointer hover:bg-[#f1f5f9] transition-colors"
                           title="Open Command Center"
                         >
@@ -2595,25 +3029,17 @@ export default function App() {
                   <div className="w-full h-full flex flex-col min-h-0">
                     <Card className="rounded-[24px] border border-[#dbe4ef] bg-white/95 shadow-[0_10px_30px_rgba(15,23,42,0.06)] h-full flex flex-col">
                       <div className="px-5 py-3 border-b border-[#e2e8f0] bg-[linear-gradient(120deg,#f8fafc_0%,#fff7ed_42%,#f8fafc_100%)] rounded-t-[24px]">
-                        <div className="flex items-center justify-between gap-3 flex-wrap">
+                        <div className="flex items-center justify-between gap-3">
                           <div>
                             <div className="text-[12px] text-[#94a3b8] uppercase tracking-wider font-heading">Needs your approval</div>
-                            <div className="text-[15px] font-medium text-[#334155] mt-0.5">Guardian-gated actions queued for founder decision</div>
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <Badge className="text-[10px] font-sans uppercase tracking-wider bg-[#fef2f2] text-[#e94235] border border-[#fecaca] shadow-none">
-                              {pendingApprovals.length} pending
-                            </Badge>
-                            {pendingApprovals.length > 0 ? (
-                              <Badge className="text-[10px] font-sans uppercase tracking-wider bg-[#fffbeb] text-[#b45309] border border-[#fde68a] shadow-none">
-                                next expiry {hasMounted ? nextApprovalExpiryLabel : '--'}
-                              </Badge>
-                            ) : null}
+                            <div className="text-[14px] font-medium text-[#334155] mt-0.5">
+                              {pendingApprovals.length} guardian-gated action{pendingApprovals.length !== 1 ? 's' : ''} queued
+                            </div>
                           </div>
                         </div>
                       </div>
 
-                      <CardContent className="p-4 md:p-5 flex-1 overflow-y-auto">
+                      <CardContent className="p-2 md:p-3 flex-1 overflow-y-auto">
                         {pendingApprovalsRaw === undefined ? (
                           <div className="flex flex-col gap-3">
                             {Array.from({ length: 2 }).map((_, idx) => (
@@ -2639,59 +3065,54 @@ export default function App() {
                           </Card>
                         ) : (
                           <div className="flex flex-col h-full gap-4">
-                            <div className="flex flex-wrap justify-center gap-6 pb-2 items-center px-2">
-
-                              {/* Approvals Horizontal List */}
-                              {pendingApprovals.map((approval) => {
+                            <div className="flex flex-col overflow-y-auto max-h-[260px] -mx-1 px-1 scrollbar-thin">
+                              {pendingApprovals.map((approval, idx) => {
                                 const candidate = parseApprovalCandidate(approval.payloadJson);
-                                const isSelected = selectedApproval?._id === approval._id;
                                 const agentKey = resolveApprovalAgentKey(approval, candidate);
                                 const agentSeed = findHeadieSeed(agentKey);
-                                const agentVisual = HEADIE_AGENT_VISUALS[agentKey];
-                                
+
                                 // Safe urgency check for hydration
-                                const urgency = hasMounted 
+                                const urgency = hasMounted
                                   ? resolveApprovalUrgency(approval.expiresAtMs)
                                   : { label: 'Pending', className: 'bg-[#ecfeff] text-[#0e7490] border border-[#a5f3fc] shadow-none text-[10px] uppercase' };
+
+                                const displayName = candidate.candidateName ?? candidate.clientName ?? 'Unknown candidate';
+                                const displayJob = candidate.jobTitle ?? candidate.invoiceNumber ?? toActionLabel(candidate.actionType ?? approval.actionType);
 
                                 return (
                                   <button
                                     key={approval._id}
                                     type="button"
                                     onClick={() => setSelectedApprovalId(approval._id)}
-                                    aria-label={`Review ${toActionLabel(candidate.actionType ?? approval.actionType)} from ${agentSeed.name}`}
-                                    className="group relative flex flex-col items-center cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#e18131]/50 rounded-xl min-w-[70px]"
+                                    aria-label={`Review ${displayName} — ${displayJob}`}
+                                    className={cn(
+                                      "group flex items-center gap-3 w-full text-left px-3 py-2.5 rounded-xl transition-all duration-150 cursor-pointer",
+                                      "hover:bg-[#f8fafc] active:scale-[0.995]",
+                                      idx < pendingApprovals.length - 1 && "border-b border-[#f1f5f9]",
+                                    )}
                                   >
-                                    <div className={cn(
-                                      'relative w-12 h-12 flex items-center justify-center transition-transform duration-200',
-                                      isSelected ? 'scale-110' : 'opacity-65 hover:opacity-100 hover:scale-105',
-                                    )}>
-                                      {isSelected ? (
-                                        <span className="absolute inset-1 rounded-full bg-[radial-gradient(circle,rgba(225,129,49,0.35)_0%,rgba(225,129,49,0)_72%)] blur-[5px]" />
-                                      ) : null}
+                                    {/* Agent avatar — small */}
+                                    <div className="w-8 h-8 rounded-full bg-[#f8fafc] border border-[#e2e8f0] flex items-center justify-center shrink-0">
                                       <img
-                                        src={agentVisual.coloredSrc}
+                                        src={HEADIE_AGENT_VISUALS[agentKey].coloredSrc}
                                         alt={agentSeed.name}
-                                        className={getHeadieAvatarClass(
-                                          agentKey,
-                                          cn('relative z-10 transition-all', isSelected ? 'w-10 h-10' : 'w-9 h-9'),
-                                        )}
+                                        className={getHeadieAvatarClass(agentKey, 'w-5 h-5')}
                                       />
                                     </div>
 
-                                    <Badge className={cn(
-                                      'mt-1 text-[9px] px-1.5 py-0 uppercase tracking-wide shadow-none border',
-                                      urgency.className,
-                                      !isSelected && 'opacity-75 group-hover:opacity-100',
-                                    )}>
+                                    {/* Name + Job */}
+                                    <div className="flex-1 min-w-0">
+                                      <div className="text-[13px] font-sans font-medium text-[#1e293b] truncate">{displayName}</div>
+                                      <div className="text-[11px] font-sans text-[#94a3b8] truncate">{displayJob}</div>
+                                    </div>
+
+                                    {/* Urgency badge */}
+                                    <Badge className={cn('shrink-0 text-[9px] px-1.5 py-0 uppercase tracking-wide shadow-none border', urgency.className)}>
                                       {urgency.label}
                                     </Badge>
 
-                                    {isSelected && (
-                                      <div className="absolute -bottom-3 left-1/2 -translate-x-1/2 flex flex-col items-center text-[#94a3b8]">
-                                        <div className="h-2 w-px bg-[#e18131]" />
-                                      </div>
-                                    )}
+                                    {/* Chevron */}
+                                    <ArrowRight size={14} className="shrink-0 text-[#cbd5e1] group-hover:text-[#e18131] transition-colors" />
                                   </button>
                                 );
                               })}
@@ -2797,18 +3218,19 @@ export default function App() {
                   <div className="w-full h-full flex flex-col min-h-0">
                     <Card className="rounded-[24px] border border-[#dbe4ef] bg-white/95 shadow-[0_10px_30px_rgba(15,23,42,0.06)] h-full flex flex-col">
                       <div className="px-5 py-3 border-b border-[#e2e8f0] bg-[linear-gradient(125deg,#f8fafc_0%,#fff7ed_55%,#f8fafc_100%)] shrink-0 rounded-t-[24px]">
-                        <div className="flex items-start justify-between gap-3">
+                        <div className="flex items-center justify-between gap-3">
                           <div>
                             <div className="text-[12px] text-[#94a3b8] uppercase tracking-wider font-heading">Agents active</div>
                             <div className="text-[14px] font-medium text-[#334155] mt-0.5">{activeAgentCount} live operators coordinating hiring loops</div>
                           </div>
-                          <Button
-                            variant="link"
+                          <button
+                            type="button"
                             onClick={() => setActiveScreen('agents')}
-                            className="text-[13px] font-sans font-medium text-[#64748b] hover:text-[#e18131] h-auto p-0 transition-colors"
+                            aria-label="View agent logs"
+                            className="w-7 h-7 rounded-full flex items-center justify-center text-[#94a3b8] hover:text-[#e18131] hover:bg-[#fff7ed] transition-all duration-200 shrink-0"
                           >
-                            View logs
-                          </Button>
+                            <ArrowRight size={16} strokeWidth={2} />
+                          </button>
                         </div>
                       </div>
 
@@ -2917,7 +3339,7 @@ export default function App() {
 
             {activeScreen === 'candidates' && (
               <React.Suspense fallback={<div className="w-full h-full min-h-[240px]" />}>
-                <CandidatesScreen />
+                <CandidatesScreen onToast={showToast} />
               </React.Suspense>
             )}
 
@@ -3002,80 +3424,44 @@ function JobsScreen() {
     { id: 'status-draft', label: 'Draft', category: 'Status' },
   ];
 
+  const [jobs, setJobs] = useState<JobRecord[]>([]);
+  const [isJobsLoading, setIsJobsLoading] = useState(true);
+  const [jobsLoadError, setJobsLoadError] = useState<string | null>(null);
+  const [isCreatingJob, setIsCreatingJob] = useState(false);
+
+  const loadJobs = useCallback(async () => {
+    setIsJobsLoading(true);
+    setJobsLoadError(null);
+
+    try {
+      const response = await fetch('/api/jobs', {
+        method: 'GET',
+        credentials: 'include',
+      });
+      const payload = (await response.json()) as JobsApiResponse;
+
+      if (!response.ok || !Array.isArray(payload.jobs)) {
+        throw new Error(payload.message ?? 'Failed to load jobs.');
+      }
+
+      setJobs(payload.jobs.map(toJobRecord));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to load jobs.';
+      setJobsLoadError(message);
+    } finally {
+      setIsJobsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadJobs();
+  }, [loadJobs]);
+
   const handleToggleFilter = (id: string) => {
     setActiveFilters(prev => 
       prev.includes(id) ? prev.filter(f => f !== id) : [...prev, id]
     );
   };
-
-  const initialJobs: JobRecord[] = [
-    {
-      id: 'job_spd_001',
-      slug: 'senior-product-designer',
-      title: 'Senior Product Designer',
-      team: 'Design',
-      openedAt: 'Opened Mar 29',
-      status: 'active',
-      statusClass: 'bg-[#ecfdf5] text-[#15803d] border-[#bbf7d0]',
-      applied: 42,
-      reviewed: 24,
-      interviewed: 8,
-      manager: 'Radhika (Founder)',
-      description: 'Design and ship end-to-end product experiences while partnering with engineering and leadership.',
-      jdSynthesis: null,
-      offerTemplate: buildDefaultOfferTemplate('Senior Product Designer', 'Design'),
-    },
-    {
-      id: 'job_mle_002',
-      slug: 'staff-ml-engineer',
-      title: 'Staff ML Engineer',
-      team: 'Platform',
-      openedAt: 'Opened Mar 25',
-      status: 'active',
-      statusClass: 'bg-[#ecfdf5] text-[#15803d] border-[#bbf7d0]',
-      applied: 31,
-      reviewed: 17,
-      interviewed: 4,
-      manager: 'Chaitanya (Founder)',
-      description: 'Lead ML platform architecture and ship production-quality models across customer-facing systems.',
-      jdSynthesis: null,
-      offerTemplate: buildDefaultOfferTemplate('Staff ML Engineer', 'Platform'),
-    },
-    {
-      id: 'job_fpm_003',
-      slug: 'founding-product-manager',
-      title: 'Founding Product Manager',
-      team: 'Product',
-      openedAt: 'Opened Mar 18',
-      status: 'paused',
-      statusClass: 'bg-[#fffbeb] text-[#b45309] border-[#fde68a]',
-      applied: 19,
-      reviewed: 8,
-      interviewed: 3,
-      manager: 'Anya (Hiring Lead)',
-      description: 'Own roadmap definition, customer discovery, and cross-functional execution for key company bets.',
-      jdSynthesis: null,
-      offerTemplate: buildDefaultOfferTemplate('Founding Product Manager', 'Product'),
-    },
-    {
-      id: 'job_fe_004',
-      slug: 'frontend-lead',
-      title: 'Frontend Lead',
-      team: 'Engineering',
-      openedAt: 'Opened Apr 02',
-      status: 'draft',
-      statusClass: 'bg-[#f8fafc] text-[#475569] border-[#e2e8f0]',
-      applied: 0,
-      reviewed: 0,
-      interviewed: 0,
-      manager: 'Nora (Eng Lead)',
-      description: 'Define frontend architecture and mentor engineers while owning UI quality and delivery velocity.',
-      jdSynthesis: null,
-      offerTemplate: buildDefaultOfferTemplate('Frontend Lead', 'Engineering'),
-    },
-  ];
-
-  const [jobs, setJobs] = useState(initialJobs);
 
   const jobMatch = pathname.match(/^\/jobs\/([^/]+)$/);
   const currentJobSlug = jobMatch?.[1] ?? null;
@@ -3212,36 +3598,7 @@ function JobsScreen() {
     setDraftForm((prev) => ({ ...prev, [field]: value }));
   };
 
-  const handleCreateJob = () => {
-    if (!jobTitle.trim()) return;
-
-    const baseSlug = slugifyJobTitle(jobTitle);
-    const existingSlugs = new Set(jobs.map((job) => job.slug));
-    let slug = baseSlug;
-    let suffix = 2;
-    while (!slug || existingSlugs.has(slug)) {
-      slug = `${baseSlug || 'job'}-${suffix}`;
-      suffix += 1;
-    }
-
-    const newJob: JobRecord = {
-      id: `job_new_${Date.now()}`,
-      slug,
-      title: jobTitle.trim(),
-      team: jobDept.trim() || 'Engineering',
-      openedAt: 'Opened just now',
-      status: 'draft',
-      statusClass: 'bg-[#f8fafc] text-[#475569] border-[#e2e8f0]',
-      applied: 0,
-      reviewed: 0,
-      interviewed: 0,
-      manager: 'You',
-      description: jobDescription.trim(),
-      jdSynthesis,
-      offerTemplate: buildDefaultOfferTemplate(jobTitle.trim(), jobDept.trim() || 'Engineering'),
-    };
-
-    setJobs((prev) => [newJob, ...prev]);
+  const resetNewJobModalState = () => {
     setShowNewJobModal(false);
     setJobTitle('');
     setJobDept('');
@@ -3250,10 +3607,81 @@ function JobsScreen() {
     setJdSynthesis(null);
     setUploadedFileName(null);
     setIsStep3PanelOpen(false);
+    setIsStep3ModalOpen(false);
     setShowDraftBuilder(false);
     setDraftForm(INITIAL_DRAFT_JD_FORM);
-    router.push(`/jobs/${slug}`);
   };
+
+  const handleCreateJob = async () => {
+    if (!jobTitle.trim() || isCreatingJob) {
+      return;
+    }
+
+    setIsCreatingJob(true);
+
+    try {
+      const response = await fetch('/api/jobs', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          title: jobTitle.trim(),
+          team: jobDept.trim() || 'General',
+          description: jobDescription.trim(),
+          status: 'draft',
+          jdSynthesis: jdSynthesis ?? undefined,
+        }),
+      });
+
+      let payload: CreateJobApiResponse | null = null;
+      try {
+        payload = (await response.json()) as CreateJobApiResponse;
+      } catch {
+        payload = null;
+      }
+
+      if (!response.ok || !payload?.job) {
+        throw new Error(payload?.message ?? 'Failed to create job.');
+      }
+
+      const createdJob = toJobRecord(payload.job);
+      setJobs((prev) => [createdJob, ...prev.filter((job) => job.id !== createdJob.id)]);
+      setJobsLoadError(null);
+      resetNewJobModalState();
+      router.push(`/jobs/${createdJob.slug}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to create job.';
+      setJobsLoadError(message);
+    } finally {
+      setIsCreatingJob(false);
+    }
+  };
+
+  if (jobMatch && isJobsLoading) {
+    return (
+      <div className="flex flex-col items-center justify-center py-14 text-center">
+        <div className="text-[16px] font-heading text-[#1e293b]">Loading job details...</div>
+        <div className="text-[13px] text-[#64748b] mt-2">Fetching the latest persisted job state.</div>
+      </div>
+    );
+  }
+
+  if (jobMatch && !currentJob && !isJobsLoading) {
+    return (
+      <div className="flex flex-col items-center justify-center py-14 text-center">
+        <div className="text-[16px] font-heading text-[#1e293b]">Job not found</div>
+        <div className="text-[13px] text-[#64748b] mt-2">{jobsLoadError ?? 'This role was not found in persisted data.'}</div>
+        <Button
+          variant="outline"
+          className="mt-4 h-8 rounded-full border-[#cbd5e1] text-[12px]"
+          onClick={() => router.push('/jobs')}
+        >
+          Back to Jobs
+        </Button>
+      </div>
+    );
+  }
 
   if (jobMatch && currentJob) {
     const parsedJdTemplate = currentJob.jdSynthesis ?? buildDefaultJdTemplate(currentJob);
@@ -3294,9 +3722,9 @@ function JobsScreen() {
         </div>
 
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Applied</div><div className="text-[26px] font-sans text-[#0f172a] mt-1">{currentJob.applied}</div></CardContent></Card>
-          <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Reviewed</div><div className="text-[26px] font-sans text-[#0f172a] mt-1">{currentJob.reviewed}</div></CardContent></Card>
-          <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Interviewed</div><div className="text-[26px] font-sans text-[#0f172a] mt-1">{currentJob.interviewed}</div></CardContent></Card>
+          <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Applied</div><div className="text-[26px] font-sans text-[#0f172a] mt-1"><AnimatedNumber value={currentJob.applied} delay={100} /></div></CardContent></Card>
+          <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Reviewed</div><div className="text-[26px] font-sans text-[#0f172a] mt-1"><AnimatedNumber value={currentJob.reviewed} delay={200} /></div></CardContent></Card>
+          <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Interviewed</div><div className="text-[26px] font-sans text-[#0f172a] mt-1"><AnimatedNumber value={currentJob.interviewed} delay={300} /></div></CardContent></Card>
           <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Status</div><Badge className={cn('mt-2 text-[10px] uppercase border shadow-none', currentJob.statusClass)}>{currentJob.status}</Badge></CardContent></Card>
         </div>
 
@@ -3684,6 +4112,37 @@ function JobsScreen() {
     );
   }
 
+  const filteredJobs = jobs.filter((job) => {
+    if (activeFilters.length === 0) return true;
+
+    const teamFilters = activeFilters.filter((f) => f.startsWith('team-'));
+    const matchesTeam =
+      teamFilters.length === 0 ||
+      teamFilters.some((f) => {
+        if (f === 'team-design') return job.team === 'Design';
+        if (f === 'team-platform') return job.team === 'Platform';
+        if (f === 'team-product') return job.team === 'Product';
+        if (f === 'team-eng') return job.team === 'Engineering';
+        return false;
+      });
+
+    const statusFilters = activeFilters.filter((f) => f.startsWith('status-'));
+    const matchesStatus =
+      statusFilters.length === 0 ||
+      statusFilters.some((f) => {
+        if (f === 'status-active') return job.status === 'active';
+        if (f === 'status-paused') return job.status === 'paused';
+        if (f === 'status-draft') return job.status === 'draft';
+        return false;
+      });
+
+    return matchesTeam && matchesStatus;
+  });
+
+  const activeRolesCount = jobs.filter((job) => job.status === 'active').length;
+  const candidatesInProcessCount = jobs.reduce((total, job) => total + job.applied, 0);
+  const interviewsInProcessCount = jobs.reduce((total, job) => total + job.interviewed, 0);
+
   return (
     <div className="flex flex-col gap-5 max-w-[1120px] w-full mx-auto pb-10">
       <div className="flex flex-col xl:flex-row xl:items-center xl:justify-between gap-3">
@@ -3700,11 +4159,11 @@ function JobsScreen() {
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-        <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Active Roles</div><div className="text-[34px] text-[#0f172a] font-sans mt-2">8</div><div className="text-[11px] text-[#16a34a]">2 opened this week</div></CardContent></Card>
-        <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Candidates in Process</div><div className="text-[34px] text-[#0f172a] font-sans mt-2">137</div><div className="text-[11px] text-[#64748b]">Across all open jobs</div></CardContent></Card>
-        <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Interviews This Week</div><div className="text-[34px] text-[#0f172a] font-sans mt-2">26</div><div className="text-[11px] text-[#d97706]">7 awaiting confirmation</div></CardContent></Card>
-        <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Offers Awaiting Clearance</div><div className="text-[34px] text-[#0f172a] font-sans mt-2">3</div><div className="text-[11px] text-[#d97706]">1 expires in 21m</div></CardContent></Card>
-        <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Time to First Interview</div><div className="text-[34px] text-[#0f172a] font-sans mt-2">3.4d</div><div className="text-[11px] text-[#16a34a]">-0.6d vs last sprint</div></CardContent></Card>
+        <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Active Roles</div><div className="text-[34px] text-[#0f172a] font-sans mt-2"><AnimatedNumber value={activeRolesCount} delay={100} /></div><div className="text-[11px] text-[#64748b]">Persisted in DB</div></CardContent></Card>
+        <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Candidates in Process</div><div className="text-[34px] text-[#0f172a] font-sans mt-2"><AnimatedNumber value={candidatesInProcessCount} delay={200} /></div><div className="text-[11px] text-[#64748b]">Across persisted jobs</div></CardContent></Card>
+        <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Interviewed Candidates</div><div className="text-[34px] text-[#0f172a] font-sans mt-2"><AnimatedNumber value={interviewsInProcessCount} delay={300} /></div><div className="text-[11px] text-[#64748b]">Based on application stages</div></CardContent></Card>
+        <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Offers Awaiting Clearance</div><div className="text-[34px] text-[#0f172a] font-sans mt-2"><AnimatedNumber value={3} delay={400} /></div><div className="text-[11px] text-[#d97706]">1 expires in 21m</div></CardContent></Card>
+        <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Time to First Interview</div><div className="text-[34px] text-[#0f172a] font-sans mt-2"><AnimatedNumber value={3.4} precision={1} suffix="d" delay={500} /></div><div className="text-[11px] text-[#16a34a]">-0.6d vs last sprint</div></CardContent></Card>
       </div>
 
       <Card className="rounded-[18px] border border-[#e2e8f0] shadow-sm overflow-hidden">
@@ -3721,45 +4180,43 @@ function JobsScreen() {
           />
         </div>
         <div className="p-3 space-y-2">
-          {jobs.filter(job => {
-            if (activeFilters.length === 0) return true;
-
-            const teamFilters = activeFilters.filter(f => f.startsWith('team-'));
-            const matchesTeam = teamFilters.length === 0 || teamFilters.some(f => {
-              if (f === 'team-design') return job.team === 'Design';
-              if (f === 'team-platform') return job.team === 'Platform';
-              if (f === 'team-product') return job.team === 'Product';
-              if (f === 'team-eng') return job.team === 'Engineering';
-              return false;
-            });
-
-            const statusFilters = activeFilters.filter(f => f.startsWith('status-'));
-            const matchesStatus = statusFilters.length === 0 || statusFilters.some(f => {
-              if (f === 'status-active') return job.status === 'active';
-              if (f === 'status-paused') return job.status === 'paused';
-              if (f === 'status-draft') return job.status === 'draft';
-              return false;
-            });
-
-            return matchesTeam && matchesStatus;
-          }).map((job) => (
-            <div key={job.id} className="rounded-[12px] border border-[#e2e8f0] px-4 py-3 hover:bg-[#fdfdfd] transition-colors">
-              <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
-                <div>
-                  <div className="text-[20px] font-heading text-[#1e293b]">{job.title}</div>
-                  <div className="text-[13px] font-sans text-[#64748b]">{job.team} · {job.openedAt}</div>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Badge className={cn('text-[10px] uppercase border shadow-none', job.statusClass)}>{job.status}</Badge>
-                  <Button size="sm" variant="outline" className="h-7 rounded-full border-[#cbd5e1] text-[11px]" onClick={() => router.push(`/candidates?job=${job.slug}`)}>Candidates</Button>
-                  <Button size="sm" variant="outline" className="h-7 rounded-full border-[#cbd5e1] text-[11px]" onClick={() => router.push(`/jobs/${job.slug}`)}>Open</Button>
-                </div>
-              </div>
-              <div className="text-[12px] font-sans text-[#64748b] mt-2">
-                {job.applied} applied · {job.reviewed} reviewed · {job.interviewed} interviewed
-              </div>
+          {isJobsLoading && (
+            <div className="rounded-[12px] border border-[#e2e8f0] px-4 py-8 text-center text-[13px] text-[#64748b]">
+              Loading persisted jobs...
             </div>
-          ))}
+          )}
+
+          {jobsLoadError && (
+            <div className="rounded-[12px] border border-[#fecaca] bg-[#fef2f2] px-4 py-3 text-[13px] text-[#991b1b]">
+              {jobsLoadError}
+            </div>
+          )}
+
+          {!isJobsLoading && !jobsLoadError && filteredJobs.length === 0 && (
+            <div className="rounded-[12px] border border-[#e2e8f0] px-4 py-8 text-center text-[13px] text-[#64748b]">
+              No persisted jobs yet. Create a role to store it in the database.
+            </div>
+          )}
+
+          {!isJobsLoading &&
+            filteredJobs.map((job) => (
+              <div key={job.id} className="rounded-[12px] border border-[#e2e8f0] px-4 py-3 hover:bg-[#fdfdfd] transition-colors">
+                <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+                  <div>
+                    <div className="text-[20px] font-heading text-[#1e293b]">{job.title}</div>
+                    <div className="text-[13px] font-sans text-[#64748b]">{job.team} · {job.openedAt}</div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Badge className={cn('text-[10px] uppercase border shadow-none', job.statusClass)}>{job.status}</Badge>
+                    <Button size="sm" variant="outline" className="h-7 rounded-full border-[#cbd5e1] text-[11px]" onClick={() => router.push(`/candidates?job=${job.slug}`)}>Candidates</Button>
+                    <Button size="sm" variant="outline" className="h-7 rounded-full border-[#cbd5e1] text-[11px]" onClick={() => router.push(`/jobs/${job.slug}`)}>Open</Button>
+                  </div>
+                </div>
+                <div className="text-[12px] font-sans text-[#64748b] mt-2">
+                  {job.applied} applied · {job.reviewed} reviewed · {job.interviewed} interviewed
+                </div>
+              </div>
+            ))}
         </div>
       </Card>
 
@@ -4053,10 +4510,10 @@ function JobsScreen() {
               <div className="relative z-10 flex pt-5">
                 <Button
                   onClick={handleCreateJob}
-                  disabled={!jobTitle.trim() || isParsing}
+                  disabled={!jobTitle.trim() || isParsing || isCreatingJob}
                   className="h-12 w-full rounded-full bg-[#e18131] hover:bg-[#c76922] text-white px-7 shadow-[0_8px_20px_rgba(225,129,49,0.35)] text-[14px] font-medium transition-all"
                 >
-                  Create Job
+                  {isCreatingJob ? 'Creating job...' : 'Create Job'}
                 </Button>
               </div>
             </div>
@@ -4067,13 +4524,28 @@ function JobsScreen() {
   );
 }
 
-function CandidatesScreen() {
+type CandidatesScreenProps = {
+  onToast?: (msg: string) => void;
+};
+
+function CandidatesScreen({ onToast }: CandidatesScreenProps) {
   const router = useRouter();
   const searchParams = useSearchParams();
   const pathname = usePathname();
+  const { user } = useUser();
   const initialJobQuery = (searchParams.get('job') || '').trim().toLowerCase();
   const [activeFilters, setActiveFilters] = useState<string[]>([]);
   const [searchQuery, setSearchQuery] = useState(initialJobQuery || '');
+  const [currentPage, setCurrentPage] = useState(1);
+  const [candidateSort, setCandidateSort] = useState<{ field: 'name' | 'score' | 'intelConfidence', direction: 'asc' | 'desc' }>({ field: 'score', direction: 'desc' });
+  const [scheduleTarget, setScheduleTarget] = useState<{
+    candidateId: string;
+    jobId: string;
+    candidateName: string;
+  } | null>(null);
+  const [isTranscriptDigestRunning, setIsTranscriptDigestRunning] = useState(false);
+  const ITEMS_PER_PAGE = 10;
+  const candidatesRaw = useQuery(api.candidates.listCandidates);
 
   useEffect(() => {
     setSearchQuery(initialJobQuery || '');
@@ -4082,8 +4554,8 @@ function CandidatesScreen() {
   const filterOptions: FilterOption[] = [
     { id: 'role-design', label: 'Product Designer', category: 'Role' },
     { id: 'role-ml', label: 'ML Engineer', category: 'Role' },
-    { id: 'role-pm', label: 'Product Manager', category: 'Role' },
     { id: 'role-frontend', label: 'Frontend Lead', category: 'Role' },
+    { id: 'role-backend', label: 'Backend Engineer', category: 'Role' },
     { id: 'stage-reviewed', label: 'Reviewed', category: 'Stage' },
     { id: 'stage-scheduled', label: 'Interview Scheduled', category: 'Stage' },
     { id: 'stage-interviewed', label: 'Interviewed', category: 'Stage' },
@@ -4100,63 +4572,166 @@ function CandidatesScreen() {
     setActiveFilters(prev => 
       prev.includes(id) ? prev.filter(f => f !== id) : [...prev, id]
     );
+    setCurrentPage(1);
   };
 
-  const candidates = [
-    {
-      id: 'cand_001',
-      name: 'Anya Sharma',
-      role: 'Senior Product Designer',
-      jobId: 'senior-product-designer',
-      stage: 'reviewed',
-      score: 93,
-      confidence: [1, 1, 1, 1, 1, 1, 0, 1, 1, 1],
-      source: 'gmail_thread_001',
-      owner: 'Triage',
-      latency: '42m',
-    },
-    {
-      id: 'cand_002',
-      name: 'Marco Lin',
-      role: 'Staff ML Engineer',
-      jobId: 'staff-ml-engineer',
-      stage: 'interview_scheduled',
-      score: 89,
-      confidence: [1, 1, 1, 0, 1, 1, 1, 1, 0, 1],
-      source: 'slack_dm_402',
-      owner: 'Liaison',
-      latency: '18m',
-    },
-    {
-      id: 'cand_003',
-      name: 'Riya Patel',
-      role: 'Founding Product Manager',
-      jobId: 'founding-product-manager',
-      stage: 'interviewed',
-      score: 91,
-      confidence: [1, 1, 1, 1, 1, 1, 1, 1, 1, 0],
-      source: 'referral_email_22',
-      owner: 'Analyst',
-      latency: '1h 5m',
-    },
-    {
-      id: 'cand_004',
-      name: 'Ibrahim Noor',
-      role: 'Frontend Lead',
-      jobId: 'frontend-lead',
-      stage: 'offer_sent',
-      score: 87,
-      confidence: [1, 1, 0, 1, 1, 0, 1, 1, 0, 1],
-      source: 'gmail_thread_889',
-      owner: 'Dispatch',
-      latency: '14m',
-    },
-  ];
+  // Reset page when search changes
+  const handleSearchChange = (value: string) => {
+    setSearchQuery(value);
+    setCurrentPage(1);
+  };
+
+  const candidates = useMemo(
+    () =>
+      Array.isArray(candidatesRaw)
+        ? (candidatesRaw as Array<{
+            id: string;
+            organizationId?: string | null;
+            name: string;
+            role: string;
+            jobId: string;
+            stage: string;
+            objectiveScore?: number;
+            confidenceScore?: number;
+            score: number;
+            confidence: number[];
+            source: string;
+            owner: string;
+            latency: string;
+            intelConfidence?: number | null;
+            summary?: string | null;
+            intelBullets?: string[];
+            analysisStatus?: 'pending' | 'paused' | 'ready' | 'failed' | 'unknown';
+            roundsCompleted?: number;
+            nextInterviewAt?: string | Date | null;
+            nextInterviewMeetLink?: string | null;
+          }>)
+        : [],
+    [candidatesRaw],
+  );
+
+  const candidatesLoading = candidatesRaw === undefined && candidates.length === 0;
 
   const candidateMatch = pathname.match(/^\/candidates\/([^/]+)$/);
   const selectedCandidate = candidates.find((candidate) => candidate.id === candidateMatch?.[1]);
 
+  if (candidateMatch && candidatesLoading) {
+    return (
+      <div className="flex flex-col items-center justify-center py-14 text-center">
+        <div className="text-[16px] font-heading text-[#1e293b]">Loading candidate...</div>
+        <div className="text-[13px] text-[#64748b] mt-2">Fetching profile from persisted data.</div>
+      </div>
+    );
+  }
+
   if (selectedCandidate) {
+    const candidateOrgId = typeof (selectedCandidate as any)?.organizationId === 'string' ? (selectedCandidate as any).organizationId : null;
+    const userOrgId = typeof user?.organizationId === 'string' ? user.organizationId : null;
+    const isUserOrgCandidate = Boolean(candidateOrgId && userOrgId && candidateOrgId === userOrgId);
+
+    const nextInterviewAt = (() => {
+      const raw = (selectedCandidate as any)?.nextInterviewAt;
+      if (!raw) return null;
+      const parsed = raw instanceof Date ? raw : new Date(raw);
+      return Number.isFinite(parsed.getTime()) ? parsed : null;
+    })();
+
+    const nextInterviewMeetLink =
+      typeof (selectedCandidate as any)?.nextInterviewMeetLink === 'string'
+        ? ((selectedCandidate as any).nextInterviewMeetLink as string)
+        : null;
+
+    const confidencePercent =
+      typeof selectedCandidate.confidenceScore === 'number'
+        ? selectedCandidate.confidenceScore
+        : typeof selectedCandidate.intelConfidence === 'number'
+          ? selectedCandidate.intelConfidence
+          : Math.round(
+              (selectedCandidate.confidence.filter((segment) => segment === 1).length /
+                Math.max(selectedCandidate.confidence.length, 1)) *
+                100,
+            );
+
+    const roundsCompleted = typeof selectedCandidate.roundsCompleted === 'number' ? selectedCandidate.roundsCompleted : 0;
+
+    const objectiveScore =
+      typeof selectedCandidate.objectiveScore === 'number' ? selectedCandidate.objectiveScore : selectedCandidate.score;
+
+    const analysisLabel =
+      selectedCandidate.analysisStatus === 'pending'
+        ? 'Analyst running'
+        : selectedCandidate.analysisStatus === 'paused'
+          ? 'Awaiting re-auth'
+          : selectedCandidate.analysisStatus === 'failed'
+            ? 'Analyst failed'
+            : selectedCandidate.analysisStatus === 'ready'
+              ? 'Analysis ready'
+              : 'Analysis unknown';
+
+    const isIntelPending = selectedCandidate.analysisStatus === 'pending' || selectedCandidate.analysisStatus === 'paused';
+
+    const handleRunTranscriptDigest = async () => {
+      if (isTranscriptDigestRunning) return;
+
+      setIsTranscriptDigestRunning(true);
+      onToast?.('Transcript digest running | Summarizing Drive PDF + posting to Slack');
+
+      const slackChannel = 'new-channel';
+
+      const parseResponsePayload = async (response: Response) => {
+        const raw = await response.text().catch(() => '');
+        if (!raw.trim()) return { payload: null as any, rawText: '' };
+        try {
+          return { payload: JSON.parse(raw) as any, rawText: raw };
+        } catch {
+          return { payload: null as any, rawText: raw };
+        }
+      };
+
+      const summarizeRawErrorText = (rawText: string) => {
+        const trimmed = rawText.trim();
+        if (!trimmed) return '';
+        const oneLine = trimmed.replace(/\s+/g, ' ');
+        return oneLine.length > 220 ? `${oneLine.slice(0, 220)}…` : oneLine;
+      };
+
+      try {
+        const response = await fetch('/api/interview-transcripts/digest', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+          },
+          credentials: 'include',
+          body: JSON.stringify({
+            candidateId: selectedCandidate.id,
+            slackChannel,
+            driveFolderName: 'Headhunt Transcripts',
+            driveQuery: selectedCandidate.name,
+          }),
+        });
+
+        const { payload, rawText } = await parseResponsePayload(response);
+
+        if (!response.ok || payload?.status !== 'success') {
+          const message =
+            (payload && typeof payload.message === 'string' && payload.message.trim())
+              ? payload.message
+              : rawText
+                ? `Request failed (${response.status}) | ${summarizeRawErrorText(rawText)}`
+                : `Request failed (${response.status}).`;
+          onToast?.(`Transcript digest failed | ${message}`);
+          return;
+        }
+
+        onToast?.(`Transcript digest sent | Posted to #${slackChannel}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown error.';
+        onToast?.(`Transcript digest failed | ${message}`);
+      } finally {
+        setIsTranscriptDigestRunning(false);
+      }
+    };
+
     return (
       <div className="flex flex-col gap-5 max-w-[1020px] w-full mx-auto pb-10">
         <div className="flex items-center justify-between border-b border-[#e2e8f0] pb-4">
@@ -4176,24 +4751,40 @@ function CandidatesScreen() {
         </div>
 
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Score</div><div className="text-[30px] font-sans mt-1 text-[#0f172a]">{selectedCandidate.score}</div></CardContent></Card>
-          <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Confidence</div><div className="text-[30px] font-sans mt-1 text-[#0f172a]">86%</div></CardContent></Card>
-          <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Rounds Completed</div><div className="text-[30px] font-sans mt-1 text-[#0f172a]">2</div></CardContent></Card>
-          <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Response Latency</div><div className="text-[30px] font-sans mt-1 text-[#0f172a]">{selectedCandidate.latency}</div></CardContent></Card>
+          <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Objective Score</div><div className="text-[30px] font-sans mt-1 text-[#0f172a]"><AnimatedNumber value={objectiveScore} delay={100} /></div></CardContent></Card>
+          <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Confidence Score</div><div className="text-[30px] font-sans mt-1 text-[#0f172a]"><AnimatedNumber value={confidencePercent} suffix="%" delay={200} /></div></CardContent></Card>
+          <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Rounds Completed</div><div className="text-[30px] font-sans mt-1 text-[#0f172a]"><AnimatedNumber value={roundsCompleted} delay={300} /></div></CardContent></Card>
+          <Card className="rounded-[14px] border border-[#e2e8f0] shadow-sm"><CardContent className="p-4"><div className="text-[10px] uppercase tracking-wider text-[#94a3b8] font-heading">Response Latency</div><div className="text-[30px] font-sans mt-1 text-[#0f172a]"><AnimatedNumber value={parseFloat(selectedCandidate.latency) || 0} precision={selectedCandidate.latency?.includes('.') ? 1 : 0} delay={400} /></div></CardContent></Card>
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
           <Card className="rounded-[16px] border border-[#e2e8f0] shadow-sm lg:col-span-2">
             <CardContent className="p-5">
-              <div className="text-[14px] font-sans font-semibold text-[#1e293b] mb-3">Intel Summary</div>
-              <div className="text-[13px] font-sans text-[#475569] leading-relaxed mb-3">
-                Strong systems thinker with high-end collaboration signal. Candidate has consistent product intuition and clear ownership examples from prior roles.
+              <div className="flex items-center justify-between mb-3">
+                <div className="text-[14px] font-sans font-semibold text-[#1e293b]">Intel Summary</div>
+                <Badge className="text-[10px] bg-[#f8fafc] border border-[#e2e8f0] text-[#64748b] shadow-none">
+                  {analysisLabel}
+                </Badge>
               </div>
-              <div className="space-y-2 text-[12px] font-sans text-[#64748b]">
-                <div className="rounded-[10px] border border-[#e2e8f0] p-2.5">Qualification checks: 8/9 passed</div>
-                <div className="rounded-[10px] border border-[#e2e8f0] p-2.5">Work history signal: strong trajectory in zero-to-one teams</div>
-                <div className="rounded-[10px] border border-[#e2e8f0] p-2.5">Founder private note: align on ownership scope before final round</div>
+
+              <div className={cn('space-y-2 text-[12px] font-sans text-[#64748b] transition-all', isIntelPending ? 'blur-[2px] opacity-70 pointer-events-none select-none' : '')}>
+                {(Array.isArray(selectedCandidate.intelBullets) && selectedCandidate.intelBullets.length > 0
+                  ? selectedCandidate.intelBullets
+                  : (selectedCandidate.summary ? selectedCandidate.summary.split(/\r?\n/).map(line => line.replace(/^[-*•\s]+/, '').trim()).filter(Boolean).slice(0, 3) : [])
+                ).slice(0, 3).map((bullet, idx) => (
+                  <div key={idx} className="rounded-[10px] border border-[#e2e8f0] p-2.5">{bullet}</div>
+                ))}
+
+                {!selectedCandidate.summary && (!selectedCandidate.intelBullets || selectedCandidate.intelBullets.length === 0) ? (
+                  <div className="rounded-[10px] border border-[#e2e8f0] p-2.5">No intel summary persisted yet.</div>
+                ) : null}
               </div>
+
+              {isIntelPending ? (
+                <div className="mt-3 text-[12px] text-[#94a3b8]">
+                  Analyst is still running. This card will sharpen automatically.
+                </div>
+              ) : null}
             </CardContent>
           </Card>
 
@@ -4201,9 +4792,26 @@ function CandidatesScreen() {
             <CardContent className="p-5">
               <div className="text-[14px] font-sans font-semibold text-[#1e293b] mb-3">Action Rail</div>
               <div className="flex flex-col gap-2">
-                <Button className="h-8 rounded-full bg-[#e18131] hover:bg-[#c76922] text-white text-[12px]">Schedule</Button>
-                <Button variant="outline" className="h-8 rounded-full border-[#cbd5e1] text-[12px]">Propose Slots</Button>
-                <Button variant="outline" className="h-8 rounded-full border-[#cbd5e1] text-[12px]">Run Transcript Digest</Button>
+                <Button
+                  className="h-8 rounded-full bg-[#e18131] hover:bg-[#c76922] text-white text-[12px]"
+                  onClick={() =>
+                    setScheduleTarget({
+                      candidateId: selectedCandidate.id,
+                      jobId: selectedCandidate.jobId,
+                      candidateName: selectedCandidate.name,
+                    })
+                  }
+                >
+                  Schedule
+                </Button>
+                <Button
+                  variant="outline"
+                  className="h-8 rounded-full border-[#cbd5e1] text-[12px]"
+                  onClick={() => void handleRunTranscriptDigest()}
+                  disabled={isTranscriptDigestRunning}
+                >
+                  {isTranscriptDigestRunning ? 'Running Transcript Digest…' : 'Run Transcript Digest'}
+                </Button>
                 <Button variant="outline" className="h-8 rounded-full border-[#cbd5e1] text-[12px]">Draft Offer</Button>
                 <Button variant="outline" className="h-8 rounded-full border-[#fecaca] text-[#b91c1c] text-[12px] hover:bg-[#fef2f2]">Reject</Button>
               </div>
@@ -4215,18 +4823,49 @@ function CandidatesScreen() {
           <CardContent className="p-5">
             <div className="text-[14px] font-sans font-semibold text-[#1e293b] mb-3">Interview Timeline</div>
             <div className="space-y-3">
-              {[
-                'Apr 02 · Intro call completed · summary attached',
-                'Apr 03 · Portfolio review completed · pass',
-                'Apr 06 · Founder round scheduled · awaiting candidate confirmation',
-              ].map((event) => (
-                <div key={event} className="rounded-[10px] border border-[#e2e8f0] px-3 py-2 text-[12px] font-sans text-[#64748b]">
-                  {event}
+              {isUserOrgCandidate && nextInterviewAt ? (
+                <div className="rounded-[10px] border border-[#e2e8f0] px-3 py-2 text-[12px] font-sans text-[#64748b]">
+                  <span className="text-[#334155]">
+                    {nextInterviewAt.toLocaleDateString('en-US', { month: 'short', day: '2-digit' })}
+                  </span>
+                  <span> · Interview scheduled</span>
+                  {nextInterviewMeetLink ? (
+                    <>
+                      <span> · </span>
+                      <a
+                        href={nextInterviewMeetLink}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-[#0f172a] underline"
+                      >
+                        Join link
+                      </a>
+                    </>
+                  ) : (
+                    <>
+                      <span> · </span>
+                      <span className="text-[#94a3b8]">Join link unavailable</span>
+                    </>
+                  )}
                 </div>
-              ))}
+              ) : (
+                <div className="rounded-[10px] border border-[#e2e8f0] px-3 py-2 text-[12px] font-sans text-[#64748b]">
+                  No interview scheduled yet.
+                </div>
+              )}
             </div>
           </CardContent>
         </Card>
+
+        <SchedulingDialog
+          open={!!scheduleTarget}
+          onOpenChange={(open) => {
+            if (!open) setScheduleTarget(null);
+          }}
+          candidateId={scheduleTarget?.candidateId ?? ''}
+          jobId={scheduleTarget?.jobId ?? ''}
+          candidateName={scheduleTarget?.candidateName ?? null}
+        />
       </div>
     );
   }
@@ -4257,13 +4896,26 @@ function CandidatesScreen() {
             onToggle={handleToggleFilter}
             onClear={() => setActiveFilters([])}
           />
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="outline" className="h-9 rounded-full border-[#cbd5e1] text-[13px] text-[#475569] px-4 flex items-center gap-2">
+                <ArrowUpDown size={14} /> Sort by
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-48 rounded-xl border-[#e2e8f0] shadow-lg">
+              <DropdownMenuLabel className="text-[10px] font-bold uppercase tracking-wider text-[#94a3b8] px-2 py-1.5">Primary Metric</DropdownMenuLabel>
+              <DropdownMenuItem className="text-[13px] cursor-pointer" onClick={() => setCandidateSort({ field: 'score', direction: 'desc' })}>Highest Score</DropdownMenuItem>
+              <DropdownMenuItem className="text-[13px] cursor-pointer" onClick={() => setCandidateSort({ field: 'intelConfidence', direction: 'desc' })}>Highest Confidence</DropdownMenuItem>
+              <DropdownMenuItem className="text-[13px] cursor-pointer" onClick={() => setCandidateSort({ field: 'name', direction: 'asc' })}>Alphabetical (Name)</DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
           <div className="relative">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-[#94a3b8]" size={16} />
             <Input 
               placeholder="Search by name, role, source, or job match..." 
               className="pl-9 h-9 w-[260px] border-[#cbd5e1] rounded-full" 
               value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
+              onChange={(e) => handleSearchChange(e.target.value)}
             />
           </div>
         </div>
@@ -4273,150 +4925,598 @@ function CandidatesScreen() {
         <div className="grid grid-cols-12 gap-3 px-5 py-3 bg-[#f8fafc] border-b border-[#e2e8f0] text-[11px] uppercase tracking-wider font-heading text-[#64748b]">
           <div className="col-span-3">Candidate</div>
           <div className="col-span-2">Role</div>
-          <div className="col-span-2">Confidence</div>
-          <div className="col-span-1 text-left">Score</div>
+          <div className="col-span-2">Confidence Score</div>
+          <div className="col-span-1 text-left">Objective Score</div>
           <div className="col-span-2">Stage</div>
           <div className="col-span-2 text-left">Owner</div>
         </div>
-        {candidates.filter(candidate => {
-          if (initialJobQuery && candidate.jobId.toLowerCase() !== initialJobQuery) {
-            return false;
-          }
+        {(() => {
+          const filteredCandidates = candidates.filter(candidate => {
+            if (initialJobQuery && candidate.jobId.toLowerCase() !== initialJobQuery) {
+              return false;
+            }
 
-          // Search query check
-          if (searchQuery && !candidate.name.toLowerCase().includes(searchQuery.toLowerCase()) && 
-              !candidate.role.toLowerCase().includes(searchQuery.toLowerCase()) && 
-              !candidate.jobId.toLowerCase().includes(searchQuery.toLowerCase()) &&
-              !candidate.source.toLowerCase().includes(searchQuery.toLowerCase())) {
-            return false;
-          }
+            // Search query check
+            if (searchQuery && !candidate.name.toLowerCase().includes(searchQuery.toLowerCase()) && 
+                !candidate.role.toLowerCase().includes(searchQuery.toLowerCase()) && 
+                !candidate.jobId.toLowerCase().includes(searchQuery.toLowerCase()) &&
+                !candidate.source.toLowerCase().includes(searchQuery.toLowerCase())) {
+              return false;
+            }
 
-          if (activeFilters.length === 0) return true;
+            if (activeFilters.length === 0) return true;
 
-          const roleFilters = activeFilters.filter(f => f.startsWith('role-'));
-          const matchesRole = roleFilters.length === 0 || roleFilters.some(f => {
-            if (f === 'role-design') return candidate.role.includes('Designer');
-            if (f === 'role-ml') return candidate.role.includes('ML');
-            if (f === 'role-pm') return candidate.role.includes('PM');
-            if (f === 'role-frontend') return candidate.role.includes('Frontend');
-            return false;
+            const roleFilters = activeFilters.filter(f => f.startsWith('role-'));
+            const matchesRole = roleFilters.length === 0 || roleFilters.some(f => {
+              if (f === 'role-design') return candidate.role.includes('Designer');
+              if (f === 'role-ml') return candidate.role.includes('ML');
+              if (f === 'role-frontend') return candidate.role.includes('Frontend');
+              if (f === 'role-backend') return candidate.role.includes('Backend') || candidate.role.includes('Engineer');
+              return false;
+            });
+
+            const stageFilters = activeFilters.filter(f => f.startsWith('stage-'));
+            const matchesStage = stageFilters.length === 0 || stageFilters.some(f => {
+              if (f === 'stage-reviewed') return candidate.stage === 'reviewed';
+              if (f === 'stage-scheduled') return candidate.stage === 'interview_scheduled';
+              if (f === 'stage-interviewed') return candidate.stage === 'interviewed';
+              if (f === 'stage-offer') return candidate.stage === 'offer_sent';
+              return false;
+            });
+
+            const scoreFilters = activeFilters.filter(f => f.startsWith('score-'));
+            const matchesScore = scoreFilters.length === 0 || scoreFilters.some(f => {
+              if (f === 'score-90') return candidate.score >= 90;
+              if (f === 'score-80') return candidate.score >= 80;
+              return false;
+            });
+
+            const ownerFilters = activeFilters.filter(f => f.startsWith('owner-'));
+            const matchesOwner = ownerFilters.length === 0 || ownerFilters.some(f => {
+              if (f === 'owner-triage') return candidate.owner === 'Triage';
+              if (f === 'owner-liaison') return candidate.owner === 'Liaison';
+              if (f === 'owner-analyst') return candidate.owner === 'Analyst';
+              if (f === 'owner-dispatch') return candidate.owner === 'Dispatch';
+              return false;
+            });
+
+            return matchesRole && matchesStage && matchesScore && matchesOwner;
           });
 
-          const stageFilters = activeFilters.filter(f => f.startsWith('stage-'));
-          const matchesStage = stageFilters.length === 0 || stageFilters.some(f => {
-            if (f === 'stage-reviewed') return candidate.stage === 'reviewed';
-            if (f === 'stage-scheduled') return candidate.stage === 'interview_scheduled';
-            if (f === 'stage-interviewed') return candidate.stage === 'interviewed';
-            if (f === 'stage-offer') return candidate.stage === 'offer_sent';
-            return false;
+          const sortedCandidates = [...filteredCandidates].sort((a, b) => {
+            let valA = (a as any)[candidateSort.field];
+            let valB = (b as any)[candidateSort.field];
+            
+            if (typeof valA === 'string' && typeof valB === 'string') {
+              return candidateSort.direction === 'asc' ? valA.localeCompare(valB) : valB.localeCompare(valA);
+            }
+            
+            const numA = typeof valA === 'number' ? valA : 0;
+            const numB = typeof valB === 'number' ? valB : 0;
+            return candidateSort.direction === 'asc' ? numA - numB : numB - numA;
           });
 
-          const scoreFilters = activeFilters.filter(f => f.startsWith('score-'));
-          const matchesScore = scoreFilters.length === 0 || scoreFilters.some(f => {
-            if (f === 'score-90') return candidate.score >= 90;
-            if (f === 'score-80') return candidate.score >= 80;
-            return false;
-          });
+          const totalFiltered = sortedCandidates.length;
+          const totalPages = Math.max(1, Math.ceil(totalFiltered / ITEMS_PER_PAGE));
+          const safePage = Math.min(currentPage, totalPages);
+          const startIndex = (safePage - 1) * ITEMS_PER_PAGE;
+          const endIndex = startIndex + ITEMS_PER_PAGE;
+          const paginatedCandidates = sortedCandidates.slice(startIndex, endIndex);
 
-          const ownerFilters = activeFilters.filter(f => f.startsWith('owner-'));
-          const matchesOwner = ownerFilters.length === 0 || ownerFilters.some(f => {
-            if (f === 'owner-triage') return candidate.owner === 'Triage';
-            if (f === 'owner-liaison') return candidate.owner === 'Liaison';
-            if (f === 'owner-analyst') return candidate.owner === 'Analyst';
-            if (f === 'owner-dispatch') return candidate.owner === 'Dispatch';
-            return false;
-          });
+          // Build visible page numbers (max 5 centered around current)
+          const buildPageNumbers = (): number[] => {
+            if (totalPages <= 7) return Array.from({ length: totalPages }, (_, i) => i + 1);
+            const pages: number[] = [];
+            const start = Math.max(2, safePage - 1);
+            const end = Math.min(totalPages - 1, safePage + 1);
+            pages.push(1);
+            if (start > 2) pages.push(-1); // ellipsis marker
+            for (let i = start; i <= end; i++) pages.push(i);
+            if (end < totalPages - 1) pages.push(-2); // ellipsis marker
+            pages.push(totalPages);
+            return pages;
+          };
 
-          return matchesRole && matchesStage && matchesScore && matchesOwner;
-        }).map(candidate => (
-          (() => {
-            const totalSegments = candidate.confidence.length;
-            const filledSegments = candidate.confidence.filter((value) => value === 1).length;
+          return (
+            <>
+              {paginatedCandidates.map(candidate => {
+                const totalSegments = candidate.confidence.length;
+                const filledSegments = candidate.confidence.filter((value) => value === 1).length;
 
-            return (
-          <div key={candidate.id} className="grid grid-cols-12 gap-3 px-5 py-4 border-b border-[#f1f5f9] items-center hover:bg-[#fdfdfd] cursor-pointer" onClick={() => router.push(`/candidates/${candidate.id}`)}>
-            <div className="col-span-3">
-              <div className="text-[13px] font-sans font-medium text-[#1e293b]">{candidate.name}</div>
-              <div className="text-[11px] font-sans text-[#94a3b8] truncate">{candidate.source}</div>
-            </div>
-            <div className="col-span-2 text-[12px] font-sans text-[#475569]">{candidate.role}</div>
-            <div className="col-span-2 flex gap-0.5">
-              {Array.from({ length: totalSegments }).map((_, i) => (
-                <div
-                  key={i}
-                  className={cn("w-1.5 h-4 rounded-sm", i < filledSegments ? "bg-[#10b981]" : "bg-[#f1f5f9]")}
-                />
-              ))}
-            </div>
-            <div className="col-span-1 text-left text-[14px] font-sans font-medium text-[#0f172a]">{candidate.score}</div>
-            <div className="col-span-2 text-[12px] font-sans text-[#64748b]"><Badge className="bg-[#f8fafc] text-[#475569] text-[10px] shadow-none border-[#e2e8f0] font-medium">{candidate.stage.replace('_', ' ')}</Badge></div>
-            <div className="col-span-2 text-left">
-              <div className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-[#f8fafc] border border-[#e2e8f0]">
-                <img src={HEADIE_AGENT_VISUALS[resolveHeadieAgentKey(candidate.owner)].coloredSrc} className="w-3.5 h-3.5 object-contain" alt="" />
-                <span className="text-[11px] font-bold text-[#64748b] tracking-wide uppercase">{candidate.owner}</span>
-              </div>
-            </div>
-          </div>
-            );
-          })()
-        ))}
+                return (
+                  <div key={candidate.id} className="grid grid-cols-12 gap-3 px-5 py-4 border-b border-[#f1f5f9] items-center hover:bg-[#fdfdfd] cursor-pointer transition-colors duration-150" onClick={() => router.push(`/candidates/${candidate.id}`)}>
+                    <div className="col-span-3">
+                      <div className="text-[13px] font-sans font-medium text-[#1e293b]">{candidate.name}</div>
+                      <div className="text-[11px] font-sans text-[#94a3b8] truncate">{candidate.source}</div>
+                    </div>
+                    <div className="col-span-2 text-[12px] font-sans text-[#475569]">{candidate.role}</div>
+                    <div className="col-span-2 flex gap-0.5">
+                      {Array.from({ length: totalSegments }).map((_, i) => (
+                        <div
+                          key={i}
+                          className={cn("w-1.5 h-4 rounded-sm", i < filledSegments ? "bg-[#10b981]" : "bg-[#f1f5f9]")}
+                        />
+                      ))}
+                    </div>
+                    <div className="col-span-1 text-left text-[14px] font-sans font-medium text-[#0f172a]">{candidate.score}</div>
+                    <div className="col-span-2 text-[12px] font-sans text-[#64748b]"><Badge className="bg-[#f8fafc] text-[#475569] text-[10px] shadow-none border-[#e2e8f0] font-medium">{candidate.stage.replace('_', ' ')}</Badge></div>
+                    <div className="col-span-2 text-left">
+                      <div className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-[#f8fafc] border border-[#e2e8f0]">
+                        <img src={HEADIE_AGENT_VISUALS[resolveHeadieAgentKey(candidate.owner)].coloredSrc} className="w-3.5 h-3.5 object-contain" alt="" />
+                        <span className="text-[11px] font-bold text-[#64748b] tracking-wide uppercase">{candidate.owner}</span>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+
+              {!candidatesLoading && totalFiltered === 0 && (
+                <div className="px-5 py-8 text-[13px] text-[#64748b]">No persisted candidates found for this organization.</div>
+              )}
+
+              {/* Pagination footer */}
+              {totalFiltered > ITEMS_PER_PAGE && (
+                <div className="flex items-center justify-between px-5 py-3 bg-[#fafbfc] border-t border-[#e2e8f0]">
+                  <div className="text-[12px] font-sans text-[#94a3b8]">
+                    Showing <span className="font-medium text-[#475569]">{startIndex + 1}</span>–<span className="font-medium text-[#475569]">{Math.min(endIndex, totalFiltered)}</span> of <span className="font-medium text-[#475569]">{totalFiltered}</span> candidates
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <button
+                      disabled={safePage <= 1}
+                      onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                      className={cn(
+                        "h-8 px-3 rounded-full text-[12px] font-sans font-medium transition-all duration-200 border",
+                        safePage <= 1
+                          ? "text-[#cbd5e1] border-transparent cursor-not-allowed"
+                          : "text-[#475569] border-[#e2e8f0] hover:bg-[#f1f5f9] hover:border-[#cbd5e1] active:scale-95"
+                      )}
+                    >
+                      Prev
+                    </button>
+                    {buildPageNumbers().map((pageNum, idx) =>
+                      pageNum < 0 ? (
+                        <span key={`ellipsis-${idx}`} className="w-8 h-8 flex items-center justify-center text-[12px] text-[#94a3b8] select-none">…</span>
+                      ) : (
+                        <button
+                          key={pageNum}
+                          onClick={() => setCurrentPage(pageNum)}
+                          className={cn(
+                            "w-8 h-8 rounded-full text-[12px] font-sans font-medium transition-all duration-200 border",
+                            pageNum === safePage
+                              ? "bg-[#1e293b] text-white border-[#1e293b] shadow-sm"
+                              : "text-[#475569] border-transparent hover:bg-[#f1f5f9] hover:border-[#e2e8f0] active:scale-95"
+                          )}
+                        >
+                          {pageNum}
+                        </button>
+                      )
+                    )}
+                    <button
+                      disabled={safePage >= totalPages}
+                      onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                      className={cn(
+                        "h-8 px-3 rounded-full text-[12px] font-sans font-medium transition-all duration-200 border",
+                        safePage >= totalPages
+                          ? "text-[#cbd5e1] border-transparent cursor-not-allowed"
+                          : "text-[#475569] border-[#e2e8f0] hover:bg-[#f1f5f9] hover:border-[#cbd5e1] active:scale-95"
+                      )}
+                    >
+                      Next
+                    </button>
+                  </div>
+                </div>
+              )}
+            </>
+          );
+        })()}
       </Card>
     </div>
   );
 }
 
+type SchedulingProvider = 'google' | 'cal';
+
+type SchedulingSlot = {
+  startISO: string;
+  endISO: string;
+  displayLabel: string;
+  dateISO?: string;
+};
+
+function SchedulingDialog(props: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  candidateId: string;
+  jobId: string;
+  candidateName?: string | null;
+}) {
+  const timezone = 'America/Los_Angeles';
+
+  const [provider, setProvider] = useState<SchedulingProvider>('google');
+  const [slotsLoading, setSlotsLoading] = useState(false);
+  const [slotsError, setSlotsError] = useState<string | null>(null);
+  const [slotsWarning, setSlotsWarning] = useState<string | null>(null);
+  const [slots, setSlots] = useState<SchedulingSlot[]>([]);
+  const [selectedStarts, setSelectedStarts] = useState<string[]>([]);
+
+  const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
+  const [sendSuccess, setSendSuccess] = useState<null | {
+    delayedRecheckScheduledFor?: string | null;
+    delayedRecheckQuery?: string | null;
+  }>(null);
+
+  const reset = useCallback(() => {
+    setProvider('google');
+    setSlotsLoading(false);
+    setSlotsError(null);
+    setSlotsWarning(null);
+    setSlots([]);
+    setSelectedStarts([]);
+    setSending(false);
+    setSendError(null);
+    setSendSuccess(null);
+  }, []);
+
+  useEffect(() => {
+    if (!props.open) {
+      reset();
+    }
+  }, [props.open, reset]);
+
+  const fetchSlots = useCallback(async () => {
+    if (!props.candidateId || !props.jobId) {
+      setSlotsError('Missing candidateId/jobId for scheduling.');
+      return;
+    }
+
+    setSlotsLoading(true);
+    setSlotsError(null);
+    setSlotsWarning(null);
+    setSlots([]);
+    setSelectedStarts([]);
+    setSendError(null);
+    setSendSuccess(null);
+
+    try {
+      const response = await fetch('/api/scheduling/slots', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          candidateId: props.candidateId,
+          jobId: props.jobId,
+          provider,
+          timezone,
+          durationMinutes: 30,
+        }),
+      });
+
+      const payload = (await response.json().catch(() => null)) as any;
+      if (!response.ok) {
+        setSlotsError(payload?.message || 'Failed to load scheduling slots.');
+        return;
+      }
+
+      if (!payload || typeof payload !== 'object') {
+        setSlotsError('Failed to load scheduling slots.');
+        return;
+      }
+
+      if (payload.status !== 'success') {
+        setSlotsError(payload.message || 'Failed to load scheduling slots.');
+        return;
+      }
+
+      const nextSlots = Array.isArray(payload.slots) ? (payload.slots as SchedulingSlot[]) : [];
+      setSlots(nextSlots);
+      setSlotsWarning(typeof payload.warning === 'string' ? payload.warning : null);
+    } catch (error) {
+      setSlotsError(error instanceof Error ? error.message : 'Failed to load scheduling slots.');
+    } finally {
+      setSlotsLoading(false);
+    }
+  }, [props.candidateId, props.jobId, provider, timezone]);
+
+  useEffect(() => {
+    if (!props.open) return;
+    fetchSlots();
+  }, [props.open, fetchSlots]);
+
+  const toggleSlot = useCallback(
+    (startISO: string) => {
+      setSelectedStarts((prev) => {
+        if (prev.includes(startISO)) {
+          return prev.filter((value) => value !== startISO);
+        }
+
+        if (prev.length >= 3) {
+          return prev;
+        }
+
+        return [...prev, startISO];
+      });
+    },
+    [],
+  );
+
+  const sendScheduling = useCallback(async () => {
+    if (!props.candidateId || !props.jobId) {
+      setSendError('Missing candidateId/jobId for scheduling.');
+      return;
+    }
+
+    if (provider === 'google' && selectedStarts.length === 0) {
+      setSendError('Select at least 1 slot to propose.');
+      return;
+    }
+
+    setSending(true);
+    setSendError(null);
+    setSendSuccess(null);
+
+    try {
+      const response = await fetch('/api/scheduling/send', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          candidateId: props.candidateId,
+          jobId: props.jobId,
+          provider,
+          timezone,
+          sendMode: 'send',
+          ...(provider === 'google' ? { slotStartISOs: selectedStarts } : {}),
+        }),
+      });
+
+      const payload = (await response.json().catch(() => null)) as any;
+
+      if (!response.ok) {
+        setSendError(payload?.message || payload?.error || 'Failed to send scheduling email.');
+        return;
+      }
+
+      if (!payload || typeof payload !== 'object' || payload.status !== 'success') {
+        setSendError(payload?.message || 'Failed to send scheduling email.');
+        return;
+      }
+
+      setSendSuccess({
+        delayedRecheckScheduledFor: payload?.delayedRecheck?.scheduledFor ?? null,
+        delayedRecheckQuery: payload?.delayedRecheck?.query ?? null,
+      });
+
+      const scheduledFor = payload?.delayedRecheck?.scheduledFor;
+      if (typeof scheduledFor === 'string') {
+        const scheduledAtMs = Date.parse(scheduledFor);
+        if (Number.isFinite(scheduledAtMs)) {
+          const delayMs = Math.max(0, scheduledAtMs - Date.now() + 1500);
+          window.setTimeout(() => {
+            void fetch('/api/automation/tick', {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                'x-requested-with': 'XMLHttpRequest',
+              },
+              credentials: 'include',
+              body: JSON.stringify({ mode: 'scheduling', limit: 6, passes: 2 }),
+            })
+              .catch(() => null)
+              .finally(() => {
+                requestHiringRefresh();
+              });
+          }, delayMs);
+        }
+      }
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : 'Failed to send scheduling email.');
+    } finally {
+      setSending(false);
+    }
+  }, [props.candidateId, props.jobId, provider, selectedStarts, timezone]);
+
+  const canSend = provider === 'cal' ? true : selectedStarts.length > 0;
+
+  return (
+    <Dialog open={props.open} onOpenChange={props.onOpenChange}>
+      <DialogContent className="sm:max-w-[560px] rounded-[24px] p-6 bg-white border border-[#dbe4ef] shadow-[0_10px_40px_rgba(15,23,42,0.12)] [&>button[class*='absolute']]:hidden">
+        <div className="flex flex-col gap-4">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <DialogTitle className="text-[16px] font-heading font-semibold text-[#0f172a]">
+                Schedule interview
+              </DialogTitle>
+              <div className="text-[12px] font-sans text-[#64748b] mt-1">
+                {props.candidateName ? `${props.candidateName} · ` : ''}
+                {timezone} · 30 min
+              </div>
+            </div>
+            <button
+              type="button"
+              className="w-9 h-9 rounded-full border border-[#e2e8f0] flex items-center justify-center text-[#64748b] hover:bg-[#f8fafc]"
+              onClick={() => props.onOpenChange(false)}
+              aria-label="Close"
+            >
+              <X size={16} />
+            </button>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              className={cn(
+                'px-3 py-1.5 rounded-full text-[11px] uppercase tracking-wider font-heading border transition-colors',
+                provider === 'google'
+                  ? 'bg-white border-[#cbd5e1] text-[#0f172a]'
+                  : 'bg-[#f8fafc] border-[#e2e8f0] text-[#64748b]',
+              )}
+              onClick={() => setProvider('google')}
+            >
+              Google Meet
+            </button>
+            <button
+              type="button"
+              className={cn(
+                'px-3 py-1.5 rounded-full text-[11px] uppercase tracking-wider font-heading border transition-colors',
+                provider === 'cal' ? 'bg-white border-[#cbd5e1] text-[#0f172a]' : 'bg-[#f8fafc] border-[#e2e8f0] text-[#64748b]',
+              )}
+              onClick={() => setProvider('cal')}
+            >
+              Cal.com
+            </button>
+
+            <div className="ml-auto">
+              <Button
+                variant="outline"
+                className="h-8 rounded-full border-[#cbd5e1] text-[12px]"
+                onClick={fetchSlots}
+                disabled={slotsLoading || sending}
+              >
+                Refresh
+              </Button>
+            </div>
+          </div>
+
+          {provider === 'google' ? (
+            <div className="text-[12px] text-[#64748b]">Pick up to 3 times to propose.</div>
+          ) : (
+            <div className="text-[12px] text-[#64748b]">Cal.com flow will request availability (no selection required).</div>
+          )}
+
+          {slotsWarning ? (
+            <div className="rounded-[12px] border border-[#fde68a] bg-[#fffbeb] px-3 py-2 text-[12px] text-[#92400e]">
+              {slotsWarning}
+            </div>
+          ) : null}
+
+          {slotsError ? (
+            <div className="rounded-[12px] border border-[#fecaca] bg-[#fef2f2] px-3 py-2 text-[12px] text-[#b91c1c]">
+              {slotsError}
+            </div>
+          ) : null}
+
+          <div className="space-y-2 max-h-[280px] overflow-auto pr-1">
+            {slotsLoading ? (
+              Array.from({ length: 6 }).map((_, idx) => (
+                <div
+                  key={idx}
+                  className="h-10 rounded-[12px] border border-[#e2e8f0] bg-[#f8fafc] animate-pulse"
+                />
+              ))
+            ) : slots.length === 0 ? (
+              <div className="rounded-[12px] border border-[#e2e8f0] px-3 py-3 text-[12px] text-[#64748b]">
+                No slots found in the next 3 days.
+              </div>
+            ) : (
+              slots.map((slot) => {
+                const isSelected = selectedStarts.includes(slot.startISO);
+                const selectable = provider === 'google';
+
+                return (
+                  <button
+                    key={slot.startISO}
+                    type="button"
+                    disabled={!selectable}
+                    onClick={() => selectable && toggleSlot(slot.startISO)}
+                    className={cn(
+                      'w-full flex items-center justify-between rounded-[12px] border px-3 py-2.5 text-left transition-colors',
+                      selectable
+                        ? isSelected
+                          ? 'bg-[#fffaf5] border-[#f5b37a]'
+                          : 'bg-white border-[#e2e8f0] hover:bg-[#f8fafc]'
+                        : 'bg-[#f8fafc] border-[#e2e8f0] cursor-default',
+                    )}
+                  >
+                    <div className="text-[12px] font-sans text-[#0f172a]">{slot.displayLabel}</div>
+                    {selectable ? (
+                      <Badge
+                        className={cn(
+                          'text-[10px] border shadow-none',
+                          isSelected
+                            ? 'bg-[#0f172a] text-white border-[#0f172a]'
+                            : 'bg-[#f8fafc] text-[#64748b] border-[#e2e8f0]',
+                        )}
+                      >
+                        {isSelected ? 'Selected' : 'Pick'}
+                      </Badge>
+                    ) : null}
+                  </button>
+                );
+              })
+            )}
+          </div>
+
+          {sendError ? (
+            <div className="rounded-[12px] border border-[#fecaca] bg-[#fef2f2] px-3 py-2 text-[12px] text-[#b91c1c]">
+              {sendError}
+            </div>
+          ) : null}
+
+          {sendSuccess ? (
+            <div className="rounded-[12px] border border-[#bbf7d0] bg-[#f0fdf4] px-3 py-2 text-[12px] text-[#15803d]">
+              Scheduling email sent. Recheck scheduled{sendSuccess.delayedRecheckScheduledFor ? ` for ${sendSuccess.delayedRecheckScheduledFor}` : ''}.
+            </div>
+          ) : null}
+
+          <div className="flex items-center justify-end gap-2 pt-1">
+            <Button
+              variant="outline"
+              className="h-9 rounded-full border-[#cbd5e1] text-[12px]"
+              onClick={() => props.onOpenChange(false)}
+              disabled={sending}
+            >
+              Cancel
+            </Button>
+            <Button
+              className="h-9 rounded-full bg-[#e18131] hover:bg-[#c76922] text-white text-[12px]"
+              onClick={sendScheduling}
+              disabled={!canSend || sending || slotsLoading}
+            >
+              {sending ? 'Sending…' : provider === 'google' ? 'Send proposal' : 'Send request'}
+            </Button>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function ApprovalsScreen() {
   const [tab, setTab] = useState<'pending' | 'approved' | 'denied'>('pending');
-  const [selectedId, setSelectedId] = useState('appr_001');
-
-  const approvals = [
-    {
-      id: 'appr_001',
-      action: 'send_offer',
-      status: 'pending',
-      candidateName: 'Ibrahim Noor',
-      jobTitle: 'Frontend Lead',
-      comp: '$230k + 0.25%',
-      requestedAt: '9m ago',
-      expires: '21m remaining',
-      authReqId: 'authreq_7a21f8',
-    },
-    {
-      id: 'appr_002',
-      action: 'send_offer',
-      status: 'pending',
-      candidateName: 'Riya Patel',
-      jobTitle: 'Founding Product Manager',
-      comp: '$210k + 0.2%',
-      requestedAt: '23m ago',
-      expires: '12m remaining',
-      authReqId: 'authreq_70ff31',
-    },
-    {
-      id: 'appr_003',
-      action: 'reject_candidate',
-      status: 'approved',
-      candidateName: 'Noah Kline',
-      jobTitle: 'Staff ML Engineer',
-      comp: 'n/a',
-      requestedAt: '2h ago',
-      expires: 'resolved',
-      authReqId: 'authreq_182eb5',
-    },
-    {
-      id: 'appr_004',
-      action: 'send_offer',
-      status: 'denied',
-      candidateName: 'Dina Rao',
-      jobTitle: 'Senior Product Designer',
-      comp: '$198k + 0.15%',
-      requestedAt: '4h ago',
-      expires: 'resolved',
-      authReqId: 'authreq_8b2c18',
-    },
-  ];
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const approvalsRaw = useQuery(api.approvals.listApprovals);
+  const approvals = useMemo(
+    () =>
+      Array.isArray(approvalsRaw)
+        ? (approvalsRaw as Array<{
+            id: string;
+            action: string;
+            status: 'pending' | 'approved' | 'denied';
+            candidateName: string;
+            jobTitle: string;
+            comp: string;
+            requestedAt: string;
+            expires: string;
+            authReqId: string;
+          }>)
+        : [],
+    [approvalsRaw],
+  );
 
   const filtered = approvals.filter((approval) => approval.status === tab);
+
+  useEffect(() => {
+    if (filtered.length === 0) {
+      setSelectedId(null);
+      return;
+    }
+
+    if (!selectedId || !filtered.some((approval) => approval.id === selectedId)) {
+      setSelectedId(filtered[0].id);
+    }
+  }, [filtered, selectedId]);
+
   const selected = filtered.find((approval) => approval.id === selectedId) ?? filtered[0] ?? null;
 
   return (

@@ -1719,7 +1719,7 @@ AUTH0_AUDIENCE=                      # https://api.headhunt.app
 AUTH0_MCP_AUDIENCE=                  # https://mcp.headhunt.app (separate audience for MCP)
 
 # ── Auth0 Management API (for Token Vault) ────────────────────────────────────
-AUTH0_MGMT_CLIENT_ID=                # M2M client with read:user_idp_tokens scope
+AUTH0_MGMT_CLIENT_ID=                # M2M client with read:federated_connections_tokens scope
 AUTH0_MGMT_CLIENT_SECRET=
 
 # ── Auth0 FGA ─────────────────────────────────────────────────────────────────
@@ -1903,7 +1903,7 @@ Run: `npx ts-node scripts/bootstrap-fga.ts`
 1. **Create Application:** Single Page App → get Client ID and Secret
 2. **Create API:** Audience = `https://api.headhunt.app`; enable RBAC; add permissions (`read:candidates`, `write:offers`, etc.)
 3. **Enable Social Connections:** Google OAuth2 (request Gmail + Drive fallback scopes), Slack, Tumblr — all via Token Vault
-4. **Create M2M Application:** For Management API access (Token Vault token fetching). Grant `read:user_idp_tokens` scope.
+4. **Create M2M Application:** For Management API access (Token Vault token fetching). Grant `read:federated_connections_tokens` scope.
 5. **Enable CIBA:** In tenant settings → Advanced → Enable CIBA flow; configure Auth0 Guardian
 6. **Create FGA Store:** Via Auth0 Dashboard → FGA → New Store → import model from Appendix A
 7. **Create MCP Application:** Separate application with audience `https://mcp.headhunt.app`

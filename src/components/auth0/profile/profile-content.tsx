@@ -10,19 +10,43 @@ interface KeyValueMap {
   [key: string]: any;
 }
 
+type WorkspaceContext = {
+  organizationId?: string | null;
+  organizationName?: string | null;
+  role?: string | null;
+  avatarUrl?: string | null;
+};
+
+type AccountContextResponse = {
+  workspace?: WorkspaceContext;
+};
+
 export default function ProfileContent({ user }: { user: KeyValueMap }) {
   const [connectedAccounts, setConnectedAccounts] = useState<ConnectedAccount[]>([]);
+  const [workspace, setWorkspace] = useState<WorkspaceContext | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    loadConnectedAccounts();
+    loadProfileData();
   }, []);
 
-  const loadConnectedAccounts = async () => {
+  const loadProfileData = async () => {
     try {
-      const accounts = await fetchConnectedAccounts();
+      const [accounts, contextResponse] = await Promise.all([
+        fetchConnectedAccounts(),
+        fetch('/api/account/context', {
+          method: 'GET',
+          credentials: 'include',
+        }),
+      ]);
+
       console.log('Fetched Linked Accounts:', accounts);
       setConnectedAccounts(accounts);
+
+      if (contextResponse.ok) {
+        const payload = (await contextResponse.json()) as AccountContextResponse;
+        setWorkspace(payload.workspace ?? null);
+      }
     } catch (error) {
       console.error('Error fetching linked accounts:', error);
     } finally {
@@ -34,7 +58,13 @@ export default function ProfileContent({ user }: { user: KeyValueMap }) {
     <div className="grid grid-cols-2 lg:grid-cols-2 gap-6">
       {/* User Info Card */}
       <div className="lg:col-span-1">
-        <UserInfoCard user={user} />
+        <UserInfoCard
+          user={{
+            ...user,
+            picture: workspace?.avatarUrl ?? user.picture,
+          }}
+          workspace={workspace}
+        />
       </div>
 
       {/* Linked Accounts Card */}
@@ -42,7 +72,7 @@ export default function ProfileContent({ user }: { user: KeyValueMap }) {
         <ConnectedAccountsCard
           connectedAccounts={connectedAccounts}
           loading={loading}
-          onAccountDeleted={loadConnectedAccounts}
+          onAccountDeleted={loadProfileData}
         />
       </div>
     </div>

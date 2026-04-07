@@ -20,6 +20,7 @@ import {
   SLACK_TOKEN_VAULT_CONNECTION,
   getGoogleAccessToken,
   getAccessToken,
+  getSlackAccessToken,
   withCal,
   withGoogle,
   withCalendar,
@@ -103,7 +104,12 @@ function buildScopeCheck(params: {
 
   const grantedScopeSet = new Set(connectionAccounts.flatMap((account) => account.scopes ?? []));
   const missingScopes = params.requiredScopes.filter((scope) => !grantedScopeSet.has(scope));
-  const requiresOfflineAccess = params.requiredScopes.includes('offline_access');
+
+  const requiresOfflineAccess = !(
+    process.env.AUTH0_TOKEN_VAULT_M2M_CLIENT_ID &&
+    process.env.AUTH0_TOKEN_VAULT_M2M_CLIENT_SECRET &&
+    process.env.AUTH0_TOKEN_VAULT_M2M_AUDIENCE
+  );
   const hasOfflineAccessType = hasRefreshCapableAccess(connectionAccounts);
 
   if (requiresOfflineAccess && !hasOfflineAccessType) {
@@ -648,7 +654,7 @@ export const verifySlackConnectionTool = withSlack(
           requiredScopes: SLACK_SCOPES,
         });
 
-        const accessToken = await getAccessToken();
+        const accessToken = await getSlackAccessToken({ allowTokenVaultFallback: true });
         const web = new WebClient(accessToken);
 
         const authResult = await web.auth.test();

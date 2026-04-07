@@ -33,7 +33,17 @@ export const getContextDocumentsTool = tool({
       }),
     });
 
-    const documents = await findRelevantContent(question, 25);
+    const rawDocuments = await findRelevantContent(question, 25);
+    const documents: DocumentWithScore[] = rawDocuments
+      .filter((doc): doc is { content: string; similarity: number; documentId: string } => {
+        return typeof (doc as any)?.documentId === 'string' && (doc as any).documentId.trim().length > 0;
+      })
+      .map((doc) => ({
+        content: doc.content,
+        similarity: doc.similarity,
+        documentId: doc.documentId,
+      }));
+
     // filter docs based on FGA authorization
     const context = await retriever.filter(documents);
     return context;

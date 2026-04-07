@@ -14,17 +14,29 @@ import {
   buildTranscriptSlackDigestMessage,
 } from '@/lib/prompts/interview-transcript-digest';
 import { nim, nimChatModelId } from '@/lib/nim';
-import { runIntakeE2ETool } from '@/lib/tools/intake-e2e';
-import { runFinalScheduleFlowTool } from '@/lib/tools/scheduling';
+import { runIntakeE2E } from '@/lib/tools/intake-e2e';
 import {
-  summarizeCalBookingTranscriptTool,
-  summarizeDriveTranscriptPdfTool,
+  analyzeCandidateSchedulingReplyTool,
+  runFinalScheduleFlowTool,
+  scheduleInterviewSlotsTool,
+  sendInterviewConfirmationTool,
+} from '@/lib/tools/scheduling';
+import {
+  runSummarizeCalBookingTranscript,
+  runSummarizeDriveTranscriptPdf,
 } from '@/lib/tools/interview-transcripts';
 import { runMultiAgentCandidateScoreTool } from '@/lib/tools/multi-agent-candidate-score';
 import { draftOfferLetterTool, pollOfferClearanceTool, submitOfferForClearanceTool } from '@/lib/tools/offers';
 import { sendSlackMessageTool } from '@/lib/tools/slack';
 
-type RunStatus = 'pending' | 'running' | 'retrying' | 'completed' | 'dead_letter' | 'cancelled';
+type RunStatus =
+  | 'pending'
+  | 'running'
+  | 'retrying'
+  | 'paused_awaiting_reauth'
+  | 'completed'
+  | 'dead_letter'
+  | 'cancelled';
 
 type AutomationPayload = Record<string, unknown>;
 
@@ -102,12 +114,26 @@ export async function enqueueAutomationRun(input: EnqueueInput) {
   };
 }
 
-async function claimDueRuns(limit: number) {
+async function claimDueRuns(limit: number, handlerTypes?: string[]) {
   const now = new Date();
+  const normalizedHandlerTypes = (handlerTypes ?? [])
+    .map((handler) => handler.trim())
+    .filter((handler) => handler.length > 0);
+
+  const whereParts = [
+    inArray(automationRuns.status, ['pending', 'retrying']),
+    lte(automationRuns.nextAttemptAt, now),
+    ...(normalizedHandlerTypes.length > 0
+      ? [inArray(automationRuns.handlerType, normalizedHandlerTypes)]
+      : []),
+  ];
+
+  const where = and(...whereParts);
+
   const due = await db
     .select({ id: automationRuns.id })
     .from(automationRuns)
-    .where(and(inArray(automationRuns.status, ['pending', 'retrying']), lte(automationRuns.nextAttemptAt, now)))
+    .where(where)
     .orderBy(asc(automationRuns.nextAttemptAt), asc(automationRuns.createdAt))
     .limit(limit);
 
@@ -267,28 +293,42 @@ async function resolveTranscriptDigestContext(payload: AutomationPayload) {
   const candidateId = asString(payload.candidateId);
   const jobId = asString(payload.jobId);
 
-  const [candidateRow] = candidateId
-    ? await db
-      .select({
-        id: candidates.id,
-        name: candidates.name,
-        contactEmail: candidates.contactEmail,
-      })
-      .from(candidates)
-      .where(eq(candidates.id, candidateId))
-      .limit(1)
-    : [];
+  const canUseDb = Boolean(process.env.DATABASE_URL);
 
-  const [jobRow] = jobId
-    ? await db
-      .select({
-        id: jobs.id,
-        title: jobs.title,
-      })
-      .from(jobs)
-      .where(eq(jobs.id, jobId))
-      .limit(1)
-    : [];
+  let candidateRow: { id: string; name: string; contactEmail: string } | undefined;
+  if (canUseDb && candidateId) {
+    try {
+      const [row] = await db
+        .select({
+          id: candidates.id,
+          name: candidates.name,
+          contactEmail: candidates.contactEmail,
+        })
+        .from(candidates)
+        .where(eq(candidates.id, candidateId))
+        .limit(1);
+      candidateRow = row;
+    } catch {
+      candidateRow = undefined;
+    }
+  }
+
+  let jobRow: { id: string; title: string } | undefined;
+  if (canUseDb && jobId) {
+    try {
+      const [row] = await db
+        .select({
+          id: jobs.id,
+          title: jobs.title,
+        })
+        .from(jobs)
+        .where(eq(jobs.id, jobId))
+        .limit(1);
+      jobRow = row;
+    } catch {
+      jobRow = undefined;
+    }
+  }
 
   return {
     candidateId,
@@ -445,17 +485,22 @@ export async function executeAutomationHandler(run: {
   }
 
   if (run.handlerType === 'intake.scan') {
-    if (typeof runIntakeE2ETool.execute !== 'function') {
-      return {
-        check: 'run_intake_e2e',
-        status: 'error',
-        message: 'Intake scan tool is unavailable in automation runtime.',
-      };
-    }
+    const actorUserId =
+      asString(run.payload.actorUserId) ??
+      process.env.HEADHUNT_FOUNDER_USER_ID?.trim() ??
+      process.env.AUTH0_FOUNDER_USER_ID?.trim();
 
-    return runIntakeE2ETool.execute({
+    return runIntakeE2E({
       organizationId: asString(run.payload.organizationId),
       jobId: asString(run.payload.jobId),
+      actorUserId,
+      actorDisplayName: asString(run.payload.actorDisplayName),
+      tokenVaultLoginHint:
+        actorUserId ??
+        asString(run.payload.tokenVaultLoginHint) ??
+        asString(run.payload.loginHint) ??
+        asString(run.payload.actorUserId),
+      automationMode: true,
       query: asString(run.payload.query) ??
         'in:inbox newer_than:14d -category:promotions -category:social -subject:newsletter -subject:digest -subject:unsubscribe',
       maxResults: Math.max(1, Math.min(25, asNumber(run.payload.maxResults) ?? 20)),
@@ -466,7 +511,7 @@ export async function executeAutomationHandler(run: {
       requirements: Array.isArray(run.payload.requirements)
         ? run.payload.requirements.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
         : undefined,
-    }, {} as any);
+    });
   }
 
   if (run.handlerType === 'candidate.score') {
@@ -551,28 +596,242 @@ export async function executeAutomationHandler(run: {
       });
     }
 
-    return runFinalScheduleFlowTool.execute({
+    const execute = runFinalScheduleFlowTool.execute;
+    if (!execute) {
+      return {
+        check: 'run_final_schedule_flow',
+        status: 'error',
+        message: 'runFinalScheduleFlowTool is not executable.',
+      };
+    }
+
+    const booking: any = await execute(
+      {
+        candidateId,
+        jobId,
+        organizationId: asString(run.payload.organizationId),
+        actorUserId: asString(run.payload.actorUserId),
+        action: 'auto',
+        forceRequestResend: false,
+        sendMode: asString(run.payload.sendMode) === 'draft' ? 'draft' : 'send',
+        timezone: asString(run.payload.timezone) ?? 'America/Los_Angeles',
+        targetDayCount: asNumber(run.payload.targetDayCount) ?? 3,
+        slotsPerDay: asNumber(run.payload.slotsPerDay) ?? 1,
+        maxSlotsToEmail: asNumber(run.payload.maxSlotsToEmail) ?? 3,
+        threadId: asString(run.payload.threadId),
+        query: asString(run.payload.query),
+        lookbackDays: asNumber(run.payload.lookbackDays) ?? 14,
+        maxResults: asNumber(run.payload.maxResults) ?? 10,
+        eventTypeSlug: asString(run.payload.eventTypeSlug),
+        username: asString(run.payload.username),
+        teamSlug: asString(run.payload.teamSlug),
+        organizationSlug: asString(run.payload.organizationSlug),
+        durationMinutes: asNumber(run.payload.durationMinutes) ?? 30,
+      },
+      {} as any,
+    );
+
+    if (!booking || typeof booking !== 'object') {
+      return booking;
+    }
+
+    if (asString(booking.status) !== 'success' || asString(booking.mode) !== 'scheduled') {
+      return booking;
+    }
+
+    const confirmExecute = sendInterviewConfirmationTool.execute;
+    if (!confirmExecute) {
+      return {
+        ...booking,
+        confirmation: {
+          check: 'send_interview_confirmation',
+          status: 'error',
+          message: 'sendInterviewConfirmationTool is not executable.',
+        },
+      };
+    }
+
+    const confirmationSendMode = asString(run.payload.confirmationSendMode) === 'draft' ? 'draft' : 'send';
+    const timezone = asString(run.payload.timezone) ?? 'America/Los_Angeles';
+    const interviewId = asString(booking.interviewId) ?? undefined;
+
+    let confirmation: any;
+    try {
+      confirmation = await confirmExecute(
+        {
+          interviewId,
+          candidateId,
+          jobId,
+          organizationId: asString(run.payload.organizationId) ?? undefined,
+          actorUserId: asString(run.payload.actorUserId) ?? undefined,
+          sendMode: confirmationSendMode,
+          timezone,
+        },
+        {} as any,
+      );
+    } catch (error) {
+      confirmation = {
+        check: 'send_interview_confirmation',
+        status: 'error',
+        message: error instanceof Error ? error.message : 'Interview confirmation threw an unexpected error.',
+      };
+    }
+
+    return {
+      ...booking,
+      confirmation,
+    };
+  }
+
+  if (run.handlerType === 'scheduling.reply.parse_book_google') {
+    const actorUserId =
+      asString(run.payload.actorUserId) ??
+      process.env.HEADHUNT_FOUNDER_USER_ID?.trim() ??
+      process.env.AUTH0_FOUNDER_USER_ID?.trim();
+    const candidateId = asString(run.payload.candidateId);
+    const jobId = asString(run.payload.jobId);
+
+    if (!candidateId || !jobId) {
+      return missingAutomationContextError({
+        handlerType: run.handlerType,
+        missing: [...(candidateId ? [] : ['candidateId']), ...(jobId ? [] : ['jobId'])],
+      });
+    }
+
+    if (!actorUserId) {
+      return missingAutomationContextError({
+        handlerType: run.handlerType,
+        missing: ['actorUserId'],
+      });
+    }
+
+    const timezone = asString(run.payload.timezone) ?? 'America/Los_Angeles';
+    const organizationId = asString(run.payload.organizationId) ?? undefined;
+
+    const analyzeExecute = analyzeCandidateSchedulingReplyTool.execute;
+    if (!analyzeExecute) {
+      return {
+        check: 'analyze_candidate_scheduling_reply',
+        status: 'error',
+        message: 'analyzeCandidateSchedulingReplyTool is not executable.',
+      };
+    }
+
+    const analysis: any = await analyzeExecute(
+      {
+        candidateId,
+        jobId,
+        organizationId,
+        actorUserId,
+        timezone,
+        threadId: asString(run.payload.threadId) ?? undefined,
+        query: asString(run.payload.query) ?? undefined,
+        lookbackDays: asNumber(run.payload.lookbackDays) ?? 14,
+        maxResults: asNumber(run.payload.maxResults) ?? 10,
+      },
+      {} as any,
+    );
+
+    if (!analysis || typeof analysis !== 'object' || analysis.status !== 'success') {
+      return analysis ?? {
+        check: 'analyze_candidate_scheduling_reply',
+        status: 'error',
+        message: 'Failed to analyze candidate scheduling reply.',
+      };
+    }
+
+    const selectedStartISO = typeof analysis.selectedStartISO === 'string' ? analysis.selectedStartISO : null;
+    if (!selectedStartISO) {
+      return {
+        check: 'scheduling_reply_parse_google',
+        status: 'error',
+        message:
+          'Candidate reply did not map cleanly to a proposed slot. Ask the candidate to reply with an option number and retry.',
+        analysis,
+      };
+    }
+
+    const durationMinutes = asNumber(run.payload.durationMinutes) ?? 30;
+
+    const scheduleExecute = scheduleInterviewSlotsTool.execute;
+    if (!scheduleExecute) {
+      return {
+        check: 'schedule_interview_slots',
+        status: 'error',
+        message: 'scheduleInterviewSlotsTool is not executable.',
+      };
+    }
+
+    const scheduled: any = await scheduleExecute(
+      {
+        candidateId,
+        jobId,
+        organizationId,
+        actorUserId,
+        selectedStartISO,
+        durationMinutes,
+        slotIntervalMinutes: 30,
+        maxSuggestions: 12,
+        windowStartISO: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+        windowEndISO: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+        timezone,
+      },
+      {} as any,
+    );
+
+    if (!scheduled || typeof scheduled !== 'object' || scheduled.status !== 'success') {
+      return scheduled ?? {
+        check: 'schedule_interview_slots',
+        status: 'error',
+        message: 'Failed to schedule interview slot on Google Calendar.',
+      };
+    }
+
+    const interviewId = typeof scheduled.interviewId === 'string' ? scheduled.interviewId : undefined;
+
+    const confirmExecute = sendInterviewConfirmationTool.execute;
+    if (!confirmExecute) {
+      return {
+        check: 'send_interview_confirmation',
+        status: 'error',
+        message: 'sendInterviewConfirmationTool is not executable.',
+      };
+    }
+
+    const confirmation: any = await confirmExecute(
+      {
+        interviewId,
+        candidateId,
+        jobId,
+        organizationId,
+        actorUserId,
+        sendMode: asString(run.payload.confirmationSendMode) === 'draft' ? 'draft' : 'send',
+        timezone,
+      },
+      {} as any,
+    );
+
+    if (!confirmation || typeof confirmation !== 'object' || confirmation.status !== 'success') {
+      return {
+        check: 'scheduling_reply_book_google',
+        status: 'error',
+        message: 'Interview was scheduled, but confirmation email failed.',
+        scheduled,
+        confirmation,
+      };
+    }
+
+    return {
+      check: 'scheduling_reply_book_google',
+      status: 'success',
+      mode: 'scheduled',
       candidateId,
       jobId,
-      organizationId: asString(run.payload.organizationId),
-      actorUserId: asString(run.payload.actorUserId),
-      action: 'auto',
-      forceRequestResend: false,
-      sendMode: asString(run.payload.sendMode) === 'draft' ? 'draft' : 'send',
-      timezone: asString(run.payload.timezone) ?? 'America/Los_Angeles',
-      targetDayCount: asNumber(run.payload.targetDayCount) ?? 3,
-      slotsPerDay: asNumber(run.payload.slotsPerDay) ?? 1,
-      maxSlotsToEmail: asNumber(run.payload.maxSlotsToEmail) ?? 3,
-      threadId: asString(run.payload.threadId),
-      query: asString(run.payload.query),
-      lookbackDays: asNumber(run.payload.lookbackDays) ?? 14,
-      maxResults: asNumber(run.payload.maxResults) ?? 10,
-      eventTypeSlug: asString(run.payload.eventTypeSlug),
-      username: asString(run.payload.username),
-      teamSlug: asString(run.payload.teamSlug),
-      organizationSlug: asString(run.payload.organizationSlug),
-      durationMinutes: asNumber(run.payload.durationMinutes) ?? 30,
-    }, {} as any);
+      interviewId: interviewId ?? null,
+      scheduled,
+      confirmation,
+      analysis,
+    };
   }
 
   if (run.handlerType === 'offer.draft.create') {
@@ -657,7 +916,7 @@ export async function executeAutomationHandler(run: {
   }
 
   if (run.handlerType === 'interview.transcript.fetch') {
-    if (typeof summarizeCalBookingTranscriptTool.execute !== 'function') {
+    if (typeof runSummarizeCalBookingTranscript !== 'function') {
       return {
         check: 'summarize_cal_booking_transcript',
         status: 'error',
@@ -674,19 +933,26 @@ export async function executeAutomationHandler(run: {
       };
     }
 
+    const actorUserId =
+      asString(run.payload.actorUserId) ??
+      process.env.HEADHUNT_FOUNDER_USER_ID?.trim() ??
+      process.env.AUTH0_FOUNDER_USER_ID?.trim();
+
     let calResult: unknown;
     let calRecord: Record<string, unknown> | undefined;
 
     try {
-      calResult = await summarizeCalBookingTranscriptTool.execute({
+      calResult = await runSummarizeCalBookingTranscript({
         bookingUid,
         candidateId: asString(run.payload.candidateId),
         jobId: asString(run.payload.jobId),
         organizationId: asString(run.payload.organizationId),
-        actorUserId: asString(run.payload.actorUserId),
+        actorUserId,
+        tokenVaultLoginHint: actorUserId,
+        automationMode: true,
         maxTranscriptChars: asNumber(run.payload.maxTranscriptChars) ?? 28000,
         jobRequirements: asStringArray(run.payload.jobRequirements),
-      }, {} as any);
+      });
 
       calRecord = asRecord(calResult);
     } catch (error) {
@@ -706,7 +972,7 @@ export async function executeAutomationHandler(run: {
       return calResult;
     }
 
-    if (typeof summarizeDriveTranscriptPdfTool.execute !== 'function') {
+    if (typeof runSummarizeDriveTranscriptPdf !== 'function') {
       return calResult;
     }
 
@@ -725,7 +991,7 @@ export async function executeAutomationHandler(run: {
     let driveRecord: Record<string, unknown> | undefined;
 
     try {
-      driveResult = await summarizeDriveTranscriptPdfTool.execute({
+      driveResult = await runSummarizeDriveTranscriptPdf({
         driveFileId: asString(run.payload.driveFileId),
         driveQuery: asString(run.payload.driveQuery),
         driveFolderId: asString(run.payload.driveFolderId),
@@ -733,10 +999,12 @@ export async function executeAutomationHandler(run: {
         candidateId: asString(run.payload.candidateId),
         jobId: asString(run.payload.jobId),
         organizationId: asString(run.payload.organizationId),
-        actorUserId: asString(run.payload.actorUserId),
+        actorUserId,
+        tokenVaultLoginHint: actorUserId,
+        automationMode: true,
         maxTranscriptChars: asNumber(run.payload.maxTranscriptChars) ?? 28000,
         jobRequirements: asStringArray(run.payload.jobRequirements),
-      }, {} as any);
+      });
 
       driveRecord = asRecord(driveResult);
     } catch (error) {
@@ -870,6 +1138,9 @@ export async function executeAutomationHandler(run: {
         {
           channel: slackChannel,
           text: slackMessage,
+          tokenVaultLoginHint: asString(run.payload.actorUserId) ?? undefined,
+          actorUserId: asString(run.payload.actorUserId) ?? undefined,
+          allowTokenVaultFallback: false,
         },
         {} as any,
       );
@@ -956,7 +1227,7 @@ function isRetryableSuccess(result: Record<string, unknown>): boolean {
 }
 
 function shouldEscalateToManualReview(handlerType: string, result: Record<string, unknown>): boolean {
-  if (handlerType !== 'scheduling.reply.parse_book') {
+  if (handlerType !== 'scheduling.reply.parse_book' && handlerType !== 'scheduling.reply.parse_book_google') {
     return false;
   }
 
@@ -972,15 +1243,45 @@ function shouldEscalateToManualReview(handlerType: string, result: Record<string
     return true;
   }
 
+  if (check === 'scheduling_reply_book_google' && mode !== 'scheduled') {
+    return true;
+  }
+
   return false;
 }
 
-export async function processAutomationQueue(limit = 10) {
-  const claimed = await claimDueRuns(limit);
+function isTokenVaultAuthorizationErrorMessage(message: string): boolean {
+  const normalized = message.toLowerCase();
+
+  return (
+    normalized.includes('authorization required to access the token vault') ||
+    normalized.includes('missing scopes:') ||
+    (normalized.includes('token vault') && normalized.includes('authorization'))
+  );
+}
+
+function shouldPauseAwaitingReauth(handlerType: string): boolean {
+  // Intake scans are designed to run headlessly; they should never block on interactive re-auth.
+  if (handlerType === 'intake.scan') {
+    return false;
+  }
+
+  return true;
+}
+
+export async function processAutomationQueue(
+  input: number | { limit?: number; handlerTypes?: string[] } = 10,
+) {
+  const limit = typeof input === 'number' ? input : (input.limit ?? 10);
+  const handlerTypes = typeof input === 'number' ? undefined : input.handlerTypes;
+
+  const cappedLimit = Math.max(1, Math.min(25, limit));
+  const claimed = await claimDueRuns(cappedLimit, handlerTypes);
   const now = new Date();
 
   let completed = 0;
   let retried = 0;
+  let pausedAwaitingReauth = 0;
   let deadLettered = 0;
 
   for (const run of claimed) {
@@ -1033,6 +1334,27 @@ export async function processAutomationQueue(limit = 10) {
         continue;
       }
 
+      const tokenVaultError = isTokenVaultAuthorizationErrorMessage(asString(result.message) ?? '');
+      if (tokenVaultError && shouldPauseAwaitingReauth(run.handlerType)) {
+        await db
+          .update(automationRuns)
+          .set({
+            status: 'paused_awaiting_reauth',
+            result: {
+              ...result,
+              mode: 'awaiting_reauth',
+              remediation: 'Reconnect required integrations and resume this run.',
+            },
+            updatedAt: now,
+            lastError: asString(result.message) ?? 'Authorization required to access the Token Vault.',
+            lastErrorAt: now,
+          })
+          .where(eq(automationRuns.id, run.id));
+
+        pausedAwaitingReauth += 1;
+        continue;
+      }
+
       const nextAttemptCount = run.attemptCount + 1;
       const reachedMax = nextAttemptCount >= run.maxAttempts;
 
@@ -1069,6 +1391,28 @@ export async function processAutomationQueue(limit = 10) {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown automation error.';
+
+      if (isTokenVaultAuthorizationErrorMessage(message) && shouldPauseAwaitingReauth(run.handlerType)) {
+        await db
+          .update(automationRuns)
+          .set({
+            status: 'paused_awaiting_reauth',
+            result: {
+              status: 'error',
+              mode: 'awaiting_reauth',
+              message,
+              remediation: 'Reconnect required integrations and resume this run.',
+            },
+            updatedAt: now,
+            lastError: message,
+            lastErrorAt: now,
+          })
+          .where(eq(automationRuns.id, run.id));
+
+        pausedAwaitingReauth += 1;
+        continue;
+      }
+
       const nextAttemptCount = run.attemptCount + 1;
       const reachedMax = nextAttemptCount >= run.maxAttempts;
 
@@ -1108,6 +1452,7 @@ export async function processAutomationQueue(limit = 10) {
     claimed: claimed.length,
     completed,
     retried,
+    pausedAwaitingReauth,
     deadLettered,
   };
 }
@@ -1137,7 +1482,13 @@ export async function enqueueWatchdogs(params?: {
     group by al.resource_id, (al.metadata->>'jobId')
   `);
 
-  for (const row of staleReplies.rows as Array<{ candidate_id: string; job_id: string | null; last_requested_at: string }>) {
+  const staleReplyRows = staleReplies as unknown as Array<{
+    candidate_id: string;
+    job_id: string | null;
+    last_requested_at: string;
+  }>;
+
+  for (const row of staleReplyRows) {
     if (!row.job_id) continue;
 
     const [scheduledInterview] = await db

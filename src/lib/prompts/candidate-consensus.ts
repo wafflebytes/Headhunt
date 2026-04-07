@@ -88,7 +88,9 @@ export function buildTechnicalEvaluatorPrompt(params: {
     params.turn > 1
       ? 'Adjust your score only when peer evidence changes your view. Explain what changed in adjustmentNote.'
       : 'Provide an initial independent technical assessment.',
-    'Return concise evidence points grounded in candidate text.',
+    'EvidencePoints must be specific and falsifiable (company/product/system, metrics, tools, scope).',
+    'When possible, include short direct quotes/snippets from the supplied text to justify the claim.',
+    'If evidence is missing for a requirement, state the gap explicitly (do not assume).',
     `Peer feedback from previous turns:\n${peerFeedback}`,
     buildSharedContext(params.context),
   ].join('\n\n');
@@ -115,6 +117,8 @@ export function buildSocialEvaluatorPrompt(params: {
     params.turn > 1
       ? 'Revise only when peer evidence materially changes your prior assessment. Explain revision in adjustmentNote.'
       : 'Provide an initial independent communication and motivation assessment.',
+    'EvidencePoints must cite concrete textual behavior (what they said, how they framed scope/ownership, specificity).',
+    'When possible, include short direct quotes/snippets; avoid generic praise like "great communicator" without proof.',
     `Peer feedback from previous turns:\n${peerFeedback}`,
     buildSharedContext(params.context),
   ].join('\n\n');
@@ -137,6 +141,7 @@ export function buildAtsEvaluatorPrompt(params: {
     'You must be non-subjective. Focus strictly on requirement coverage and evidence completeness.',
     'Scoring scale is 0-100. Confidence is 0-100.',
     'For requirementChecks, each item must include requirement, met(boolean), and evidence.',
+    'Evidence must reference specific text (prefer short quote/snippet) rather than general statements.',
     'If explicit requirements are missing, derive 3-5 objective requirements from role title and available evidence.',
     `Turn ${params.turn} of ${params.maxTurns}.`,
     params.turn > 1
@@ -179,7 +184,9 @@ export function buildConsensusPrompt(params: {
     'Use these weights exactly: technical 45, social 20, ats objective 35.',
     `Weighted baseline score from arithmetic combination is ${params.weightedBaselineScore}.`,
     'You may adjust baseline only with explicit evidence-based rationale.',
-    'Return clear strengths, risks, and executable next steps.',
+    'Strengths and risks must be evidence-first: write each as "claim — evidence snippet".',
+    'Do not restate scores in strengths/risks; focus on decision-relevant signals and gaps.',
+    'NextSteps must be executable (specific probes / validation steps), not generic advice.',
     'Disagreements should capture unresolved evaluator conflicts only.',
     `Turns completed: ${params.turns}.`,
     `Final evaluator snapshots:\n${finalByAgent}`,

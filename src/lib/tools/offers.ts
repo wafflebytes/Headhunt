@@ -15,6 +15,7 @@ import { offerTermsSchema, offers } from '@/lib/db/schema/offers';
 import { organizations } from '@/lib/db/schema/organizations';
 import { templates } from '@/lib/db/schema/templates';
 import { canViewCandidate } from '@/lib/fga/fga';
+import { buildJobScopedOfferTemplateName } from '@/lib/offer-template-seeding';
 
 const draftOfferLetterInputSchema = z.object({
   candidateId: z.string().min(1),
@@ -51,6 +52,19 @@ const pollOfferClearanceInputSchema = z.object({
 });
 
 type ActorRole = 'founder' | 'hiring_manager';
+
+type JobDraftContext = {
+  department: string;
+  employmentType: string;
+  location: string;
+  compensation: string;
+  roleSummary: string;
+  requirements: string[];
+  responsibilities: string[];
+  preferredQualifications: string[];
+  benefits: string[];
+  hiringSignals: string[];
+};
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (value && typeof value === 'object' && !Array.isArray(value)) {
@@ -394,7 +408,7 @@ async function markOfferSent(params: {
   const sentAt = new Date();
   const updatedAt = new Date();
 
-  await db.transaction(async (tx: typeof db) => {
+  await db.transaction(async (tx) => {
     await tx
       .update(offers)
       .set({
@@ -467,6 +481,13 @@ function buildDefaultOfferBody(values: {
   candidateName: string;
   jobTitle: string;
   companyName: string;
+  department: string;
+  employmentType: string;
+  location: string;
+  compensation: string;
+  roleSummary: string;
+  requirementsSummary: string;
+  responsibilitiesSummary: string;
   baseSalary: string;
   startDate: string;
   equityLine: string;
@@ -477,6 +498,13 @@ function buildDefaultOfferBody(values: {
     `Hi ${values.candidateName},`,
     '',
     `We are excited to extend an offer for the ${values.jobTitle} role at ${values.companyName}.`,
+    `Department: ${values.department}`,
+    `Employment type: ${values.employmentType}`,
+    `Location: ${values.location}`,
+    `Role compensation context: ${values.compensation}`,
+    `Role summary: ${values.roleSummary}`,
+    `Top requirements: ${values.requirementsSummary}`,
+    `Key responsibilities: ${values.responsibilitiesSummary}`,
     `Base salary: ${values.baseSalary}`,
     values.equityLine,
     values.bonusLine,
@@ -490,6 +518,36 @@ function buildDefaultOfferBody(values: {
   ]
     .filter(Boolean)
     .join('\n');
+}
+
+function summarizeList(items: string[], fallback: string): string {
+  if (!Array.isArray(items) || items.length === 0) {
+    return fallback;
+  }
+
+  return items.slice(0, 4).join('; ');
+}
+
+function resolveJobDraftContext(jdTemplate: unknown): JobDraftContext {
+  const template = asRecord(jdTemplate);
+
+  const listFromTemplate = (key: string): string[] => {
+    const value = template ? template[key] : undefined;
+    return asStringArray(value);
+  };
+
+  return {
+    department: asString(template?.department) ?? 'Not specified',
+    employmentType: asString(template?.employmentType) ?? 'Not specified',
+    location: asString(template?.location) ?? 'Not specified',
+    compensation: asString(template?.compensation) ?? 'Not specified',
+    roleSummary: asString(template?.roleSummary) ?? 'Not specified',
+    requirements: listFromTemplate('requirements'),
+    responsibilities: listFromTemplate('responsibilities'),
+    preferredQualifications: listFromTemplate('preferredQualifications'),
+    benefits: listFromTemplate('benefits'),
+    hiringSignals: listFromTemplate('hiringSignals'),
+  };
 }
 
 export const draftOfferLetterTool = tool({
@@ -541,7 +599,11 @@ export const draftOfferLetterTool = tool({
     }
 
     failureStep = 'load_job';
-    const [job] = await db.select({ id: jobs.id, title: jobs.title }).from(jobs).where(eq(jobs.id, input.jobId)).limit(1);
+    const [job] = await db
+      .select({ id: jobs.id, title: jobs.title, jdTemplate: jobs.jdTemplate })
+      .from(jobs)
+      .where(eq(jobs.id, input.jobId))
+      .limit(1);
     if (!job) {
       return {
         check: 'draft_offer_letter',
@@ -549,6 +611,8 @@ export const draftOfferLetterTool = tool({
         message: `Job ${input.jobId} not found.`,
       };
     }
+
+    const jobContext = resolveJobDraftContext(job.jdTemplate);
 
     const resolvedOrganizationId = input.organizationId ?? candidate.organizationId ?? null;
     failureStep = 'load_organization';
@@ -561,22 +625,46 @@ export const draftOfferLetterTool = tool({
       : [];
 
     failureStep = 'load_template';
-    const [template] = await (input.templateId
-      ? db
-          .select({ id: templates.id, subject: templates.subject, body: templates.body })
-          .from(templates)
-          .where(eq(templates.id, input.templateId))
-          .limit(1)
-      : db
+    let template: { id: string; subject: string; body: string } | undefined;
+
+    if (input.templateId) {
+      [template] = await db
+        .select({ id: templates.id, subject: templates.subject, body: templates.body })
+        .from(templates)
+        .where(eq(templates.id, input.templateId))
+        .limit(1);
+    } else {
+      if (resolvedOrganizationId) {
+        const [jobScopedTemplate] = await db
           .select({ id: templates.id, subject: templates.subject, body: templates.body })
           .from(templates)
           .where(
             and(
               eq(templates.type, 'offer_letter'),
-              resolvedOrganizationId ? eq(templates.organizationId, resolvedOrganizationId) : eq(templates.type, 'offer_letter'),
+              eq(templates.organizationId, resolvedOrganizationId),
+              eq(templates.name, buildJobScopedOfferTemplateName(job.id)),
             ),
           )
-          .limit(1));
+          .limit(1);
+
+        template = jobScopedTemplate;
+      }
+
+      if (!template) {
+        [template] = await db
+          .select({ id: templates.id, subject: templates.subject, body: templates.body })
+          .from(templates)
+          .where(
+            and(
+              eq(templates.type, 'offer_letter'),
+              resolvedOrganizationId
+                ? eq(templates.organizationId, resolvedOrganizationId)
+                : eq(templates.type, 'offer_letter'),
+            ),
+          )
+          .limit(1);
+      }
+    }
 
     const normalizedCurrency = input.terms.currency.toUpperCase();
     const salaryText = formatCurrency(input.terms.baseSalary, normalizedCurrency);
@@ -593,6 +681,16 @@ export const draftOfferLetterTool = tool({
       baseSalary: salaryText,
       currency: normalizedCurrency,
       startDate: input.terms.startDate,
+      jobDepartment: jobContext.department,
+      jobEmploymentType: jobContext.employmentType,
+      jobLocation: jobContext.location,
+      jobCompensation: jobContext.compensation,
+      jobRoleSummary: jobContext.roleSummary,
+      jobRequirements: summarizeList(jobContext.requirements, 'Not specified'),
+      jobResponsibilities: summarizeList(jobContext.responsibilities, 'Not specified'),
+      jobPreferredQualifications: summarizeList(jobContext.preferredQualifications, 'Not specified'),
+      jobBenefits: summarizeList(jobContext.benefits, 'Not specified'),
+      jobHiringSignals: summarizeList(jobContext.hiringSignals, 'Not specified'),
       equityPercent: input.terms.equityPercent?.toString() ?? '',
       bonusTargetPercent: input.terms.bonusTargetPercent?.toString() ?? '',
       signOnBonus: signOnText ?? '',
@@ -609,6 +707,13 @@ export const draftOfferLetterTool = tool({
           candidateName: candidate.name,
           jobTitle: job.title,
           companyName: interpolationValues.companyName,
+          department: interpolationValues.jobDepartment,
+          employmentType: interpolationValues.jobEmploymentType,
+          location: interpolationValues.jobLocation,
+          compensation: interpolationValues.jobCompensation,
+          roleSummary: interpolationValues.jobRoleSummary,
+          requirementsSummary: interpolationValues.jobRequirements,
+          responsibilitiesSummary: interpolationValues.jobResponsibilities,
           baseSalary: salaryText,
           startDate: input.terms.startDate,
           equityLine: equityText ? `Equity: ${equityText}` : '',
@@ -882,7 +987,7 @@ export const submitOfferForClearanceTool = withGmailWrite(tool({
 
       const updatedAt = new Date();
 
-      await db.transaction(async (tx: typeof db) => {
+      await db.transaction(async (tx) => {
         await tx
           .update(offers)
           .set({
@@ -1051,7 +1156,7 @@ export const pollOfferClearanceTool = withGmailWrite(tool({
       if (pollResult.status === 'denied' || pollResult.status === 'expired') {
         const updatedAt = new Date();
 
-        await db.transaction(async (tx: typeof db) => {
+        await db.transaction(async (tx) => {
           await tx
             .update(offers)
             .set({

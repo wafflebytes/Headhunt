@@ -15,6 +15,8 @@ import { serpApiTool } from '@/lib/tools/serpapi';
 import { getUserInfoTool } from '@/lib/tools/user-info';
 import { gmailDraftTool, gmailSearchTool } from '@/lib/tools/gmail';
 import { getCalendarEventsTool } from '@/lib/tools/google-calender';
+import { calendarEventsTool } from '@/lib/tools/calendar-events';
+import { calendarSlotsTool } from '@/lib/tools/calendar-slots';
 import { sendSlackMessageTool } from '@/lib/tools/slack';
 import { getContextDocumentsTool } from '@/lib/tools/context-docs';
 import { listSlackChannels } from '@/lib/tools/list-slack-channels';
@@ -1041,6 +1043,8 @@ export async function POST(req: NextRequest) {
     gmailSearchTool,
     gmailDraftTool,
     getCalendarEventsTool,
+    calendar_events: calendarEventsTool,
+    calendar_slots: calendarSlotsTool,
     getContextDocumentsTool,
     listSlackChannels,
     send_slack_message: sendSlackMessageTool,

@@ -18,6 +18,7 @@ const runInterceptInputSchema = z.object({
   includeBody: z.boolean().default(true),
   organizationId: z.string().optional(),
   actorUserId: z.string().min(1).optional(),
+  tokenVaultLoginHint: z.string().min(1).optional(),
 });
 
 export type FetchInterceptMessagesInput = {
@@ -25,6 +26,8 @@ export type FetchInterceptMessagesInput = {
   maxResults: number;
   candidateLikeOnly: boolean;
   includeBody: boolean;
+  tokenVaultLoginHint?: string;
+  automationMode?: boolean;
 };
 
 export type InterceptMessage = {
@@ -131,6 +134,17 @@ function compact(value: string, limit = 1400): string {
   return value.replace(/\s+/g, ' ').trim().slice(0, limit);
 }
 
+function normalizeBody(value: string, limit = 5000): string {
+  const normalized = value
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  return normalized.slice(0, limit);
+}
+
 function classifyCandidateLike(params: { from: string | null; subject: string | null; body: string; snippet: string }) {
   const from = params.from ?? '';
   const subject = params.subject ?? '';
@@ -177,7 +191,10 @@ function classifyCandidateLike(params: { from: string | null; subject: string | 
 }
 
 export async function fetchInterceptMessages(input: FetchInterceptMessagesInput): Promise<InterceptMessage[]> {
-  const accessToken = await getGoogleAccessToken();
+  const accessToken = await getGoogleAccessToken({
+    loginHint: input.tokenVaultLoginHint,
+    allowTokenVaultFallback: input.automationMode ? false : true,
+  });
   const auth = new google.auth.OAuth2();
   auth.setCredentials({ access_token: accessToken });
 
@@ -209,7 +226,7 @@ export async function fetchInterceptMessages(input: FetchInterceptMessagesInput)
         const payload = detail.data.payload;
         const from = getHeader(payload, 'From');
         const subject = getHeader(payload, 'Subject');
-        const body = compact(extractPlainTextPart(payload), 5000);
+        const body = normalizeBody(extractPlainTextPart(payload), 5000);
         const snippet = compact(detail.data.snippet ?? '', 600);
         const classification = classifyCandidateLike({
           from,
@@ -258,6 +275,7 @@ export const runInterceptTool = withGmailRead(
           maxResults: input.maxResults,
           candidateLikeOnly: input.candidateLikeOnly,
           includeBody: input.includeBody,
+          tokenVaultLoginHint: input.tokenVaultLoginHint ?? input.actorUserId,
         });
 
         await db.insert(auditLogs).values({

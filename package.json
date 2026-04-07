@@ -25,7 +25,8 @@
     "smoke:boundary-guards": "tsx scripts/smoke-boundary-guards.ts",
     "smoke:edge-e2e": "tsx scripts/smoke-edge-e2e.ts",
     "smoke:mcp-acceptance": "tsx scripts/smoke-mcp-acceptance.ts",
-    "seed:demo": "tsx scripts/seed-demo-headhunt.ts"
+    "seed:demo": "tsx scripts/seed-demo-headhunt.ts",
+    "demo:reset-intake": "tsx scripts/_reset-demo-intake.ts"
   },
   "engines": {
     "node": ">=18"

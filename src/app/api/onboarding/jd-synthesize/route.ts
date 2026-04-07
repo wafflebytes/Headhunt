@@ -1,9 +1,15 @@
 import { generateObject } from 'ai';
+import { eq } from 'drizzle-orm';
 import { NextRequest, NextResponse } from 'next/server';
 import pdf from 'pdf-parse';
 import { z } from 'zod';
 
 import { auth0 } from '@/lib/auth0';
+import { enqueueInitialIntakeScan } from '@/lib/automation/intake-bootstrap';
+import { kickoffV2IntakeFromSession } from '@/lib/automation/v2-kickoff';
+import { db } from '@/lib/db';
+import { jobs } from '@/lib/db/schema/jobs';
+import { JdTemplate, jdTemplateSchema, normalizeJdTemplate } from '@/lib/jd-template';
 import { nim } from '@/lib/nim';
 import {
   buildJdSynthesisFromDraftPrompt,
@@ -16,24 +22,10 @@ const KIMI_K2_MODEL_ID = 'moonshotai/kimi-k2-instruct';
 const MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024;
 const MAX_SOURCE_CHARS = 20000;
 
-const jdTemplateSchema = z.object({
-  title: z.string(),
-  department: z.string(),
-  employmentType: z.string(),
-  location: z.string(),
-  compensation: z.string(),
-  roleSummary: z.string(),
-  responsibilities: z.array(z.string()),
-  requirements: z.array(z.string()),
-  preferredQualifications: z.array(z.string()),
-  benefits: z.array(z.string()),
-  hiringSignals: z.array(z.string()),
-});
-
-type JdTemplate = z.infer<typeof jdTemplateSchema>;
-
 const draftPayloadSchema = z.object({
   mode: z.literal('draft'),
+  jobId: z.string().optional().default(''),
+  organizationId: z.string().optional().default(''),
   jobTitle: z.string().optional().default(''),
   jobDepartment: z.string().optional().default(''),
   companyStage: z.string().optional().default(''),
@@ -46,40 +38,6 @@ const draftPayloadSchema = z.object({
   niceToHave: z.string().optional().default(''),
   benefits: z.string().optional().default(''),
 });
-
-const cleanText = (value: string | undefined | null, fallback: string) => {
-  const next = value?.trim();
-  return next && next.length > 0 ? next : fallback;
-};
-
-const cleanItems = (items: string[], fallback: string): string[] => {
-  const normalized = items
-    .map((item) => item.trim())
-    .filter((item) => item.length > 0)
-    .slice(0, 12);
-
-  if (normalized.length > 0) {
-    return normalized;
-  }
-
-  return [fallback];
-};
-
-function normalizeTemplate(template: JdTemplate): JdTemplate {
-  return {
-    title: cleanText(template.title, 'Not specified'),
-    department: cleanText(template.department, 'Not specified'),
-    employmentType: cleanText(template.employmentType, 'Not specified'),
-    location: cleanText(template.location, 'Not specified'),
-    compensation: cleanText(template.compensation, 'Not specified'),
-    roleSummary: cleanText(template.roleSummary, 'Not specified'),
-    responsibilities: cleanItems(template.responsibilities, 'Not specified'),
-    requirements: cleanItems(template.requirements, 'Not specified'),
-    preferredQualifications: cleanItems(template.preferredQualifications, 'Not specified'),
-    benefits: cleanItems(template.benefits, 'Not specified'),
-    hiringSignals: cleanItems(template.hiringSignals, 'Not specified'),
-  };
-}
 
 function truncateSourceText(value: string): string {
   if (value.length <= MAX_SOURCE_CHARS) {
@@ -97,7 +55,7 @@ async function synthesizeTemplate(prompt: string): Promise<JdTemplate> {
     prompt,
   });
 
-  return normalizeTemplate(object);
+  return normalizeJdTemplate(object);
 }
 
 async function extractPdfText(file: File): Promise<string> {
@@ -120,11 +78,87 @@ async function extractPdfText(file: File): Promise<string> {
   return truncateSourceText(text);
 }
 
+async function persistSynthesisToJob(params: {
+  jobId?: string;
+  organizationId?: string;
+  actorUserId?: string;
+  tokenVaultLoginHint?: string;
+  synthesis: JdTemplate;
+}) {
+  const jobId = params.jobId?.trim();
+  if (!jobId) {
+    return null;
+  }
+
+  const organizationId = params.organizationId?.trim() || null;
+  const jobTitle = params.synthesis.title.trim() || 'Untitled role';
+  const now = new Date();
+
+  const [existing] = await db
+    .select({ id: jobs.id })
+    .from(jobs)
+    .where(eq(jobs.id, jobId))
+    .limit(1);
+
+  if (existing) {
+    const updatePayload: {
+      title: string;
+      jdTemplate: JdTemplate;
+      updatedAt: Date;
+      organizationId?: string | null;
+    } = {
+      title: jobTitle,
+      jdTemplate: params.synthesis,
+      updatedAt: now,
+    };
+
+    if (organizationId) {
+      updatePayload.organizationId = organizationId;
+    }
+
+    await db.update(jobs).set(updatePayload).where(eq(jobs.id, jobId));
+    return jobId;
+  }
+
+  const [inserted] = await db
+    .insert(jobs)
+    .values({
+      id: jobId,
+      organizationId,
+      title: jobTitle,
+      status: 'active',
+      jdTemplate: params.synthesis,
+    })
+    .returning({ id: jobs.id });
+
+  if (inserted?.id) {
+    await enqueueInitialIntakeScan({
+      jobId: inserted.id,
+      organizationId,
+      actorUserId: params.actorUserId,
+      tokenVaultLoginHint: params.tokenVaultLoginHint,
+      trigger: 'api.onboarding.jd-synthesize',
+    });
+
+    await kickoffV2IntakeFromSession({
+      jobId: inserted.id,
+      organizationId,
+      actorUserId: params.actorUserId,
+      tokenVaultLoginHint: params.tokenVaultLoginHint,
+      trigger: 'api.onboarding.jd-synthesize',
+    });
+  }
+
+  return inserted?.id ?? jobId;
+}
+
 export async function POST(request: NextRequest) {
   const session = await auth0.getSession();
   if (!session?.user?.sub) {
     return NextResponse.json({ message: 'Unauthorized' }, { status: 401 });
   }
+
+  const tokenVaultLoginHint = session.user.sub;
 
   try {
     const contentType = request.headers.get('content-type') ?? '';
@@ -139,6 +173,8 @@ export async function POST(request: NextRequest) {
 
       const jobTitle = String(formData.get('jobTitle') ?? '').trim();
       const jobDepartment = String(formData.get('jobDepartment') ?? '').trim();
+      const jobId = String(formData.get('jobId') ?? '').trim();
+      const organizationId = String(formData.get('organizationId') ?? '').trim();
       const sourceText = await extractPdfText(file);
 
       const synthesis = await synthesizeTemplate(
@@ -149,10 +185,26 @@ export async function POST(request: NextRequest) {
         }),
       );
 
+      let persistedJobId: string | null = null;
+      if (jobId) {
+        try {
+          persistedJobId = await persistSynthesisToJob({
+            jobId,
+            organizationId,
+            actorUserId: session.user.sub,
+            tokenVaultLoginHint,
+            synthesis,
+          });
+        } catch {
+          // Synthesis should still succeed even if persistence fails.
+        }
+      }
+
       return NextResponse.json({
         status: 'success',
         source: 'upload',
         synthesis,
+        persistedJobId,
       });
     }
 
@@ -184,10 +236,26 @@ export async function POST(request: NextRequest) {
       }),
     );
 
+    let persistedJobId: string | null = null;
+    if (payload.jobId) {
+      try {
+        persistedJobId = await persistSynthesisToJob({
+          jobId: payload.jobId,
+          organizationId: payload.organizationId,
+          actorUserId: session.user.sub,
+          tokenVaultLoginHint,
+          synthesis,
+        });
+      } catch {
+        // Synthesis should still succeed even if persistence fails.
+      }
+    }
+
     return NextResponse.json({
       status: 'success',
       source: 'draft',
       synthesis,
+      persistedJobId,
     });
   } catch (error) {
     return NextResponse.json(

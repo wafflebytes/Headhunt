@@ -42,8 +42,10 @@ Work history guidance:
 - Prefer recency and role relevance over completeness.
 
 Summary quality bar:
-- 1 short paragraph (4-7 sentences).
-- Must include: strongest fit signals, biggest risk flags, and interview focus recommendation.
+- Exactly 3 concise bullet points (each 1 sentence, <= 160 characters).
+- Bullet 1: strongest fit signal(s) with evidence.
+- Bullet 2: biggest risk / missing evidence + what to probe.
+- Bullet 3 (must start with "Founder note:"): founder-facing interview focus recommendation.
 - Avoid fluff and avoid repeating raw resume lines without interpretation.`;
 
 export function buildResumeSynthesisPrompt(params: ResumeSynthesisPromptParams): string {

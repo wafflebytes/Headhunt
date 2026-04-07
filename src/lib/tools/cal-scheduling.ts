@@ -554,7 +554,7 @@ export const scheduleInterviewWithCalTool = withCal(
           : input.durationMinutes;
 
         const updatedAt = new Date();
-        const [interviewRow] = await db.transaction(async (tx: typeof db) => {
+        const [interviewRow] = await db.transaction(async (tx) => {
           const [createdInterview] = await tx
             .insert(interviews)
             .values({

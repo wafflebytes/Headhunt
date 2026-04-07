@@ -1,8 +1,9 @@
 import { sql } from 'drizzle-orm';
-import { pgTable, text, timestamp, varchar } from 'drizzle-orm/pg-core';
+import { jsonb, pgTable, text, timestamp, varchar } from 'drizzle-orm/pg-core';
 import { createInsertSchema, createSelectSchema } from 'drizzle-zod';
 import { z } from 'zod';
 
+import type { StoredJdTemplate } from '@/lib/jd-template';
 import { nanoid } from '@/utils/nano-id';
 import { organizations } from './organizations';
 
@@ -17,6 +18,7 @@ export const jobs = pgTable('jobs', {
     onDelete: 'set null',
   }),
   title: text('title').notNull(),
+  jdTemplate: jsonb('jd_template').$type<StoredJdTemplate>().notNull().default(sql`'{}'::jsonb`),
   status: varchar('status', { length: 50 }).notNull().default('active'),
   createdAt: timestamp('created_at')
     .notNull()

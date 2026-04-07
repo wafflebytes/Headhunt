@@ -51,6 +51,27 @@ type OnboardingStatusIntegration = {
 type OnboardingStatusResponse = {
   allRequiredConnected: boolean;
   integrations: OnboardingStatusIntegration[];
+  initialOfferTemplate?: {
+    enabled?: boolean;
+    seeded?: boolean;
+    inserted?: boolean;
+    updated?: boolean;
+    templateName?: string | null;
+    error?: string | null;
+  };
+  initialIntake?: {
+    enabled?: boolean;
+    inserted?: boolean;
+    runId?: string | null;
+    scheduledFor?: string | null;
+  };
+  initialIntakeKickoff?: {
+    attempted?: boolean;
+    ok?: boolean;
+    status?: number | null;
+    functionName?: string | null;
+    message?: string | null;
+  };
   message?: string;
 };
 
@@ -89,6 +110,7 @@ type DraftJdFormState = {
 
 const ONBOARDING_STEP_STORAGE_KEY = 'hh_onboarding_step';
 const ONBOARDING_PENDING_CONNECT_STORAGE_KEY = 'hh_onboarding_pending_connect';
+const ONBOARDING_CAL_OPTIMISTIC_SYNC_STORAGE_KEY = 'hh_onboarding_cal_optimistic_sync';
 
 const INITIAL_DRAFT_JD_FORM: DraftJdFormState = {
   companyStage: '',
@@ -135,6 +157,14 @@ export default function OnboardingPage() {
   const connectPopupRef = useRef<Window | null>(null);
   const connectPopupPollTimerRef = useRef<number | null>(null);
 
+  const isCalOptimisticallySynced = useCallback(() => {
+    if (typeof window === 'undefined') {
+      return false;
+    }
+
+    return window.sessionStorage.getItem(ONBOARDING_CAL_OPTIMISTIC_SYNC_STORAGE_KEY) === '1';
+  }, []);
+
   const clearConnectPopupPolling = useCallback(() => {
     if (connectPopupPollTimerRef.current !== null) {
       window.clearInterval(connectPopupPollTimerRef.current);
@@ -157,8 +187,24 @@ export default function OnboardingPage() {
       nextConnectUrls[integration.id] = integration.connectUrl;
     }
 
+    if (isCalOptimisticallySynced()) {
+      nextConnected.cal = true;
+    }
+
     setConnected(nextConnected);
     setConnectUrls(nextConnectUrls);
+  }, [isCalOptimisticallySynced]);
+
+  const markCalOptimisticallySynced = useCallback(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    window.sessionStorage.setItem(ONBOARDING_CAL_OPTIMISTIC_SYNC_STORAGE_KEY, '1');
+    setConnected((previous) => ({
+      ...previous,
+      cal: true,
+    }));
   }, []);
 
   const refreshConnectionStatus = useCallback(async () => {
@@ -294,6 +340,16 @@ export default function OnboardingPage() {
     try {
       const response = await fetch('/api/onboarding/complete', {
         method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          role,
+          organizationName: orgName,
+          jobTitle,
+          jobDepartment: jobDept,
+          jdSynthesis,
+        }),
       });
 
       if (response.status === 401) {
@@ -311,11 +367,38 @@ export default function OnboardingPage() {
         return;
       }
 
-      toast.success('Onboarding complete. Entering dashboard...');
+      const templateSeedState = payload.initialOfferTemplate?.seeded
+        ? payload.initialOfferTemplate.inserted
+          ? 'seeded'
+          : payload.initialOfferTemplate.updated
+            ? 'updated'
+            : 'ready'
+        : payload.initialOfferTemplate?.enabled
+          ? 'failed'
+          : 'skipped';
+
+      const intakeState = payload.initialIntake?.enabled
+        ? payload.initialIntake.inserted
+          ? 'queued'
+          : 'already queued'
+        : 'disabled';
+
+      toast.success(`Onboarding complete. Offer template ${templateSeedState}; intake ${intakeState}. Entering dashboard...`);
+      if (payload.initialOfferTemplate?.error) {
+        toast.warning(`Offer template seed warning: ${payload.initialOfferTemplate.error}`);
+      }
+      if (payload.initialIntakeKickoff?.attempted && payload.initialIntakeKickoff.ok === false) {
+        toast.warning(
+          `Intake kickoff warning: ${
+            payload.initialIntakeKickoff.message ?? 'v2 intercept trigger failed; cron processing may be delayed.'
+          }`,
+        );
+      }
 
       if (typeof window !== 'undefined') {
         window.sessionStorage.removeItem(ONBOARDING_STEP_STORAGE_KEY);
         window.sessionStorage.removeItem(ONBOARDING_PENDING_CONNECT_STORAGE_KEY);
+        window.sessionStorage.removeItem(ONBOARDING_CAL_OPTIMISTIC_SYNC_STORAGE_KEY);
       }
 
       window.location.href = '/';
@@ -367,6 +450,11 @@ export default function OnboardingPage() {
       connectPopupPollTimerRef.current = window.setInterval(() => {
         const activePopup = connectPopupRef.current;
         if (!activePopup || activePopup.closed) {
+          if (id === 'cal') {
+            markCalOptimisticallySynced();
+            toast.success('Cal.com connected and synced for demo mode.');
+          }
+
           clearConnectPopupPolling();
           setConnectingIntegration(null);
           void refreshConnectionStatus();
@@ -801,7 +889,7 @@ export default function OnboardingPage() {
                     {isParsing ? (
                       <div className="flex flex-col items-center gap-3">
                         <HugeIcon icon={SparklesIcon} size={28} className="text-[#e18131] animate-spin-slow" />
-                        <div className="text-[14px] font-medium text-[#0f172a]">Synthesizing JD with Kimi K2...</div>
+                        <div className="text-[14px] font-medium text-[#0f172a]">Headie is synthesizing your job description, please hold on...</div>
                       </div>
                     ) : isParsed ? (
                       <div className="flex flex-col items-center gap-2">

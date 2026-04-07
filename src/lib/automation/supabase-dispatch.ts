@@ -55,25 +55,83 @@ async function parseResponse(response: Response) {
   }
 }
 
+type DispatchParams = {
+  functionName: string;
+  body?: Record<string, unknown>;
+  executeCookie?: string;
+};
+
+function resolveFunctionsAuthMode(): 'secret-header' | 'bearer' | 'both' {
+  const raw = process.env.SUPABASE_FUNCTIONS_AUTH_MODE?.trim().toLowerCase();
+
+  if (raw === 'bearer' || raw === 'both' || raw === 'secret-header') {
+    return raw;
+  }
+
+  return 'secret-header';
+}
+
+export async function dispatchSupabaseAutomationFunction(params: DispatchParams) {
+  const functionsBaseUrl = deriveFunctionsBaseUrl();
+  const functionSecret =
+    process.env.SUPABASE_AUTOMATION_FUNCTION_SECRET?.trim() ||
+    process.env.AUTOMATION_CRON_SECRET?.trim() ||
+    process.env.CRON_SECRET?.trim();
+
+  if (!functionsBaseUrl || !functionSecret) {
+    return {
+      ok: false,
+      status: 500,
+      data: {
+        message:
+          'Supabase automation function dispatch is not configured. Set SUPABASE_FUNCTIONS_URL and one of SUPABASE_AUTOMATION_FUNCTION_SECRET, AUTOMATION_CRON_SECRET, or CRON_SECRET.',
+      },
+    };
+  }
+
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    'x-automation-secret': functionSecret,
+  };
+
+  const authMode = resolveFunctionsAuthMode();
+  if (authMode === 'bearer' || authMode === 'both') {
+    headers.authorization = `Bearer ${functionSecret}`;
+  }
+
+  if (params.executeCookie?.trim()) {
+    headers['x-automation-execute-cookie'] = params.executeCookie.trim();
+  }
+
+  try {
+    const response = await fetch(`${functionsBaseUrl}/${params.functionName}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(params.body ?? {}),
+    });
+
+    const parsed = await parseResponse(response);
+    return {
+      ok: response.ok,
+      status: response.status,
+      data: parsed,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 502,
+      data: {
+        message: error instanceof Error ? error.message : 'Failed to call Supabase automation function.',
+      },
+    };
+  }
+}
+
 export async function proxyToSupabaseAutomationFunction(params: {
   request: NextRequest;
   functionName: string;
   fallbackBody?: Record<string, unknown>;
 }) {
-  const functionsBaseUrl = deriveFunctionsBaseUrl();
-  const functionSecret =
-    process.env.SUPABASE_AUTOMATION_FUNCTION_SECRET?.trim() || process.env.AUTOMATION_CRON_SECRET?.trim();
-
-  if (!functionsBaseUrl || !functionSecret) {
-    return NextResponse.json(
-      {
-        message:
-          'Supabase automation function dispatch is not configured. Set SUPABASE_FUNCTIONS_URL and SUPABASE_AUTOMATION_FUNCTION_SECRET.',
-      },
-      { status: 500 },
-    );
-  }
-
   const payload = await parseRequestBody(params.request);
   const body = {
     ...(params.fallbackBody ?? {}),
@@ -84,31 +142,11 @@ export async function proxyToSupabaseAutomationFunction(params: {
     params.request.headers.get('cookie')?.trim() ||
     '';
 
-  const headers: Record<string, string> = {
-    'content-type': 'application/json',
-    authorization: `Bearer ${functionSecret}`,
-    'x-automation-secret': functionSecret,
-  };
+  const dispatched = await dispatchSupabaseAutomationFunction({
+    functionName: params.functionName,
+    body,
+    executeCookie,
+  });
 
-  if (executeCookie) {
-    headers['x-automation-execute-cookie'] = executeCookie;
-  }
-
-  try {
-    const response = await fetch(`${functionsBaseUrl}/${params.functionName}`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-    });
-
-    const parsed = await parseResponse(response);
-    return NextResponse.json(parsed, { status: response.status });
-  } catch (error) {
-    return NextResponse.json(
-      {
-        message: error instanceof Error ? error.message : 'Failed to call Supabase automation function.',
-      },
-      { status: 502 },
-    );
-  }
+  return NextResponse.json(dispatched.data, { status: dispatched.status });
 }

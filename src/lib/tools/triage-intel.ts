@@ -83,6 +83,57 @@ function compact(value: string, limit = 280): string {
   return value.replace(/\s+/g, ' ').trim().slice(0, limit);
 }
 
+function normalizeIntelBullets(rawSummary: string): string {
+  const normalized = rawSummary
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .trim();
+
+  const candidateLines = normalized
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) =>
+      line
+        .replace(/^(((?:[-*•\u2022\u25CF\u25A0\u25AA\u2013\u2014])|(?:\d+\.))\s+)+/, '')
+        .trim(),
+    )
+    .filter(Boolean);
+
+  let bullets: string[] = [];
+
+  if (candidateLines.length >= 3) {
+    bullets = candidateLines.slice(0, 3);
+  } else {
+    const sentences = normalized
+      .replace(/\s+/g, ' ')
+      .split(/(?<=[.!?])\s+/)
+      .map((sentence) => sentence.trim())
+      .filter(Boolean);
+    bullets = sentences.slice(0, 3);
+  }
+
+  while (bullets.length < 3) {
+    bullets.push('');
+  }
+
+  bullets = bullets
+    .slice(0, 3)
+    .map((bullet) => bullet.replace(/\s+/g, ' ').trim())
+    .map((bullet) => (bullet.length > 160 ? `${bullet.slice(0, 157).trimEnd()}...` : bullet));
+
+  if (bullets[2] && !/^founder note:/i.test(bullets[2])) {
+    bullets[2] = `Founder note: ${bullets[2]}`.replace(/\s+/g, ' ').trim();
+  }
+
+  // Ensure we always return three visible bullets.
+  if (!bullets[0]) bullets[0] = 'Strong fit signals pending deeper resume evidence.';
+  if (!bullets[1]) bullets[1] = 'Risk: evidence gaps; verify key requirements in the first screen.';
+  if (!bullets[2]) bullets[2] = 'Founder note: ask for one concrete ownership example tied to this role.';
+
+  return bullets.map((bullet) => `• ${bullet}`).join('\n');
+}
+
 async function loadActiveJobsForTriage(organizationId?: string) {
   if (organizationId) {
     return db
@@ -504,9 +555,14 @@ export async function generateIntelCard(input: GenerateIntelCardInput) {
     };
   }
 
+  intel = {
+    ...intel,
+    summary: normalizeIntelBullets(intel.summary),
+  };
+
   const updatedAt = new Date();
 
-  await db.transaction(async (tx: typeof db) => {
+  await db.transaction(async (tx) => {
     await tx
       .update(candidates)
       .set({
@@ -516,7 +572,7 @@ export async function generateIntelCard(input: GenerateIntelCardInput) {
         scoreBreakdown: intel.scoreBreakdown,
         qualificationChecks: intel.qualificationChecks,
         workHistory: intel.workHistory,
-        summary: compact(intel.summary, 1000),
+        summary: intel.summary.slice(0, 1000),
         updatedAt,
       })
       .where(eq(candidates.id, input.candidateId));

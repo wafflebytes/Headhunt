@@ -36,6 +36,7 @@ export async function GET(request: NextRequest) {
       ),
       allRequiredConnected: cached.allRequiredConnected,
       statusCheckDegraded: cached.statusCheckDegraded,
+      reauthRequired: false,
       integrations: cached.integrations,
       cached: true,
     });
@@ -43,6 +44,18 @@ export async function GET(request: NextRequest) {
 
   try {
     const statusSnapshot = await getOnboardingIntegrationStatusSnapshot(request.nextUrl.origin);
+
+    if (statusSnapshot.reauthRequired) {
+      onboardingStatusCache.delete(cacheKey);
+      return NextResponse.json(
+        {
+          message: 'Session expired. Please sign in again.',
+          reauthRequired: true,
+        },
+        { status: 401 },
+      );
+    }
+
     const statuses = statusSnapshot.statuses;
     const allRequiredConnected = areAllRequiredIntegrationsConnected(statuses);
 
@@ -60,6 +73,7 @@ export async function GET(request: NextRequest) {
       ),
       allRequiredConnected,
       statusCheckDegraded: statusSnapshot.degraded,
+      reauthRequired: false,
       integrations: statuses,
       cached: false,
     });

@@ -98,6 +98,154 @@ function dedupeNonEmpty(values: string[]): string[] {
   );
 }
 
+function normalizeNewlines(value: string): string {
+  return value.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
+function stripQuotedThread(value: string): string {
+  const normalized = normalizeNewlines(value);
+
+  const cutPatterns: RegExp[] = [
+    /^-----Original Message-----$/m,
+    /^On\s.+\bwrote:$/m,
+    /^From:\s.+\nSent:\s.+\nTo:\s.+\nSubject:\s.+/m,
+  ];
+
+  let cutIndex = normalized.length;
+  for (const pattern of cutPatterns) {
+    const match = pattern.exec(normalized);
+    if (match && typeof match.index === 'number' && match.index >= 0 && match.index < cutIndex) {
+      cutIndex = match.index;
+    }
+  }
+
+  return (cutIndex < normalized.length ? normalized.slice(0, cutIndex) : normalized).trim();
+}
+
+function inferResumeTextFromEmail(emailText: string): string {
+  const stripped = stripQuotedThread(emailText || '').trim();
+  if (stripped.length < 200) return '';
+
+  const lines = normalizeNewlines(stripped)
+    .split('\n')
+    .map((line) => line.replace(/[\t ]+$/g, '').trimEnd());
+
+  const headingPatterns: RegExp[] = [
+    /^professional experience\b/i,
+    /^experience\b/i,
+    /^work history\b/i,
+    /^employment\b/i,
+    /^projects\b/i,
+    /^education\b/i,
+    /^skills\b/i,
+    /^technical skills\b/i,
+    /^certifications\b/i,
+  ];
+
+  let headingIndex = -1;
+  for (let i = 0; i < lines.length; i += 1) {
+    const candidate = lines[i]?.trim();
+    if (!candidate) continue;
+    if (headingPatterns.some((pattern) => pattern.test(candidate))) {
+      headingIndex = i;
+      break;
+    }
+  }
+
+  if (headingIndex >= 0) {
+    const fromHeading = lines.slice(headingIndex).join('\n').trim();
+    if (fromHeading.length >= 250) {
+      return fromHeading;
+    }
+  }
+
+  const resumeMarkerIndex = lines.findIndex((line) => /^(resume|cv)\b[:\s-]*/i.test(line.trim()));
+  if (resumeMarkerIndex >= 0) {
+    const afterMarker = lines.slice(resumeMarkerIndex + 1).join('\n').trim();
+    if (afterMarker.length >= 250) {
+      return afterMarker;
+    }
+  }
+
+  const bulletLineCount = lines.filter((line) => /^\s*((?:[-*•])|(?:\d+\.))\s+/.test(line)).length;
+  const nonEmptyLineCount = lines.filter((line) => line.trim().length > 0).length;
+
+  if (stripped.length >= 900 && nonEmptyLineCount >= 12 && bulletLineCount >= 6) {
+    return stripped;
+  }
+
+  return '';
+}
+
+function resolveResumeText(params: { emailText: string; resumeText?: string }): string {
+  const provided = (params.resumeText ?? '').trim();
+  if (provided.length >= 200) return provided;
+
+  const inferred = inferResumeTextFromEmail(params.emailText ?? '');
+  if (inferred.length > provided.length) {
+    return inferred;
+  }
+
+  return provided;
+}
+
+function buildFounderIntelSummary(params: {
+  jobTitle: string;
+  recommendation: ConsensusOutput['recommendation'];
+  confidence: number;
+  strengths: string[];
+  risks: string[];
+  evidencePoints: string[];
+  requirementGaps: string[];
+}): string {
+  const evidence = dedupeNonEmpty(params.evidencePoints)
+    .slice(0, 4)
+    .map((value) => compact(value, 150));
+
+  const strengths = dedupeNonEmpty(params.strengths)
+    .slice(0, 4)
+    .map((value) => compact(value, 130));
+
+  const risks = dedupeNonEmpty(params.risks)
+    .slice(0, 3)
+    .map((value) => compact(value, 150));
+
+  const gaps = dedupeNonEmpty(params.requirementGaps)
+    .slice(0, 2)
+    .map((value) => compact(value, 120));
+
+  const confidenceLabel = params.confidence >= 78
+    ? 'high'
+    : params.confidence >= 55
+      ? 'medium'
+      : 'low';
+
+  const decisionWhy = evidence[0] ?? strengths[0] ?? 'Evidence is sparse; treat as a calibration screen.';
+  const line1 = compact(
+    `Decision: ${params.recommendation} for ${params.jobTitle} (${confidenceLabel} confidence) — ${decisionWhy}`,
+    170,
+  );
+
+  const evidenceLine = evidence.length >= 2
+    ? `Evidence: ${evidence[0]}; ${evidence[1]}`
+    : evidence.length === 1
+      ? `Evidence: ${evidence[0]}`
+      : strengths.length > 0
+        ? `Evidence: ${strengths.slice(0, 2).join('; ')}`
+        : 'Evidence: Not enough concrete artifacts in the intake to support strong claims.';
+  const line2 = compact(evidenceLine, 170);
+
+  const probeTarget = gaps[0] ?? risks[0] ?? '';
+  const line3 = compact(
+    probeTarget
+      ? `Probe: pressure-test "${probeTarget}" with one shipped example, scope, and measurable outcome.`
+      : 'Probe: ask for one shipped project end-to-end (constraints, decisions, impact, and what they would change).',
+    170,
+  );
+
+  return [line1, line2, line3].join('\n');
+}
+
 function recommendationFromScore(score: number): ConsensusOutput['recommendation'] {
   if (score >= 85) return 'Strong Hire';
   if (score >= 75) return 'Hire';
@@ -170,8 +318,8 @@ function buildFallbackAgentAssessment(params: {
     confidence: 50,
     rationale: 'Fallback ATS objective match estimate due to structured generation failure.',
     evidencePoints: [
-      `Requirement count considered: ${params.requirements.length}`,
       compact(params.evidenceText || 'No objective evidence supplied.', 140),
+      `Requirement count considered: ${params.requirements.length}`,
     ],
     adjustmentNote:
       params.turn > 1 ? 'Adjusted after peer review in fallback mode.' : undefined,
@@ -423,12 +571,13 @@ export const runMultiAgentCandidateScoreTool = tool({
       .limit(1);
 
     const requirements = dedupeNonEmpty(input.requirements ?? []);
-    const rawEvidence = [
-      candidate.summary ?? '',
-      input.emailText ?? '',
-      input.resumeText ?? '',
-      input.externalContext ?? '',
-    ]
+    const resolvedEmailText = input.emailText ?? '';
+    const resolvedResumeText = resolveResumeText({
+      emailText: resolvedEmailText,
+      resumeText: input.resumeText,
+    });
+
+    const rawEvidence = [candidate.summary ?? '', resolvedEmailText, resolvedResumeText, input.externalContext ?? '']
       .filter((value) => value.trim().length > 0)
       .join('\n\n');
 
@@ -437,8 +586,8 @@ export const runMultiAgentCandidateScoreTool = tool({
       candidateEmail: candidate.contactEmail,
       jobTitle: job.title,
       requirements,
-      emailText: truncateForModel(input.emailText ?? '', resolvedMaxEvidenceChars),
-      resumeText: truncateForModel(input.resumeText ?? '', resolvedMaxEvidenceChars),
+      emailText: truncateForModel(resolvedEmailText, resolvedMaxEvidenceChars),
+      resumeText: truncateForModel(resolvedResumeText, resolvedMaxEvidenceChars),
       additionalEvidence: truncateForModel(rawEvidence, resolvedMaxEvidenceChars),
     };
 
@@ -449,7 +598,7 @@ export const runMultiAgentCandidateScoreTool = tool({
 
     if (resolvedAutomationMode) {
       fallbackUsed = true;
-      const automationEvidence = `${context.emailText}\n${context.resumeText}\n${context.additionalEvidence}`.trim();
+      const automationEvidence = `${context.resumeText}\n${context.emailText}\n${context.additionalEvidence}`.trim();
 
       for (const agent of AGENTS) {
         const assessment = buildFallbackAgentAssessment({
@@ -541,8 +690,7 @@ export const runMultiAgentCandidateScoreTool = tool({
           finalScore: automationScore,
           confidence: automationConfidence,
           recommendation: recommendationFromScore(automationScore),
-          rationale:
-            'Automation fast-path score generated with a single-pass heuristic profile to keep queue latency under control.',
+          rationale: 'Initial screen based on the available email + resume evidence. Confirm key requirements in a live screen.',
           strengths: automationStrengths.length >= 2
             ? automationStrengths
             : [
@@ -550,15 +698,15 @@ export const runMultiAgentCandidateScoreTool = tool({
                 'Multi-agent dimensions were still represented in scoring.',
               ],
           risks: [
-            'Automation fast-path skips multi-turn model deliberation.',
-            'Run full multi-agent scoring before final offer decisions.',
+            'Evidence may be incomplete; verify top requirements in the first screen.',
+            'Use a structured interview to validate depth and ownership.',
           ],
           nextSteps: [
             'Validate top requirements in a structured interview.',
             'Pressure-test technical depth with practical scenarios.',
-            'Run full multi-agent scoring in interactive mode before finalizing decisions.',
+            'If still promising, run full scoring before finalizing decisions.',
           ],
-          disagreements: ['Automation fast-path omitted iterative cross-evaluator debate.'],
+          disagreements: [],
         },
         fallbackUsed: true,
       };
@@ -613,25 +761,26 @@ export const runMultiAgentCandidateScoreTool = tool({
         evidenceText: `${context.emailText}\n${context.resumeText}`,
       });
 
-    const summary = compact(
-      [
-        consensusResult.consensus.rationale,
-        `Recommendation: ${consensusResult.consensus.recommendation}`,
-        `Strengths: ${consensusResult.consensus.strengths.join('; ')}`,
-        `Risks: ${consensusResult.consensus.risks.join('; ')}`,
-      ].join(' '),
-      1000,
-    );
+    const summary = buildFounderIntelSummary({
+      jobTitle: job.title,
+      recommendation: consensusResult.consensus.recommendation,
+      confidence: finalConfidence,
+      strengths: consensusResult.consensus.strengths,
+      risks: consensusResult.consensus.risks,
+      evidencePoints: [technicalFinal, socialFinal, atsFinal].flatMap((snapshot) => snapshot.keyEvidence),
+      requirementGaps: qualificationChecks.filter((check) => !check.met).map((check) => check.requirement),
+    });
 
     const candidateStage = candidate.stage === 'applied' ? 'reviewed' : candidate.stage;
     const applicationStage = applicationRow?.stage === 'applied' ? 'reviewed' : applicationRow?.stage;
     const updatedAt = new Date();
 
-    await db.transaction(async (tx: typeof db) => {
+    await db.transaction(async (tx) => {
       await tx
         .update(candidates)
         .set({
           stage: candidateStage,
+          objectiveScore: consensusScore,
           score: consensusScore,
           intelConfidence: finalConfidence,
           scoreBreakdown,

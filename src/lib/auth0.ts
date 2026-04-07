@@ -1,8 +1,14 @@
 import { Auth0Client } from '@auth0/nextjs-auth0/server';
 import { TokenVaultError } from '@auth0/ai/interrupts';
 
+const DEFAULT_AUTH0_SCOPE = 'openid profile email offline_access';
+const AUTH0_SCOPE = process.env.AUTH0_SCOPE?.trim() || DEFAULT_AUTH0_SCOPE;
+
 export const auth0 = new Auth0Client({
   enableConnectAccountEndpoint: true,
+  authorizationParameters: {
+    scope: AUTH0_SCOPE,
+  },
 });
 
 const TOKEN_VAULT_SUBJECT_AUDIENCE =
@@ -11,10 +17,24 @@ const TOKEN_VAULT_SUBJECT_AUDIENCE =
 const TOKEN_VAULT_SUBJECT_SCOPE = process.env.AUTH0_TOKEN_VAULT_SUBJECT_SCOPE?.trim();
 
 const isJwtLike = (value: string) => value.split('.').length === 3;
+const isOutsideRequestScopeError = (error: unknown) =>
+  error instanceof Error && /outside a request scope|next-dynamic-api-wrong-context/i.test(error.message);
+
+const readSessionSafely = async () => {
+  try {
+    return await auth0.getSession();
+  } catch (error) {
+    if (isOutsideRequestScopeError(error)) {
+      return null;
+    }
+
+    throw error;
+  }
+};
 
 // Get the refresh token from Auth0 session
 export const getRefreshToken = async () => {
-  const session = await auth0.getSession();
+  const session = await readSessionSafely();
   return session?.tokenSet?.refreshToken;
 };
 
@@ -30,10 +50,20 @@ export const getSessionAccessToken = async () => {
     options.scope = TOKEN_VAULT_SUBJECT_SCOPE;
   }
 
-  const { token } =
-    Object.keys(options).length > 0
-      ? await auth0.getAccessToken(options)
-      : await auth0.getAccessToken();
+  let token: string | undefined;
+
+  try {
+    ({ token } =
+      Object.keys(options).length > 0
+        ? await auth0.getAccessToken(options)
+        : await auth0.getAccessToken());
+  } catch (error) {
+    if (isOutsideRequestScopeError(error)) {
+      return undefined;
+    }
+
+    throw error;
+  }
 
   if (!token) {
     return token;
@@ -49,6 +79,6 @@ export const getSessionAccessToken = async () => {
 };
 
 export const getUser = async () => {
-  const session = await auth0.getSession();
+  const session = await readSessionSafely();
   return session?.user;
 };
